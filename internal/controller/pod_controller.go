@@ -33,7 +33,7 @@ func (r *PodReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.R
 	var pod corev1.Pod
 	if err := r.Get(ctx, req.NamespacedName, &pod); err != nil {
 		if client.IgnoreNotFound(err) == nil {
-			logger.Info("pod deleted, ASG cleanup will be handled by finalizer or NIC GC")
+			logger.Info("pod deleted; ASG memberships are not cleaned up automatically yet")
 			return ctrl.Result{}, nil
 		}
 		return ctrl.Result{}, fmt.Errorf("fetching pod: %w", err)
