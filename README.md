@@ -24,7 +24,7 @@ In Kubernetes clusters running on Azure, network traffic is governed by NSGs att
 
 ## Prerequisites
 
-- Go 1.22+
+- Go 1.23+
 - A Kubernetes cluster (1.27+) running on Azure (AKS or self-managed)
 - Azure identity with permissions to manage ASGs and NSG rules on the target resource group
 - `kubectl` configured to access the target cluster
