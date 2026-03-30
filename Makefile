@@ -54,7 +54,7 @@ docker-push: ## Push docker image with the manager.
 .PHONY: deploy
 deploy: ## Deploy controller to the K8s cluster specified in ~/.kube/config.
 	kubectl apply -f config/rbac/
-	kubectl apply -f config/manager/
+	cat config/manager/*.yaml | sed 's|pod-nsg-controller:latest|${IMG}|g' | kubectl apply -f -
 
 .PHONY: undeploy
 undeploy: ## Undeploy controller from the K8s cluster specified in ~/.kube/config.
