@@ -67,17 +67,17 @@ make undeploy
 
 ## Configuration
 
-The controller is configured via environment variables and command-line flags:
+The controller is configured via a combination of environment variables and command-line flags.
+
+The following environment variables are supported:
 
 | Variable | Description | Required |
 |---|---|---|
 | `AZURE_SUBSCRIPTION_ID` | Azure subscription containing the NSG and ASGs | Yes |
 | `AZURE_RESOURCE_GROUP` | Resource group containing the NSG and ASGs | Yes |
 | `AZURE_NSG_NAME` | Name of the NSG to manage rules on | Yes |
-| `LEADER_ELECTION` | Enable leader election (`true`/`false`) | No |
-| `METRICS_BIND_ADDRESS` | Address for the metrics endpoint (default `:8080`) | No |
-| `HEALTH_PROBE_BIND_ADDRESS` | Address for the health probe endpoint (default `:8081`) | No |
 
+Command-line flags are used to configure other settings such as leader election and the metrics/health probe bind addresses. Refer to the `cmd/` package and deployment manifests for the exact flags and defaults.
 ## Project Structure
 
 ```
