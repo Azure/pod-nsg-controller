@@ -100,7 +100,7 @@ A wrapper around the Azure SDK for Go (`armnetwork.InterfacesClient`, `armnetwor
 
 #### Configuration Loader
 
-Reads configuration from environment variables, command-line flags, and optionally a ConfigMap. Validates required parameters at startup.
+Reads configuration from environment variables and validates required parameters at startup. Support for reading from command-line flags and optionally a ConfigMap is planned for future iterations.
 
 ### 4.4 Annotation and Label Schema
 
