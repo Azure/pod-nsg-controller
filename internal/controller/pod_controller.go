@@ -44,7 +44,7 @@ func (r *PodReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.R
 		return ctrl.Result{Requeue: true}, nil
 	}
 
-	desiredASGs := r.getDesiredASGs(&pod, logger)
+	desiredASGs := getDesiredASGs(&pod)
 	if len(desiredASGs) == 0 {
 		logger.V(1).Info("no ASG annotations or labels found, skipping")
 		return ctrl.Result{}, nil
@@ -72,7 +72,7 @@ func (r *PodReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.R
 }
 
 // getDesiredASGs reads the desired ASG names from pod labels and annotations.
-func (r *PodReconciler) getDesiredASGs(pod *corev1.Pod, logger logr.Logger) []string {
+func getDesiredASGs(pod *corev1.Pod) []string {
 	var asgs []string
 
 	// Check the single-ASG label.

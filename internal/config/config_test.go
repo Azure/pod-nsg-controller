@@ -1,7 +1,6 @@
 package config
 
 import (
-	"os"
 	"testing"
 )
 
@@ -26,7 +25,7 @@ func TestLoad_AllSet(t *testing.T) {
 }
 
 func TestLoad_MissingSubscriptionID(t *testing.T) {
-	os.Unsetenv("AZURE_SUBSCRIPTION_ID")
+	t.Setenv("AZURE_SUBSCRIPTION_ID", "")
 	t.Setenv("AZURE_RESOURCE_GROUP", "rg-test")
 	t.Setenv("AZURE_NSG_NAME", "nsg-test")
 
@@ -38,7 +37,7 @@ func TestLoad_MissingSubscriptionID(t *testing.T) {
 
 func TestLoad_MissingResourceGroup(t *testing.T) {
 	t.Setenv("AZURE_SUBSCRIPTION_ID", "sub-123")
-	os.Unsetenv("AZURE_RESOURCE_GROUP")
+	t.Setenv("AZURE_RESOURCE_GROUP", "")
 	t.Setenv("AZURE_NSG_NAME", "nsg-test")
 
 	_, err := Load()
@@ -50,7 +49,7 @@ func TestLoad_MissingResourceGroup(t *testing.T) {
 func TestLoad_MissingNSGName(t *testing.T) {
 	t.Setenv("AZURE_SUBSCRIPTION_ID", "sub-123")
 	t.Setenv("AZURE_RESOURCE_GROUP", "rg-test")
-	os.Unsetenv("AZURE_NSG_NAME")
+	t.Setenv("AZURE_NSG_NAME", "")
 
 	_, err := Load()
 	if err == nil {

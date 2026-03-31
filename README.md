@@ -9,7 +9,7 @@ In Kubernetes clusters running on Azure, network traffic is governed by NSGs att
 ### How It Works
 
 1. The controller watches pod lifecycle events in the Kubernetes cluster.
-2. When a pod is created or updated, the controller assigns its network interface to the appropriate ASG based on pod labels, annotations, or namespace.
+2. When a pod is created or updated, the controller determines desired ASG membership from pod labels and annotations.
 3. NSG rules reference these ASGs as source or destination, enabling pod-level traffic control without managing individual IP addresses.
 4. When a pod is deleted, the controller removes its NIC from the ASG, ensuring stale memberships are cleaned up.
 
@@ -17,7 +17,7 @@ In Kubernetes clusters running on Azure, network traffic is governed by NSGs att
 
 - **Dynamic ASG allocation** — Automatically assigns pod NICs to Application Security Groups based on pod metadata.
 - **Pod-level NSG rules** — NSG rules reference ASGs instead of IP addresses, enabling security policies that follow pod identity rather than ephemeral IPs.
-- **Annotation and label-driven configuration** — Define ASG membership through pod or namespace labels and annotations.
+- **Annotation and label-driven configuration** — Define ASG membership through pod labels and annotations.
 - **Idempotent operations** — Safe to restart or run multiple replicas; the controller converges to the desired state without duplicating ASG memberships.
 - **Azure SDK integration** — Uses the official Azure SDK for Go to interact with the Azure Resource Manager API.
 - **Leader election** — Supports leader election for high-availability deployments.
