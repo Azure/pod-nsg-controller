@@ -25,6 +25,12 @@ spec:
         app.kubernetes.io/component: controller
     spec:
       serviceAccountName: pod-nsg-controller
+      nodeSelector:
+        node-role.kubernetes.io/control-plane: ""
+      tolerations:
+        - key: node-role.kubernetes.io/control-plane
+          operator: Exists
+          effect: NoSchedule
       securityContext:
         runAsNonRoot: true
         seccompProfile:
@@ -32,6 +38,7 @@ spec:
       containers:
         - name: manager
           image: pod-nsg-controller:latest
+          imagePullPolicy: Never
           args:
             - --leader-elect
             - --health-probe-bind-address=:8081

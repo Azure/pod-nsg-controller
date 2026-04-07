@@ -67,7 +67,7 @@ func main() {
 		os.Exit(1)
 	}
 
-	asgClient, err := azure.NewASGClient(cfg.SubscriptionID, cfg.ResourceGroup)
+	asgClient, err := azure.NewASGClient(cfg.SubscriptionID, cfg.ResourceGroup, ctrl.Log.WithName("azure"))
 	if err != nil {
 		setupLog.Error(err, "unable to create Azure ASG client")
 		os.Exit(1)
