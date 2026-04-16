@@ -32,7 +32,7 @@ conductor --version
 
 ## Workflow Architecture
 
-The TDD phase workflow (`.conductor/phase-workflow.yaml`) orchestrates 7 agents:
+The TDD phase workflow (`.conductor/phase-workflow.yaml`) orchestrates 8 agents + 3 human gates:
 
 ```
 ┌──────────┐     ┌─────────────────┐     ┌──────────────────┐
@@ -54,6 +54,12 @@ The TDD phase workflow (`.conductor/phase-workflow.yaml`) orchestrates 7 agents:
                     └────────┬───────────┘  └──────────┘
                              │ all pass          ▲
                              ▼              fix loop
+                    ┌────────────────────┐       │
+                    │  Code Reviewer     │───────┘
+                    │  (Opus)            │  logic issues
+                    └────────┬───────────┘
+                             │ approved
+                             ▼
                     ┌──────────────────────┐
                     │ 🚦 Implementation    │
                     │    Gate (Human)      │──► Coder (revise)
@@ -88,6 +94,7 @@ The TDD phase workflow (`.conductor/phase-workflow.yaml`) orchestrates 7 agents:
 | **Unit Test Writer** | Claude Opus 4.6 | Writes failing tests from TDD acceptance criteria (tests MUST fail) |
 | **Coder** | Claude Opus 4.6 | Implements production code to make tests pass |
 | **Unit Test Validator** | GPT-5.4 | Runs `go test` and `go vet`, reports pass/fail |
+| **Code Reviewer** | Claude Opus 4.6 | Reviews logic, error handling, performance, security |
 | 🚦 **Implementation Gate** | Human | Approve implementation before integration tests, revise, or abort |
 | **Integration Tester** | Claude Opus 4.6 | Writes cross-module integration tests |
 | 🚦 **Pre-QA Gate** | Human | Review integration results and QA checklist before validation |

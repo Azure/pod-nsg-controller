@@ -457,24 +457,134 @@ agents:
         type: boolean
         description: Whether go vet passes cleanly
     routes:
-      - to: implementation_review_gate
+      - to: code_reviewer
         when: "{{ output.all_pass }}"
       - to: coder
         when: "{{ not output.all_pass }}"
 
-  # ─── 5b. HUMAN GATE: Implementation Review ───────────────────
+  # ─── 5b. CODE REVIEW AGENT ───────────────────────────────────
+  - name: code_reviewer
+    description: >-
+      Performs an experienced code review of the implementation,
+      checking logic, patterns, performance, and maintainability.
+      Returns to coder if issues are found.
+    model: claude-opus-4.6
+    input:
+      - workflow.input.phase
+      - workflow.input.spec_path
+      - designer.output
+      - coder.output
+      - unit_test_validator.output
+    system_prompt: |
+      You are a Principal Engineer performing a thorough code review.
+      You focus on substantive issues — logic bugs, incorrect assumptions,
+      performance pitfalls, security concerns, and maintainability problems.
+
+      You do NOT comment on:
+      - Formatting or style (that's what linters are for)
+      - Trivial naming preferences
+      - Issues already caught by tests or go vet
+
+      Project conventions you enforce:
+      - All logging via go.uber.org/zap (no fmt.Printf, no bare log)
+      - controller-runtime code uses logr.Logger backed by zapr
+      - Azure clients use *zap.Logger directly
+      - Errors wrapped with fmt.Errorf("context: %w", err)
+      - Functions should be focused and testable
+      - Follow existing codebase patterns
+    prompt: |
+      Review the implementation for **{{ workflow.input.phase }}**.
+
+      **Design:** Read `{{ designer.output.design_path }}`
+      **Specification:** `{{ workflow.input.spec_path }}`
+
+      **Files created:**
+      {% for f in coder.output.files_created %}
+      - `{{ f }}`
+      {% endfor %}
+
+      **Files modified:**
+      {% for f in coder.output.files_modified %}
+      - `{{ f }}`
+      {% endfor %}
+
+      **Unit tests:** {{ unit_test_validator.output.passed_tests }}/{{ unit_test_validator.output.total_tests }} passing
+
+      **Implementation notes:** {{ coder.output.implementation_notes }}
+
+      ## Review Focus Areas
+
+      1. **Logic Correctness** — Does the code correctly implement the spec?
+         - Are there off-by-one errors, nil pointer risks, or race conditions?
+         - Are map/slice operations safe for concurrent access?
+         - Are Kubernetes controller reconciliation loops idempotent?
+
+      2. **Error Handling** — Is every error path handled properly?
+         - Are errors wrapped with context using %w?
+         - Are transient vs. permanent errors distinguished?
+         - Do controllers return appropriate requeue decisions?
+
+      3. **Performance** — Are there unnecessary allocations or API calls?
+         - Are Azure API calls minimized (batching, caching)?
+         - Are list/watch patterns efficient?
+
+      4. **Security** — Are credentials handled safely?
+         - No secrets logged, no hardcoded values
+         - Azure credentials use managed identity / DefaultAzureCredential
+
+      5. **Maintainability** — Is the code easy to understand and extend?
+         - Are interfaces well-defined for testability?
+         - Is the code consistent with existing patterns?
+
+      Read each file that was created or modified and provide your review.
+
+      Set `approved` to true ONLY if there are no logic issues that could
+      cause incorrect behavior. Minor suggestions are fine to note but
+      should not block approval.
+    output:
+      approved:
+        type: boolean
+        description: Whether the code passes review (no logic issues)
+      critical_issues:
+        type: array
+        description: Logic bugs or correctness issues that must be fixed
+      suggestions:
+        type: array
+        description: Non-blocking improvement suggestions
+      feedback:
+        type: string
+        description: Detailed review feedback for the coder
+      review_summary:
+        type: string
+        description: One-paragraph summary of the review
+    routes:
+      - to: implementation_review_gate
+        when: "{{ output.approved }}"
+      - to: coder
+        when: "{{ not output.approved }}"
+
+  # ─── 5c. HUMAN GATE: Implementation Review ───────────────────
   - name: implementation_review_gate
     type: human_gate
     description: >-
-      Human reviews the completed implementation and passing unit tests
-      before integration testing begins.
+      Human reviews the completed implementation, passing unit tests,
+      and code review results before integration testing begins.
     prompt: |
-      ## Implementation Complete — All Unit Tests Passing
+      ## Implementation Complete — Code Reviewed & Unit Tests Passing
 
       **Phase:** {{ workflow.input.phase }}
 
       **Test Results:** {{ unit_test_validator.output.passed_tests }}/{{ unit_test_validator.output.total_tests }} tests passing
       **go vet clean:** {{ unit_test_validator.output.vet_clean }}
+
+      **Code Review:** {{ code_reviewer.output.review_summary }}
+
+      {% if code_reviewer.output.suggestions %}
+      **Reviewer Suggestions (non-blocking):**
+      {% for s in code_reviewer.output.suggestions %}
+      - {{ s }}
+      {% endfor %}
+      {% endif %}
 
       **Files created:**
       {% for f in coder.output.files_created %}
