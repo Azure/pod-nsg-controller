@@ -35,11 +35,18 @@ conductor --version
 The TDD phase workflow (`.conductor/phase-workflow.yaml`) orchestrates 7 agents:
 
 ```
-┌──────────┐     ┌─────────────────┐     ┌───────────────────┐
-│ Designer │────►│ Design Reviewer │────►│ Unit Test Writer  │
-│ (Codex)  │◄────│ (GPT-5.4)       │     │ (Opus)            │
-└──────────┘     └─────────────────┘     └────────┬──────────┘
-  revise loop                                      │
+┌──────────┐     ┌─────────────────┐     ┌──────────────────┐
+│ Designer │────►│ Design Reviewer │────►│ 🚦 Design Gate   │
+│ (Codex)  │◄────│ (GPT-5.4)       │     │ (Human Approval) │
+└──────────┘     └─────────────────┘     └────────┬─────────┘
+  revise loop       ▲ revise                       │ approve
+                    └──────────────────────────────┘
+                                                   ▼
+                                          ┌───────────────────┐
+                                          │ Unit Test Writer  │
+                                          │ (Opus)            │
+                                          └────────┬──────────┘
+                                                   │
                                                    ▼
                     ┌─────────────────────┐  ┌──────────┐
                     │ Unit Test Validator │◄─│  Coder   │
@@ -47,11 +54,23 @@ The TDD phase workflow (`.conductor/phase-workflow.yaml`) orchestrates 7 agents:
                     └────────┬───────────┘  └──────────┘
                              │ all pass          ▲
                              ▼              fix loop
+                    ┌──────────────────────┐
+                    │ 🚦 Implementation    │
+                    │    Gate (Human)      │──► Coder (revise)
+                    └────────┬─────────────┘
+                             │ approve
+                             ▼
                     ┌────────────────────┐
                     │ Integration Tester │
                     │ (Opus)             │
                     └────────┬───────────┘
                              │
+                             ▼
+                    ┌──────────────────────┐
+                    │ 🚦 Pre-QA Gate       │──► Coder (revise)
+                    │    (Human)           │
+                    └────────┬─────────────┘
+                             │ approve
                              ▼
                     ┌────────────────────┐
                     │  QA Validator      │──► $end (approved)
@@ -65,10 +84,13 @@ The TDD phase workflow (`.conductor/phase-workflow.yaml`) orchestrates 7 agents:
 |-------|-------|------|
 | **Designer** | GPT-5.3 Codex | Reads spec, researches codebase, produces implementation design |
 | **Design Reviewer** | GPT-5.4 | Validates design against spec (score ≥ 85 to approve) |
+| 🚦 **Design Gate** | Human | Approve design before test writing, revise, or abort |
 | **Unit Test Writer** | Claude Opus 4.6 | Writes failing tests from TDD acceptance criteria (tests MUST fail) |
 | **Coder** | Claude Opus 4.6 | Implements production code to make tests pass |
 | **Unit Test Validator** | GPT-5.4 | Runs `go test` and `go vet`, reports pass/fail |
+| 🚦 **Implementation Gate** | Human | Approve implementation before integration tests, revise, or abort |
 | **Integration Tester** | Claude Opus 4.6 | Writes cross-module integration tests |
+| 🚦 **Pre-QA Gate** | Human | Review integration results and QA checklist before validation |
 | **QA Validator** | GPT-5.4 | Final gate — validates all deliverables against spec (score ≥ 90) |
 
 ## Usage
@@ -107,6 +129,29 @@ conductor -V run .conductor/phase-workflow.yaml \
   --input phase="Phase 1: CRD Types, Scaffolding & Scheme Registration" \
   --input spec_path="docs/SPECIFICATION.md"
 ```
+
+### Skip Human Gates (Fully Automated)
+
+```bash
+conductor run .conductor/phase-workflow.yaml --skip-gates \
+  --input phase="Phase 1: CRD Types, Scaffolding & Scheme Registration" \
+  --input spec_path="docs/SPECIFICATION.md"
+```
+
+## Human Gates
+
+The workflow includes 3 human checkpoints where execution pauses for your review:
+
+| Gate | When | What You Review | Options |
+|------|------|-----------------|---------|
+| 🚦 **Design Gate** | After design review passes (≥ 85) | Design document, files planned, reviewer feedback | Approve · Revise · Abort |
+| 🚦 **Implementation Gate** | After all unit tests pass | Created/modified files, test results, implementation notes | Approve · Revise · Abort |
+| 🚦 **Pre-QA Gate** | After integration tests complete | Integration results, QA validation checklist preview | Approve · Revise · Abort |
+
+At each gate you can:
+- **Approve** — continue to the next stage
+- **Revise** — provide feedback and send back for changes (with a feedback prompt)
+- **Abort** — stop the workflow entirely
 
 ## Phase Execution Order
 

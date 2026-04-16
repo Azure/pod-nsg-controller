@@ -207,11 +207,53 @@ agents:
         type: array
         description: Issues that must be addressed before implementation
     routes:
-      - to: unit_test_writer
+      - to: design_approval_gate
         when: "{{ output.approved }}"
       - to: designer
         when: "{{ output.score < 85 }}"
-      - to: unit_test_writer
+      - to: design_approval_gate
+
+  # ─── 2b. HUMAN GATE: Design Approval ─────────────────────────
+  - name: design_approval_gate
+    type: human_gate
+    description: >-
+      Human reviews the approved design before TDD test writing begins.
+      Allows the operator to inspect the design, request changes, or abort.
+    prompt: |
+      ## Design Approved — Review Before Implementation
+
+      **Phase:** {{ workflow.input.phase }}
+      **Design Score:** {{ design_reviewer.output.score }}/100
+
+      **Design Document:** `{{ designer.output.design_path }}`
+
+      **Files to create:**
+      {% for f in designer.output.files_to_create %}
+      - `{{ f }}`
+      {% endfor %}
+
+      **Files to modify:**
+      {% for f in designer.output.files_to_modify %}
+      - `{{ f }}`
+      {% endfor %}
+
+      **Test files planned:**
+      {% for f in designer.output.test_files %}
+      - `{{ f }}`
+      {% endfor %}
+
+      **Reviewer feedback:** {{ design_reviewer.output.feedback }}
+    options:
+      - label: Approve — proceed to write failing tests
+        value: proceed
+        route: unit_test_writer
+      - label: Revise design — send back to designer
+        value: revise
+        route: designer
+        prompt_for: feedback
+      - label: Abort workflow
+        value: abort
+        route: $end
 
   # ─── 3. UNIT TEST WRITER AGENT (TDD: Write Failing Tests) ───
   - name: unit_test_writer
@@ -415,10 +457,47 @@ agents:
         type: boolean
         description: Whether go vet passes cleanly
     routes:
-      - to: integration_tester
+      - to: implementation_review_gate
         when: "{{ output.all_pass }}"
       - to: coder
         when: "{{ not output.all_pass }}"
+
+  # ─── 5b. HUMAN GATE: Implementation Review ───────────────────
+  - name: implementation_review_gate
+    type: human_gate
+    description: >-
+      Human reviews the completed implementation and passing unit tests
+      before integration testing begins.
+    prompt: |
+      ## Implementation Complete — All Unit Tests Passing
+
+      **Phase:** {{ workflow.input.phase }}
+
+      **Test Results:** {{ unit_test_validator.output.passed_tests }}/{{ unit_test_validator.output.total_tests }} tests passing
+      **go vet clean:** {{ unit_test_validator.output.vet_clean }}
+
+      **Files created:**
+      {% for f in coder.output.files_created %}
+      - `{{ f }}`
+      {% endfor %}
+
+      **Files modified:**
+      {% for f in coder.output.files_modified %}
+      - `{{ f }}`
+      {% endfor %}
+
+      **Implementation notes:** {{ coder.output.implementation_notes }}
+    options:
+      - label: Approve — proceed to integration tests
+        value: proceed
+        route: integration_tester
+      - label: Send back to coder for changes
+        value: revise
+        route: coder
+        prompt_for: feedback
+      - label: Abort workflow
+        value: abort
+        route: $end
 
   # ─── 6. INTEGRATION TEST AGENT ───────────────────────────────
   - name: integration_tester
@@ -479,7 +558,47 @@ agents:
         type: string
         description: Notes about integration test coverage
     routes:
-      - to: qa_validator
+      - to: qa_review_gate
+
+  # ─── 6b. HUMAN GATE: Pre-QA Review ───────────────────────────
+  - name: qa_review_gate
+    type: human_gate
+    description: >-
+      Human reviews the integration test results and QA validation
+      checklist before the QA validator runs its automated checks.
+    prompt: |
+      ## Pre-QA Review — Inspect Before Final Validation
+
+      **Phase:** {{ workflow.input.phase }}
+
+      **Unit Tests:** {{ unit_test_validator.output.passed_tests }}/{{ unit_test_validator.output.total_tests }} passing
+
+      **Integration Tests Pass:** {{ integration_tester.output.integration_tests_pass }}
+      **Integration Notes:** {{ integration_tester.output.integration_notes }}
+
+      **Integration Test Files:**
+      {% for f in integration_tester.output.integration_test_files %}
+      - `{{ f }}`
+      {% endfor %}
+
+      ### QA Validator Will Check:
+      1. Every deliverable file exists and is fully implemented
+      2. Every TDD acceptance test (T*.x) passes
+      3. `go build`, `go test`, `go vet` all clean
+      4. zap logging used throughout (no fmt.Printf)
+      5. Error wrapping with %w
+      6. Score ≥ 90 to approve the phase
+    options:
+      - label: Proceed to QA validation
+        value: proceed
+        route: qa_validator
+      - label: Send back to coder for fixes
+        value: revise
+        route: coder
+        prompt_for: feedback
+      - label: Abort workflow
+        value: abort
+        route: $end
 
   # ─── 7. QA VALIDATOR AGENT ───────────────────────────────────
   - name: qa_validator
