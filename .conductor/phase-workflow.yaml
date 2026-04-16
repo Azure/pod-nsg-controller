@@ -1,0 +1,577 @@
+# Conductor Onboarding & TDD Phase Workflow
+#
+# This workflow orchestrates the full TDD lifecycle for each phase of the
+# pod-nsg-controller SPECIFICATION.md. It uses 7 specialized agents in a
+# sequential pipeline with feedback loops:
+#
+#   design → design_review → unit_test_writer → coder → unit_test_validator
+#     → integration_tester → qa_validator → $end (or loop back)
+#
+# Prerequisites:
+#   1. Install Conductor:
+#      curl -sSfL https://aka.ms/conductor/install.sh | sh
+#
+#   2. Ensure GitHub Copilot CLI is available (for the copilot provider):
+#      gh extension install github/gh-copilot
+#
+#   3. Run the workflow:
+#      conductor run .conductor/phase-workflow.yaml \
+#        --input phase="Phase 1: CRD Types, Scaffolding & Scheme Registration" \
+#        --input spec_path="docs/SPECIFICATION.md"
+#
+#   4. With web dashboard:
+#      conductor run .conductor/phase-workflow.yaml --web \
+#        --input phase="Phase 1: CRD Types, Scaffolding & Scheme Registration" \
+#        --input spec_path="docs/SPECIFICATION.md"
+#
+# Flow:
+#   designer → design_reviewer ──(approved)──→ unit_test_writer
+#                ↑  (revise)  ←──(rejected)──┘
+#   unit_test_writer → coder → unit_test_validator
+#                        ↑  ←──(tests fail)──┘
+#   unit_test_validator ──(pass)──→ integration_tester → qa_validator
+#                                                          ↓
+#                                                  (approved) → $end
+#                                                  (rejected) → coder
+
+workflow:
+  name: tdd-phase-implementation
+  description: >-
+    Spec-driven TDD workflow for implementing a single phase of the
+    pod-nsg-controller specification. Orchestrates design, review,
+    test-first coding, and QA validation.
+  version: "1.0.0"
+  entry_point: designer
+
+  runtime:
+    provider: copilot
+    default_model: claude-sonnet-4.6
+
+  input:
+    phase:
+      type: string
+      required: true
+      description: >-
+        The phase name to implement (e.g., "Phase 1: CRD Types, Scaffolding & Scheme Registration")
+    spec_path:
+      type: string
+      required: true
+      description: >-
+        Path to the SPECIFICATION.md file (e.g., "docs/SPECIFICATION.md")
+
+  context:
+    mode: accumulate
+
+  limits:
+    max_iterations: 80
+
+# ═══════════════════════════════════════════════════════════════════
+# AGENTS
+# ═══════════════════════════════════════════════════════════════════
+
+agents:
+
+  # ─── 1. DESIGN AGENT ─────────────────────────────────────────
+  - name: designer
+    description: >-
+      Reads the spec for the target phase, researches the codebase,
+      and produces a detailed implementation design document.
+    model: claude-opus-4.6
+    input:
+      - workflow.input.phase
+      - workflow.input.spec_path
+      - design_reviewer.output?
+    system_prompt: |
+      You are a Principal Software Architect specializing in Go, Kubernetes
+      controllers, and Azure networking. You create precise, codebase-grounded
+      implementation designs.
+
+      Project context:
+      - Repository: pod-nsg-controller (Go, controller-runtime)
+      - Logging: All code must use go.uber.org/zap (uber-go/zap)
+      - Controller-runtime code uses logr backed by zapr
+      - Azure clients use *zap.Logger directly
+      - Tests use zaptest.NewLogger(t)
+    prompt: |
+      Create a detailed implementation design for the following phase.
+
+      **Phase:** {{ workflow.input.phase }}
+      **Specification:** Read the file at `{{ workflow.input.spec_path }}`
+
+      {% if design_reviewer is defined and design_reviewer.output and not design_reviewer.output.approved %}
+      **Design Review Feedback (Score: {{ design_reviewer.output.score }}/100):**
+      {{ design_reviewer.output.feedback }}
+
+      **Critical Issues:**
+      {% for issue in design_reviewer.output.critical_issues %}
+      - {{ issue }}
+      {% endfor %}
+
+      IMPORTANT: Revise the existing design to address the feedback.
+      Read the previous design from `{{ designer.output.design_path }}`.
+      {% endif %}
+
+      ## Tasks
+
+      1. **Read the Specification** — Parse the target phase from SPECIFICATION.md.
+         Extract: goal, step-by-step actions, deliverables, type definitions,
+         TDD acceptance tests.
+
+      2. **Research the Codebase** — Analyze existing code to understand:
+         - Current file structure and Go module layout
+         - Existing types, interfaces, and patterns
+         - Dependencies (go.mod) and available libraries
+         - Conventions (naming, error handling, logging with zap)
+
+      3. **Write Implementation Design** — Produce a document covering:
+         - Files to create/modify (exact paths)
+         - Go type definitions and function signatures
+         - Interface contracts
+         - Dependency graph between new and existing code
+         - Logging approach (zap fields per operation)
+         - Edge cases and error handling strategy
+         - Test file locations and test function names
+
+      4. **Save the Design** — Write to `.conductor/designs/{{ workflow.input.phase | replace(' ', '-') | lower }}.design.md`
+    output:
+      design_path:
+        type: string
+        description: Path where the design document was saved
+      files_to_create:
+        type: array
+        description: List of new files to be created
+      files_to_modify:
+        type: array
+        description: List of existing files to be modified
+      test_files:
+        type: array
+        description: List of test files to be created
+      revision_notes:
+        type: string
+        description: Summary of changes if this is a revision
+    routes:
+      - to: design_reviewer
+
+  # ─── 2. DESIGN REVIEW AGENT ──────────────────────────────────
+  - name: design_reviewer
+    description: >-
+      Reviews the implementation design for technical accuracy,
+      spec compliance, and feasibility.
+    model: claude-opus-4.6
+    input:
+      - workflow.input.phase
+      - workflow.input.spec_path
+      - designer.output
+    system_prompt: |
+      You are a Senior Engineering Reviewer specializing in Go, Kubernetes
+      controller-runtime, and Azure SDK. You validate implementation designs
+      against specifications.
+
+      You are especially attentive to:
+      - Whether the design covers ALL deliverables listed in the spec phase
+      - Whether ALL TDD acceptance tests from the spec are accounted for
+      - Correctness of Go type definitions and interface contracts
+      - Proper use of uber-go/zap logging (not fmt.Printf, not logr without zapr)
+      - Feasibility given existing codebase structure
+      - Missing edge cases or error handling
+    prompt: |
+      Review the implementation design for **{{ workflow.input.phase }}**.
+
+      **Specification:** Read `{{ workflow.input.spec_path }}` — focus on the
+      target phase section.
+
+      **Design Document:** Read `{{ designer.output.design_path }}`
+
+      ## Evaluation Criteria
+
+      | Criteria | Weight |
+      |----------|--------|
+      | Spec completeness (all deliverables covered) | 30% |
+      | TDD test coverage (all acceptance tests listed) | 25% |
+      | Technical correctness (Go types, interfaces) | 20% |
+      | Codebase consistency (patterns, conventions, zap) | 15% |
+      | Error handling and edge cases | 10% |
+
+      Score 0-100. Approve if score >= 85.
+    output:
+      score:
+        type: number
+        description: Design quality score 0-100
+      approved:
+        type: boolean
+        description: Whether the design is approved (score >= 85)
+      feedback:
+        type: string
+        description: Detailed review feedback
+      critical_issues:
+        type: array
+        description: Issues that must be addressed before implementation
+    routes:
+      - to: unit_test_writer
+        when: "{{ output.approved }}"
+      - to: designer
+        when: "{{ output.score < 85 }}"
+      - to: unit_test_writer
+
+  # ─── 3. UNIT TEST WRITER AGENT (TDD: Write Failing Tests) ───
+  - name: unit_test_writer
+    description: >-
+      Writes failing unit tests based on the TDD acceptance criteria
+      from the spec. Tests MUST fail before implementation.
+    model: claude-opus-4.6
+    input:
+      - workflow.input.phase
+      - workflow.input.spec_path
+      - designer.output
+    system_prompt: |
+      You are a Test Engineer specializing in Go testing, TDD, and Kubernetes
+      controller testing (envtest). You write comprehensive, failing tests
+      BEFORE any implementation code exists.
+
+      Testing conventions for this project:
+      - Use standard `testing` package with `t.Run()` subtests
+      - Use `zaptest.NewLogger(t)` from go.uber.org/zap/zaptest for test loggers
+      - Test naming: `TestPhaseX_Description` or grouped suites
+      - Use envtest for CRD/controller tests
+      - Use table-driven tests where appropriate
+      - Assert with `if got != want { t.Errorf(...) }` pattern (no testify)
+    prompt: |
+      Write failing unit tests for **{{ workflow.input.phase }}**.
+
+      **Specification:** Read `{{ workflow.input.spec_path }}` — extract the
+      TDD Acceptance Tests table for this phase.
+
+      **Design:** Read `{{ designer.output.design_path }}`
+
+      ## Tasks
+
+      1. **Extract ALL acceptance test IDs** from the spec (e.g., T1.1–T1.6)
+
+      2. **Create test files** at the paths specified in the design:
+      {% for test_file in designer.output.test_files %}
+         - `{{ test_file }}`
+      {% endfor %}
+
+      3. **Write test functions** for EVERY acceptance criterion:
+         - Each test must have a clear name matching the test ID
+         - Tests must call functions/types that DON'T EXIST YET
+         - Tests must assert the expected behavior from the spec
+         - Tests MUST FAIL when run (compilation errors are acceptable)
+
+      4. **Create minimal stub files** — Only empty package declarations
+         and placeholder type/function signatures that return zero values,
+         so that tests compile but FAIL on assertions.
+
+      5. **Run `go test`** to confirm all tests FAIL
+
+      **CRITICAL:** Do NOT implement any real logic. Tests must fail.
+    output:
+      test_files_created:
+        type: array
+        description: List of test files created
+      stub_files_created:
+        type: array
+        description: List of stub files created
+      test_count:
+        type: number
+        description: Total number of test functions written
+      all_tests_fail:
+        type: boolean
+        description: Whether all tests correctly fail
+      test_output:
+        type: string
+        description: Output from running go test (should show failures)
+    routes:
+      - to: coder
+
+  # ─── 4. CODER AGENT (Implementation) ─────────────────────────
+  - name: coder
+    description: >-
+      Implements the production code to make the failing tests pass.
+      Follows the design document and spec precisely.
+    model: claude-opus-4.6
+    input:
+      - workflow.input.phase
+      - workflow.input.spec_path
+      - designer.output
+      - unit_test_writer.output
+      - unit_test_validator.output?
+    system_prompt: |
+      You are a Senior Go Engineer specializing in Kubernetes controllers
+      and Azure SDK integration. You write clean, production-ready Go code
+      following existing codebase patterns.
+
+      Coding standards:
+      - All logging via go.uber.org/zap (uber-go/zap)
+        - Controller code: logr.Logger backed by zapr
+        - Azure clients: *zap.Logger directly
+        - Use typed field constructors: zap.String, zap.Int, zap.Error
+      - Error handling: wrap with fmt.Errorf("context: %w", err)
+      - No fmt.Printf or log.Println
+      - Follow existing naming conventions in the codebase
+      - Keep functions focused and testable
+    prompt: |
+      Implement the code to make all failing tests pass.
+
+      **Phase:** {{ workflow.input.phase }}
+      **Specification:** `{{ workflow.input.spec_path }}`
+      **Design:** `{{ designer.output.design_path }}`
+
+      **Test files that must pass:**
+      {% for tf in unit_test_writer.output.test_files_created %}
+      - `{{ tf }}`
+      {% endfor %}
+
+      {% if unit_test_validator is defined and unit_test_validator.output and not unit_test_validator.output.all_pass %}
+      **Previous attempt had failing tests:**
+      {{ unit_test_validator.output.failure_details }}
+
+      Fix the implementation to address these specific failures.
+      {% endif %}
+
+      ## Tasks
+
+      1. **Read the design and tests** — Understand what needs to be implemented
+      2. **Implement production code** in the files specified by the design:
+      {% for f in designer.output.files_to_create %}
+         - Create: `{{ f }}`
+      {% endfor %}
+      {% for f in designer.output.files_to_modify %}
+         - Modify: `{{ f }}`
+      {% endfor %}
+      3. **Run `go build ./...`** — Ensure compilation succeeds
+      4. **Run `go test ./...`** — Check which tests pass
+      5. **Iterate** until all tests pass
+      6. **Run `go vet ./...`** — No warnings
+
+      **CRITICAL:** Implement ONLY what is needed for this phase.
+      Do NOT modify test files. Do NOT skip tests.
+    output:
+      files_created:
+        type: array
+        description: Files created during implementation
+      files_modified:
+        type: array
+        description: Files modified during implementation
+      build_success:
+        type: boolean
+        description: Whether go build succeeds
+      implementation_notes:
+        type: string
+        description: Notes about decisions made during implementation
+    routes:
+      - to: unit_test_validator
+
+  # ─── 5. UNIT TEST VALIDATOR AGENT ────────────────────────────
+  - name: unit_test_validator
+    description: >-
+      Runs the full test suite and validates that ALL unit tests
+      from the spec acceptance criteria now pass.
+    model: claude-sonnet-4.6
+    input:
+      - workflow.input.phase
+      - unit_test_writer.output
+      - coder.output
+    system_prompt: |
+      You are a Test Validation agent. Your ONLY job is to run tests,
+      analyze results, and report pass/fail status. You do NOT write
+      code or fix issues — you only validate.
+    prompt: |
+      Validate that all unit tests pass after implementation.
+
+      **Test files:**
+      {% for tf in unit_test_writer.output.test_files_created %}
+      - `{{ tf }}`
+      {% endfor %}
+
+      ## Tasks
+
+      1. Run `go test ./... -v -count=1` to execute all tests
+      2. Parse the output to identify:
+         - Total tests run
+         - Tests that PASS
+         - Tests that FAIL (with failure messages)
+      3. Run `go vet ./...` to check for issues
+      4. Report results
+
+      Set `all_pass` to true ONLY if every test passes AND go vet is clean.
+    output:
+      all_pass:
+        type: boolean
+        description: Whether ALL tests pass
+      total_tests:
+        type: number
+        description: Total number of tests run
+      passed_tests:
+        type: number
+        description: Number of passing tests
+      failed_tests:
+        type: number
+        description: Number of failing tests
+      failure_details:
+        type: string
+        description: Details of any test failures
+      vet_clean:
+        type: boolean
+        description: Whether go vet passes cleanly
+    routes:
+      - to: integration_tester
+        when: "{{ output.all_pass }}"
+      - to: coder
+        when: "{{ not output.all_pass }}"
+
+  # ─── 6. INTEGRATION TEST AGENT ───────────────────────────────
+  - name: integration_tester
+    description: >-
+      Writes and runs integration tests that validate the phase's
+      components work together with adjacent modules.
+    model: claude-opus-4.6
+    input:
+      - workflow.input.phase
+      - workflow.input.spec_path
+      - designer.output
+      - coder.output
+      - unit_test_validator.output
+    system_prompt: |
+      You are an Integration Test Engineer. You write tests that verify
+      components work together across module boundaries.
+
+      For Kubernetes controllers, you use:
+      - envtest for CRD + controller integration tests
+      - Fake Azure clients (internal/azure/fake/) for ARM interactions
+      - zaptest.NewLogger(t) for test logging
+
+      Integration tests go in `test/integration/` or alongside the code
+      with `_integration_test.go` suffix.
+    prompt: |
+      Write and run integration tests for **{{ workflow.input.phase }}**.
+
+      **Specification:** `{{ workflow.input.spec_path }}`
+      **Design:** `{{ designer.output.design_path }}`
+
+      **Files implemented:**
+      {% for f in coder.output.files_created %}
+      - `{{ f }}`
+      {% endfor %}
+
+      **Unit test results:** {{ unit_test_validator.output.passed_tests }}/{{ unit_test_validator.output.total_tests }} passing
+
+      ## Tasks
+
+      1. **Identify cross-module integration points** for this phase
+      2. **Write integration tests** that verify:
+         - Components from this phase work with existing code
+         - Data flows correctly between modules
+         - Error propagation works across boundaries
+      3. **Run integration tests** and report results
+      4. If no meaningful integration points exist for this phase
+         (e.g., Phase 2 is pure functions), report that and move on
+
+      Save integration tests to appropriate locations.
+    output:
+      integration_test_files:
+        type: array
+        description: Integration test files created
+      integration_tests_pass:
+        type: boolean
+        description: Whether all integration tests pass
+      integration_notes:
+        type: string
+        description: Notes about integration test coverage
+    routes:
+      - to: qa_validator
+
+  # ─── 7. QA VALIDATOR AGENT ───────────────────────────────────
+  - name: qa_validator
+    description: >-
+      Final QA gate that validates the implementation against the
+      spec's acceptance criteria, checking completeness and correctness.
+    model: claude-opus-4.6
+    input:
+      - workflow.input.phase
+      - workflow.input.spec_path
+      - designer.output
+      - coder.output
+      - unit_test_validator.output
+      - integration_tester.output
+    system_prompt: |
+      You are a QA Validation agent. You perform the final quality gate
+      by verifying the implementation against the specification.
+
+      You are thorough, systematic, and uncompromising about spec compliance.
+      You check every deliverable, every acceptance test, and every edge case.
+    prompt: |
+      Perform final QA validation for **{{ workflow.input.phase }}**.
+
+      **Specification:** Read `{{ workflow.input.spec_path }}` — the target phase section.
+
+      **Design:** `{{ designer.output.design_path }}`
+
+      ## Validation Checklist
+
+      1. **Deliverables Audit** — Check EVERY deliverable in the spec's phase table:
+         - Does the file exist at the specified path?
+         - Does it contain the expected types/functions?
+         - Is the implementation complete (not stubbed)?
+
+      2. **TDD Acceptance Tests Audit** — For EVERY test ID (T1.1, T1.2, etc.):
+         - Does a corresponding test function exist?
+         - Does the test assert the correct behavior?
+         - Does the test PASS?
+
+      3. **Code Quality Check**:
+         - Run `go build ./...` — must succeed
+         - Run `go test ./... -count=1` — all must pass
+         - Run `go vet ./...` — must be clean
+         - Verify zap logging is used (no fmt.Printf, no bare logr)
+         - Verify error wrapping with %w
+
+      4. **Spec Compliance Score** — Rate 0-100:
+         | Criteria | Weight |
+         |----------|--------|
+         | All deliverables present | 30% |
+         | All acceptance tests pass | 30% |
+         | Code quality (build, vet, conventions) | 20% |
+         | Integration test coverage | 20% |
+
+      Approve if score >= 90. Otherwise, list specific gaps.
+    output:
+      score:
+        type: number
+        description: QA score 0-100
+      approved:
+        type: boolean
+        description: Whether the phase passes QA (score >= 90)
+      deliverables_complete:
+        type: boolean
+        description: Whether all spec deliverables are present
+      acceptance_tests_pass:
+        type: boolean
+        description: Whether all TDD acceptance tests pass
+      gaps:
+        type: array
+        description: List of specific gaps or issues found
+      feedback:
+        type: string
+        description: Detailed QA feedback
+    routes:
+      - to: $end
+        when: "{{ output.approved }}"
+      - to: coder
+        when: "{{ not output.approved }}"
+
+# ═══════════════════════════════════════════════════════════════════
+# WORKFLOW OUTPUT
+# ═══════════════════════════════════════════════════════════════════
+
+output:
+  phase: "{{ workflow.input.phase }}"
+  design_path: "{{ designer.output.design_path }}"
+  design_review_score: "{{ design_reviewer.output.score }}"
+  unit_tests_total: "{{ unit_test_validator.output.total_tests }}"
+  unit_tests_passed: "{{ unit_test_validator.output.passed_tests }}"
+  integration_tests_pass: "{{ integration_tester.output.integration_tests_pass }}"
+  qa_score: "{{ qa_validator.output.score }}"
+  qa_approved: "{{ qa_validator.output.approved }}"
+  files_created: "{{ coder.output.files_created }}"
+  iterations: "{{ context.iteration }}"
