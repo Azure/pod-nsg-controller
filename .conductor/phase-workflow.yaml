@@ -76,7 +76,7 @@ agents:
     description: >-
       Reads the spec for the target phase, researches the codebase,
       and produces a detailed implementation design document.
-    model: claude-opus-4.6
+    model: gpt-5.3-codex
     input:
       - workflow.input.phase
       - workflow.input.spec_path
@@ -157,7 +157,7 @@ agents:
     description: >-
       Reviews the implementation design for technical accuracy,
       spec compliance, and feasibility.
-    model: claude-opus-4.6
+    model: gemini-2.5-pro
     input:
       - workflow.input.phase
       - workflow.input.spec_path
@@ -218,7 +218,7 @@ agents:
     description: >-
       Writes failing unit tests based on the TDD acceptance criteria
       from the spec. Tests MUST fail before implementation.
-    model: claude-opus-4.6
+    model: claude-sonnet-4.6
     input:
       - workflow.input.phase
       - workflow.input.spec_path
@@ -289,7 +289,7 @@ agents:
     description: >-
       Implements the production code to make the failing tests pass.
       Follows the design document and spec precisely.
-    model: claude-opus-4.6
+    model: claude-sonnet-4.6
     input:
       - workflow.input.phase
       - workflow.input.spec_path
@@ -367,7 +367,7 @@ agents:
     description: >-
       Runs the full test suite and validates that ALL unit tests
       from the spec acceptance criteria now pass.
-    model: claude-sonnet-4.6
+    model: gpt-5.4
     input:
       - workflow.input.phase
       - unit_test_writer.output
@@ -486,7 +486,7 @@ agents:
     description: >-
       Final QA gate that validates the implementation against the
       spec's acceptance criteria, checking completeness and correctness.
-    model: claude-opus-4.6
+    model: gemini-2.5-pro
     input:
       - workflow.input.phase
       - workflow.input.spec_path
