@@ -37,13 +37,13 @@ The TDD phase workflow (`.conductor/phase-workflow.yaml`) orchestrates 7 agents:
 ```
 ┌──────────┐     ┌─────────────────┐     ┌───────────────────┐
 │ Designer │────►│ Design Reviewer │────►│ Unit Test Writer  │
-│ (Opus)   │◄────│ (Opus)          │     │ (Opus)            │
+│ (Codex)  │◄────│ (GPT-5.4)       │     │ (Opus)            │
 └──────────┘     └─────────────────┘     └────────┬──────────┘
   revise loop                                      │
                                                    ▼
                     ┌─────────────────────┐  ┌──────────┐
                     │ Unit Test Validator │◄─│  Coder   │
-                    │ (Sonnet)           │──►│  (Opus)  │
+                    │ (GPT-5.4)          │──►│  (Opus)  │
                     └────────┬───────────┘  └──────────┘
                              │ all pass          ▲
                              ▼              fix loop
@@ -55,7 +55,7 @@ The TDD phase workflow (`.conductor/phase-workflow.yaml`) orchestrates 7 agents:
                              ▼
                     ┌────────────────────┐
                     │  QA Validator      │──► $end (approved)
-                    │  (Opus)            │──► Coder (gaps)
+                    │  (GPT-5.4)         │──► Coder (gaps)
                     └────────────────────┘
 ```
 
@@ -149,9 +149,10 @@ These are Git-ignored and serve as working documents during the workflow.
 
 Edit `.conductor/phase-workflow.yaml` and update the `model` field on any agent.
 Options include:
-- `claude-opus-4.6` — Best for complex reasoning (design, implementation)
-- `claude-sonnet-4.6` — Good balance of speed/quality (review, validation)
-- `gpt-4.1` — Alternative option
+- `claude-opus-4.6` — Best for complex reasoning (test writing, implementation)
+- `claude-sonnet-4.6` — Good balance of speed/quality (default model)
+- `gpt-5.3-codex` — GPT Codex, strong for code-aware design
+- `gpt-5.4` — Latest GPT, fast and accurate for reviews and validation
 
 ### Adjusting Approval Thresholds
 
