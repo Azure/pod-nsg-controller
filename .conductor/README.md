@@ -64,12 +64,12 @@ The TDD phase workflow (`.conductor/phase-workflow.yaml`) orchestrates 7 agents:
 | Agent | Model | Role |
 |-------|-------|------|
 | **Designer** | GPT-5.3 Codex | Reads spec, researches codebase, produces implementation design |
-| **Design Reviewer** | Gemini 2.5 Pro | Validates design against spec (score ≥ 85 to approve) |
-| **Unit Test Writer** | Claude Sonnet 4.6 | Writes failing tests from TDD acceptance criteria (tests MUST fail) |
-| **Coder** | Claude Sonnet 4.6 | Implements production code to make tests pass |
+| **Design Reviewer** | GPT-5.4 | Validates design against spec (score ≥ 85 to approve) |
+| **Unit Test Writer** | Claude Opus 4.6 | Writes failing tests from TDD acceptance criteria (tests MUST fail) |
+| **Coder** | Claude Opus 4.6 | Implements production code to make tests pass |
 | **Unit Test Validator** | GPT-5.4 | Runs `go test` and `go vet`, reports pass/fail |
 | **Integration Tester** | Claude Opus 4.6 | Writes cross-module integration tests |
-| **QA Validator** | Gemini 2.5 Pro | Final gate — validates all deliverables against spec (score ≥ 90) |
+| **QA Validator** | GPT-5.4 | Final gate — validates all deliverables against spec (score ≥ 90) |
 
 ## Usage
 
