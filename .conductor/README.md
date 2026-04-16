@@ -56,7 +56,7 @@ The TDD phase workflow (`.conductor/phase-workflow.yaml`) orchestrates 8 agents 
                              ▼              fix loop
                     ┌────────────────────┐       │
                     │  Code Reviewer     │───────┘
-                    │  (Opus)            │  logic issues
+                    │  (GPT-5.4)         │  logic issues
                     └────────┬───────────┘
                              │ approved
                              ▼
@@ -94,7 +94,7 @@ The TDD phase workflow (`.conductor/phase-workflow.yaml`) orchestrates 8 agents 
 | **Unit Test Writer** | Claude Opus 4.6 | Writes failing tests from TDD acceptance criteria (tests MUST fail) |
 | **Coder** | Claude Opus 4.6 | Implements production code to make tests pass |
 | **Unit Test Validator** | GPT-5.4 | Runs `go test` and `go vet`, reports pass/fail |
-| **Code Reviewer** | Claude Opus 4.6 | Reviews logic, error handling, performance, security |
+| **Code Reviewer** | GPT-5.4 | Reviews logic, error handling, performance, security |
 | 🚦 **Implementation Gate** | Human | Approve implementation before integration tests, revise, or abort |
 | **Integration Tester** | Claude Opus 4.6 | Writes cross-module integration tests |
 | 🚦 **Pre-QA Gate** | Human | Review integration results and QA checklist before validation |

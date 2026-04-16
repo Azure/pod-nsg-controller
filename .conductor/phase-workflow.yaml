@@ -468,7 +468,7 @@ agents:
       Performs an experienced code review of the implementation,
       checking logic, patterns, performance, and maintainability.
       Returns to coder if issues are found.
-    model: claude-opus-4.6
+    model: gpt-5.4
     input:
       - workflow.input.phase
       - workflow.input.spec_path
