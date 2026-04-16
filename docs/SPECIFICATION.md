@@ -79,6 +79,76 @@ These principles govern all implementation phases:
 
 5. **Testability by design:** Azure clients expose interfaces so all controller logic can be tested with fakes/mocks. Credentials and HTTP transports are injectable.
 
+6. **Structured logging via `go.uber.org/zap`:** All components use the [Uber Zap](https://github.com/uber-go/zap) structured logger as the single logging backend. The controller-runtime integration uses `zapr.NewLogger(zapLog)` to bridge `logr.Logger` calls to Zap. Direct Zap loggers (`*zap.Logger` or `*zap.SugaredLogger`) are used in non-controller-runtime code (Azure clients, domain model utilities). All log output is structured JSON with fields: `timestamp` (ISO 8601), `level`, `msg`, and context-specific keys (`namespace`, `pod`, `asg`, `subscriptionID`, `operation`, `duration`).
+
+---
+
+## Logging Standard
+
+All code in this repository **must** use [`go.uber.org/zap`](https://github.com/uber-go/zap) for structured logging.
+
+### Logger Setup (Entry Point)
+
+The `cmd/main.go` entry point creates a production Zap logger and bridges it to controller-runtime via `zapr`:
+
+```go
+import (
+    "github.com/go-logr/zapr"
+    "go.uber.org/zap"
+    "go.uber.org/zap/zapcore"
+)
+
+zapCfg := zap.NewProductionConfig()
+zapCfg.EncoderConfig.TimeKey = "timestamp"
+zapCfg.EncoderConfig.EncodeTime = zapcore.ISO8601TimeEncoder
+zapLog, _ := zapCfg.Build()
+logger := zapr.NewLogger(zapLog)
+ctrl.SetLogger(logger)
+```
+
+### Usage by Component Type
+
+| Component | Logger Type | How to Obtain |
+|---|---|---|
+| **Controller / Reconciler** | `logr.Logger` (backed by Zap) | `log.FromContext(ctx)` or injected via struct field |
+| **Azure clients** | `*zap.Logger` | Passed via constructor (e.g., `NewExecutor(logger *zap.Logger, ...)`) |
+| **Domain model / engine** | `*zap.Logger` | Passed via function parameter or struct field |
+| **Tests** | `zap.NewNop()` or `zaptest.NewLogger(t)` | Use `go.uber.org/zap/zaptest` for test-scoped loggers |
+
+### Required Log Fields
+
+Every log line must include context-appropriate structured fields:
+
+| Field | Type | When to Include |
+|---|---|---|
+| `namespace` | string | Any operation scoped to a Kubernetes namespace |
+| `pod` | string | Any operation involving a specific pod |
+| `mapping` | string | Any operation involving a PodASGMapping CR |
+| `asg` | string | Any operation involving an ASG |
+| `subscriptionID` | string | Any Azure ARM call |
+| `resourceGroup` | string | Any Azure ARM call |
+| `prefixSetName` | string | Any addressPrefixSet operation |
+| `operation` | string | The ARM verb: `GET`, `PUT`, `DELETE` |
+| `duration` | duration | Any remote call (Azure, Kubernetes API) |
+| `error` | error | Any failed operation (use `zap.Error(err)`) |
+
+### Log Levels
+
+| Level | Usage |
+|---|---|
+| `Info` | Normal operations: reconcile start/end, ASG updates, status changes |
+| `Debug` (`V(1)` via logr) | Verbose: cache hits, predicate evaluations, skipped pods |
+| `Error` | Failed operations that will be retried or reported in status |
+| `Warn` (via `zap.Warn`) | Degraded state: ASG not found, invalid annotation (non-fatal) |
+
+### Rules
+
+1. **No `fmt.Printf` or `log.Println`** — all logging goes through Zap.
+2. **No `logr` without Zap backend** — `logr.Logger` instances must be backed by `zapr.NewLogger()`.
+3. **Always defer `zapLog.Sync()`** in `main()` to flush buffered logs.
+4. **Use `zap.String`, `zap.Int`, `zap.Error`** typed field constructors (not `zap.Any`) for performance.
+5. **In tests**, use `zaptest.NewLogger(t)` to capture logs and fail on unexpected errors.
+
 ---
 
 ## Phase 1: CRD Types, Scaffolding & Scheme Registration
