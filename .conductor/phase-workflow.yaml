@@ -558,12 +558,291 @@ agents:
         type: string
         description: One-paragraph summary of the review
     routes:
-      - to: implementation_review_gate
+      - to: unit_test_writer_v2
         when: "{{ output.approved }}"
       - to: coder
         when: "{{ not output.approved }}"
 
-  # ─── 5c. HUMAN GATE: Implementation Review ───────────────────
+  # ═══════════════════════════════════════════════════════════════
+  # ITERATION 2: Swapped models for independent validation
+  # Original: Writer(Opus) Coder(Opus) Validator(GPT) Reviewer(GPT)
+  # Swapped:  Writer(GPT)  Coder(GPT)  Validator(Opus) Reviewer(Opus)
+  # ═══════════════════════════════════════════════════════════════
+
+  # ─── 5c. UNIT TEST WRITER v2 (Swapped: GPT) ──────────────────
+  - name: unit_test_writer_v2
+    description: >-
+      Second pass: GPT reviews and strengthens the existing tests,
+      adding any missing edge cases or acceptance criteria coverage.
+    model: gpt-5.4
+    input:
+      - workflow.input.phase
+      - workflow.input.spec_path
+      - designer.output
+      - unit_test_writer.output
+      - coder.output
+      - code_reviewer.output
+    system_prompt: |
+      You are a Test Engineer using a different perspective to strengthen
+      existing tests. You review the current test suite and add any
+      missing edge cases, boundary conditions, or acceptance criteria
+      that the first pass may have missed.
+
+      Testing conventions for this project:
+      - Use standard `testing` package with `t.Run()` subtests
+      - Use `zaptest.NewLogger(t)` for test loggers
+      - Use table-driven tests where appropriate
+      - Assert with `if got != want { t.Errorf(...) }` pattern
+    prompt: |
+      Review and strengthen the test suite for **{{ workflow.input.phase }}**.
+
+      **Specification:** Read `{{ workflow.input.spec_path }}`
+      **Design:** Read `{{ designer.output.design_path }}`
+
+      **Existing test files from iteration 1:**
+      {% for tf in unit_test_writer.output.test_files_created %}
+      - `{{ tf }}`
+      {% endfor %}
+
+      **Code review feedback from iteration 1:**
+      {{ code_reviewer.output.review_summary }}
+
+      {% if code_reviewer.output.suggestions %}
+      **Suggestions that may need test coverage:**
+      {% for s in code_reviewer.output.suggestions %}
+      - {{ s }}
+      {% endfor %}
+      {% endif %}
+
+      ## Tasks
+
+      1. **Read all existing tests** and the spec's acceptance criteria
+      2. **Identify gaps** — any acceptance test IDs (T*.x) not covered,
+         edge cases from the code review, or boundary conditions missing
+      3. **Add new tests** or strengthen existing ones — do NOT remove
+         or weaken passing tests
+      4. **Run `go test ./... -v -count=1`** to confirm all tests pass
+         (existing + new)
+
+      If the test suite is already comprehensive, report that and proceed.
+    output:
+      test_files_updated:
+        type: array
+        description: Test files created or updated in this pass
+      new_tests_added:
+        type: number
+        description: Number of new test functions added
+      gaps_found:
+        type: array
+        description: Test gaps that were identified and filled
+      all_tests_pass:
+        type: boolean
+        description: Whether all tests (old + new) pass
+    routes:
+      - to: coder_v2
+
+  # ─── 5d. CODER v2 (Swapped: GPT) ─────────────────────────────
+  - name: coder_v2
+    description: >-
+      Second pass: GPT reviews the implementation and fixes any issues
+      surfaced by the new tests or code review suggestions.
+    model: gpt-5.4
+    input:
+      - workflow.input.phase
+      - workflow.input.spec_path
+      - designer.output
+      - coder.output
+      - code_reviewer.output
+      - unit_test_writer_v2.output
+      - unit_test_validator_v2.output?
+    system_prompt: |
+      You are a Senior Go Engineer performing a second implementation pass.
+      You fix any issues found by new tests and address code review
+      suggestions from the first iteration.
+
+      Coding standards:
+      - All logging via go.uber.org/zap
+      - controller-runtime code uses logr.Logger backed by zapr
+      - Errors wrapped with fmt.Errorf("context: %w", err)
+      - Follow existing codebase patterns
+    prompt: |
+      Second implementation pass for **{{ workflow.input.phase }}**.
+
+      **Design:** `{{ designer.output.design_path }}`
+
+      **Code review suggestions from iteration 1:**
+      {% for s in code_reviewer.output.suggestions %}
+      - {{ s }}
+      {% endfor %}
+
+      **New tests added in iteration 2:**
+      {% for tf in unit_test_writer_v2.output.test_files_updated %}
+      - `{{ tf }}`
+      {% endfor %}
+
+      {% if unit_test_validator_v2 is defined and unit_test_validator_v2.output and not unit_test_validator_v2.output.all_pass %}
+      **Failing tests to fix:**
+      {{ unit_test_validator_v2.output.failure_details }}
+      {% endif %}
+
+      ## Tasks
+
+      1. **Fix any failing tests** from the new test pass
+      2. **Address code review suggestions** where they improve correctness
+      3. **Run `go build ./...`** and **`go test ./... -v -count=1`**
+      4. **Run `go vet ./...`**
+
+      Do NOT break existing passing tests.
+    output:
+      files_modified:
+        type: array
+        description: Files modified in this pass
+      changes_made:
+        type: array
+        description: Specific changes made
+      build_success:
+        type: boolean
+        description: Whether go build succeeds
+      implementation_notes:
+        type: string
+        description: Notes about changes in this pass
+    routes:
+      - to: unit_test_validator_v2
+
+  # ─── 5e. UNIT TEST VALIDATOR v2 (Swapped: Opus) ──────────────
+  - name: unit_test_validator_v2
+    description: >-
+      Second pass: Opus validates that ALL tests (original + new) pass.
+    model: claude-opus-4.6
+    input:
+      - workflow.input.phase
+      - unit_test_writer.output
+      - unit_test_writer_v2.output
+      - coder_v2.output
+    system_prompt: |
+      You are a Test Validation agent. Your ONLY job is to run tests,
+      analyze results, and report pass/fail status. You do NOT write
+      code or fix issues — you only validate.
+    prompt: |
+      Validate that ALL tests pass after the second implementation pass.
+
+      **Original test files:**
+      {% for tf in unit_test_writer.output.test_files_created %}
+      - `{{ tf }}`
+      {% endfor %}
+
+      **New/updated test files from iteration 2:**
+      {% for tf in unit_test_writer_v2.output.test_files_updated %}
+      - `{{ tf }}`
+      {% endfor %}
+
+      ## Tasks
+
+      1. Run `go test ./... -v -count=1` to execute ALL tests
+      2. Parse the output — identify pass/fail for every test
+      3. Run `go vet ./...`
+      4. Report results
+
+      Set `all_pass` to true ONLY if every test passes AND go vet is clean.
+    output:
+      all_pass:
+        type: boolean
+        description: Whether ALL tests pass
+      total_tests:
+        type: number
+        description: Total number of tests run
+      passed_tests:
+        type: number
+        description: Number of passing tests
+      failed_tests:
+        type: number
+        description: Number of failing tests
+      failure_details:
+        type: string
+        description: Details of any test failures
+      vet_clean:
+        type: boolean
+        description: Whether go vet passes cleanly
+    routes:
+      - to: code_reviewer_v2
+        when: "{{ output.all_pass }}"
+      - to: coder_v2
+        when: "{{ not output.all_pass }}"
+
+  # ─── 5f. CODE REVIEWER v2 (Swapped: Opus) ────────────────────
+  - name: code_reviewer_v2
+    description: >-
+      Second pass: Opus reviews the final implementation for any
+      remaining logic issues before the human gate.
+    model: claude-opus-4.6
+    input:
+      - workflow.input.phase
+      - workflow.input.spec_path
+      - designer.output
+      - coder.output
+      - coder_v2.output
+      - unit_test_validator_v2.output
+      - code_reviewer.output
+    system_prompt: |
+      You are a Principal Engineer performing a final code review.
+      This is the SECOND review pass using a different model than the
+      first reviewer. Focus on anything the first review may have missed.
+
+      You focus on substantive issues — logic bugs, incorrect assumptions,
+      performance pitfalls, security concerns, and maintainability.
+
+      Project conventions:
+      - All logging via go.uber.org/zap
+      - controller-runtime code uses logr.Logger backed by zapr
+      - Errors wrapped with fmt.Errorf("context: %w", err)
+    prompt: |
+      Final code review for **{{ workflow.input.phase }}** (iteration 2).
+
+      **Design:** `{{ designer.output.design_path }}`
+      **Specification:** `{{ workflow.input.spec_path }}`
+
+      **First review summary:** {{ code_reviewer.output.review_summary }}
+
+      **Changes in iteration 2:**
+      {% for c in coder_v2.output.changes_made %}
+      - {{ c }}
+      {% endfor %}
+
+      **Files modified in iteration 2:**
+      {% for f in coder_v2.output.files_modified %}
+      - `{{ f }}`
+      {% endfor %}
+
+      **All tests:** {{ unit_test_validator_v2.output.passed_tests }}/{{ unit_test_validator_v2.output.total_tests }} passing
+
+      ## Review Focus
+
+      1. **Were first-review suggestions addressed properly?**
+      2. **Any new issues introduced in iteration 2?**
+      3. **Final logic correctness check** — ready for integration?
+
+      Approve if the implementation is solid. Only block for genuine
+      logic issues that would cause incorrect behavior.
+    output:
+      approved:
+        type: boolean
+        description: Whether the code passes final review
+      critical_issues:
+        type: array
+        description: Any remaining logic issues
+      feedback:
+        type: string
+        description: Final review feedback
+      review_summary:
+        type: string
+        description: One-paragraph summary
+    routes:
+      - to: implementation_review_gate
+        when: "{{ output.approved }}"
+      - to: coder_v2
+        when: "{{ not output.approved }}"
+
+  # ─── 5g. HUMAN GATE: Implementation Review ───────────────────
   - name: implementation_review_gate
     type: human_gate
     description: >-
@@ -574,15 +853,18 @@ agents:
 
       **Phase:** {{ workflow.input.phase }}
 
-      **Test Results:** {{ unit_test_validator.output.passed_tests }}/{{ unit_test_validator.output.total_tests }} tests passing
-      **go vet clean:** {{ unit_test_validator.output.vet_clean }}
+      ### Iteration 1 (Opus coder / GPT reviewer)
+      **Tests:** {{ unit_test_validator.output.passed_tests }}/{{ unit_test_validator.output.total_tests }} passing
+      **Review:** {{ code_reviewer.output.review_summary }}
 
-      **Code Review:** {{ code_reviewer.output.review_summary }}
+      ### Iteration 2 (GPT coder / Opus reviewer)
+      **Tests:** {{ unit_test_validator_v2.output.passed_tests }}/{{ unit_test_validator_v2.output.total_tests }} passing
+      **Review:** {{ code_reviewer_v2.output.review_summary }}
 
-      {% if code_reviewer.output.suggestions %}
-      **Reviewer Suggestions (non-blocking):**
-      {% for s in code_reviewer.output.suggestions %}
-      - {{ s }}
+      {% if code_reviewer_v2.output.critical_issues %}
+      **Remaining issues (iteration 2):**
+      {% for i in code_reviewer_v2.output.critical_issues %}
+      - {{ i }}
       {% endfor %}
       {% endif %}
 

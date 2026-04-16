@@ -32,7 +32,7 @@ conductor --version
 
 ## Workflow Architecture
 
-The TDD phase workflow (`.conductor/phase-workflow.yaml`) orchestrates 8 agents + 3 human gates:
+The TDD phase workflow (`.conductor/phase-workflow.yaml`) orchestrates 12 agents + 3 human gates:
 
 ```
 ┌──────────┐     ┌─────────────────┐     ┌──────────────────┐
@@ -59,6 +59,28 @@ The TDD phase workflow (`.conductor/phase-workflow.yaml`) orchestrates 8 agents 
                     │  (GPT-5.4)         │  logic issues
                     └────────┬───────────┘
                              │ approved
+                   ══════════╪══════════════════════════
+                    ITERATION 2 (swapped models)
+                   ══════════╪══════════════════════════
+                             ▼
+                    ┌───────────────────┐
+                    │ Unit Test Writer  │
+                    │ v2 (GPT-5.4)     │
+                    └────────┬──────────┘
+                             │
+                             ▼
+                    ┌─────────────────────┐  ┌──────────┐
+                    │ Unit Test Validator │◄─│ Coder v2 │
+                    │ v2 (Opus)          │──►│ (GPT-5.4)│
+                    └────────┬───────────┘  └──────────┘
+                             │ all pass          ▲
+                             ▼              fix loop
+                    ┌────────────────────┐       │
+                    │ Code Reviewer      │───────┘
+                    │ v2 (Opus)          │  logic issues
+                    └────────┬───────────┘
+                             │ approved
+                   ══════════╪══════════════════════════
                              ▼
                     ┌──────────────────────┐
                     │ 🚦 Implementation    │
@@ -95,6 +117,10 @@ The TDD phase workflow (`.conductor/phase-workflow.yaml`) orchestrates 8 agents 
 | **Coder** | Claude Opus 4.6 | Implements production code to make tests pass |
 | **Unit Test Validator** | GPT-5.4 | Runs `go test` and `go vet`, reports pass/fail |
 | **Code Reviewer** | GPT-5.4 | Reviews logic, error handling, performance, security |
+| **Unit Test Writer v2** | GPT-5.4 | Second pass: strengthens tests, fills gaps (swapped model) |
+| **Coder v2** | GPT-5.4 | Second pass: fixes issues from new tests and review (swapped model) |
+| **Unit Test Validator v2** | Claude Opus 4.6 | Second pass: validates all tests pass (swapped model) |
+| **Code Reviewer v2** | Claude Opus 4.6 | Second pass: final logic review (swapped model) |
 | 🚦 **Implementation Gate** | Human | Approve implementation before integration tests, revise, or abort |
 | **Integration Tester** | Claude Opus 4.6 | Writes cross-module integration tests |
 | 🚦 **Pre-QA Gate** | Human | Review integration results and QA checklist before validation |
