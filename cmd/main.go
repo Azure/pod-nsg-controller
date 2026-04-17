@@ -2,6 +2,7 @@ package main
 
 import (
 	"flag"
+	"fmt"
 	"os"
 
 	"github.com/go-logr/zapr"
@@ -15,6 +16,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/healthz"
 	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
 
+	"github.com/Azure/pod-nsg-controller/api/v1alpha1"
 	"github.com/Azure/pod-nsg-controller/internal/azure"
 	"github.com/Azure/pod-nsg-controller/internal/config"
 	"github.com/Azure/pod-nsg-controller/internal/controller"
@@ -25,6 +27,7 @@ var scheme = runtime.NewScheme()
 func init() {
 	utilruntime.Must(clientgoscheme.AddToScheme(scheme))
 	utilruntime.Must(corev1.AddToScheme(scheme))
+	utilruntime.Must(v1alpha1.AddToScheme(scheme))
 }
 
 func main() {
@@ -42,8 +45,10 @@ func main() {
 	zapCfg.EncoderConfig.EncodeTime = zapcore.ISO8601TimeEncoder
 	zapLog, err := zapCfg.Build()
 	if err != nil {
+		_, _ = fmt.Fprintf(os.Stderr, "failed to initialize zap logger: %v\n", err)
 		os.Exit(1)
 	}
+	defer func() { _ = zapLog.Sync() }()
 	logger := zapr.NewLogger(zapLog)
 	ctrl.SetLogger(logger)
 
