@@ -77,6 +77,15 @@ func configureEnvtestAssets(repoRoot string) error {
 	return os.Setenv("KUBEBUILDER_ASSETS", assetsPath)
 }
 
+func hasEnvtestBinaries(assetsPath string) bool {
+	for _, binary := range []string{"etcd", "kube-apiserver", "kubectl"} {
+		if _, err := os.Stat(filepath.Join(assetsPath, binary)); err != nil {
+			return false
+		}
+	}
+	return true
+}
+
 func localEnvtestAssetsPath(repoRoot string) (string, error) {
 	assetsRoot := filepath.Join(repoRoot, "bin", "k8s")
 	entries, err := os.ReadDir(assetsRoot)
@@ -89,12 +98,9 @@ func localEnvtestAssetsPath(repoRoot string) (string, error) {
 			continue
 		}
 		assetsPath := filepath.Join(assetsRoot, entry.Name())
-		for _, binary := range []string{"etcd", "kube-apiserver", "kubectl"} {
-			if _, err := os.Stat(filepath.Join(assetsPath, binary)); err != nil {
-				continue
-			}
+		if hasEnvtestBinaries(assetsPath) {
+			return assetsPath, nil
 		}
-		return assetsPath, nil
 	}
 	return "", fmt.Errorf("envtest assets for %s not found under %q", envtestK8sVersion, assetsRoot)
 }
@@ -285,13 +291,19 @@ func TestIntegration_ManagerCreationWithCRD(t *testing.T) {
 		ctx, cancel := context.WithCancel(context.Background())
 		defer cancel()
 
+		startErrCh := make(chan error, 1)
 		go func() {
-			_ = mgr.Start(ctx)
+			startErrCh <- mgr.Start(ctx)
 		}()
 
-		// Wait for cache sync
+		// Wait for cache sync; if it fails, distinguish a Start error from a plain sync timeout.
 		if !mgr.GetCache().WaitForCacheSync(ctx) {
-			t.Fatal("cache sync failed")
+			select {
+			case err := <-startErrCh:
+				t.Fatalf("manager Start failed: %v", err)
+			default:
+				t.Fatal("cache sync failed")
+			}
 		}
 
 		// Use manager's client (cached) to create and get PodASGMapping
@@ -343,12 +355,19 @@ func TestIntegration_CacheInformerForCRD(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
+	startErrCh := make(chan error, 1)
 	go func() {
-		_ = mgr.Start(ctx)
+		startErrCh <- mgr.Start(ctx)
 	}()
 
+	// Wait for cache sync; if it fails, distinguish a Start error from a plain sync timeout.
 	if !mgr.GetCache().WaitForCacheSync(ctx) {
-		t.Fatal("cache sync failed")
+		select {
+		case err := <-startErrCh:
+			t.Fatalf("manager Start failed: %v", err)
+		default:
+			t.Fatal("cache sync failed")
+		}
 	}
 
 	t.Run("GetInformerForCRDType", func(t *testing.T) {

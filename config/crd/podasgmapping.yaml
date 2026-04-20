@@ -16,7 +16,7 @@ spec:
   versions:
   - additionalPrinterColumns:
     - description: Number of mapping rules
-      jsonPath: .spec.mappings
+      jsonPath: .status.mappingCount
       name: Mappings
       type: integer
     - jsonPath: .metadata.creationTimestamp
@@ -146,6 +146,8 @@ spec:
                   - type
                   type: object
                 type: array
+              mappingCount:
+                type: integer
               mappingStatuses:
                 items:
                   description: MappingStatus tracks the status of a single mapping

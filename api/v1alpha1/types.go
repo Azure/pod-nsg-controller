@@ -7,7 +7,7 @@ import (
 // PodASGMapping is the Schema for the podasgmappings API.
 // +kubebuilder:object:root=true
 // +kubebuilder:subresource:status
-// +kubebuilder:printcolumn:name="Mappings",type=integer,JSONPath=`.spec.mappings`,description="Number of mapping rules"
+// +kubebuilder:printcolumn:name="Mappings",type=integer,JSONPath=`.status.mappingCount`,description="Number of mapping rules"
 // +kubebuilder:printcolumn:name="Age",type=date,JSONPath=`.metadata.creationTimestamp`
 type PodASGMapping struct {
 	metav1.TypeMeta   `json:",inline"`
@@ -55,6 +55,7 @@ type ASGReference struct {
 // PodASGMappingStatus defines the observed state of PodASGMapping.
 type PodASGMappingStatus struct {
 	Conditions      []metav1.Condition `json:"conditions,omitempty"`
+	MappingCount    int                `json:"mappingCount,omitempty"`
 	MappingStatuses []MappingStatus    `json:"mappingStatuses,omitempty"`
 }
 
