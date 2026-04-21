@@ -1,5 +1,12 @@
 IMG ?= pod-nsg-controller:latest
 
+LOCALBIN ?= $(PWD)/bin
+CONTROLLER_GEN ?= $(LOCALBIN)/controller-gen
+CONTROLLER_GEN_VERSION ?= v0.16.5
+SETUP_ENVTEST ?= $(LOCALBIN)/setup-envtest
+SETUP_ENVTEST_VERSION ?= release-0.19
+ENVTEST_K8S_VERSION ?= 1.31.x
+
 .PHONY: all
 all: build
 
@@ -24,7 +31,8 @@ lint: ## Run golangci-lint against code.
 	golangci-lint run ./...
 
 .PHONY: test
-test: fmt vet ## Run tests.
+test: generate manifests fmt vet setup-envtest ## Run tests.
+	KUBEBUILDER_ASSETS="$$(cd "$$( $(SETUP_ENVTEST) use $(ENVTEST_K8S_VERSION) --bin-dir $(LOCALBIN) -p path )" && pwd)" \
 	go test ./... -coverprofile cover.out
 
 .PHONY: test-coverage
@@ -62,12 +70,28 @@ undeploy: ## Undeploy controller from the K8s cluster specified in ~/.kube/confi
 	kubectl delete -f config/rbac/
 
 .PHONY: generate
-generate: ## Generate code and manifests.
-	@echo "No code generation configured yet."
+generate: $(CONTROLLER_GEN) ## Generate code (deepcopy).
+	$(CONTROLLER_GEN) object paths=./api/...
 
 .PHONY: manifests
-manifests: ## Generate Kubernetes manifests.
-	@echo "No manifest generation configured yet."
+manifests: $(CONTROLLER_GEN) ## Generate Kubernetes manifests (CRD YAML).
+	mkdir -p config/crd
+	rm -f config/crd/podasgmapping.yaml config/crd/networking.azure.com_podasgmappings.yaml
+	$(CONTROLLER_GEN) crd paths=./api/... output:crd:dir=config/crd
+	test -f config/crd/networking.azure.com_podasgmappings.yaml
+	mv config/crd/networking.azure.com_podasgmappings.yaml config/crd/podasgmapping.yaml
+
+.PHONY: setup-envtest
+setup-envtest: $(SETUP_ENVTEST) ## Download envtest helper and Kubernetes test assets.
+	@$(SETUP_ENVTEST) use $(ENVTEST_K8S_VERSION) --bin-dir $(LOCALBIN) -p path >/dev/null
+
+$(CONTROLLER_GEN):
+	mkdir -p $(LOCALBIN)
+	GOBIN=$(LOCALBIN) go install sigs.k8s.io/controller-tools/cmd/controller-gen@$(CONTROLLER_GEN_VERSION)
+
+$(SETUP_ENVTEST):
+	mkdir -p $(LOCALBIN)
+	GOBIN=$(LOCALBIN) go install sigs.k8s.io/controller-runtime/tools/setup-envtest@$(SETUP_ENVTEST_VERSION)
 
 ##@ Cleanup
 
