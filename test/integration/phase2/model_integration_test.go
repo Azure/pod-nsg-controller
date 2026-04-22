@@ -465,9 +465,8 @@ func TestIntegration_RealisticScenario_MultiCR_MultiSubscription(t *testing.T) {
 		t.Errorf("backend pod ASG[0]: want %s, got %s", asgBackend, beResults[0].ResourceID)
 	}
 
-	// Pod matching both tiers → union of all 3 unique ASGs.
+	// Pod with only tier: frontend → matches frontend rule only → 2 ASGs (frontend + shared).
 	bothPod := pod("app-ns", "both-pod", map[string]string{"tier": "frontend"})
-	// Only matches frontend rule, so 2 ASGs.
 	bothResults := idx.MatchingASGs(bothPod)
 	if len(bothResults) != 2 {
 		t.Fatalf("both pod: want 2 ASGs, got %d", len(bothResults))

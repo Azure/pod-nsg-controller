@@ -8,10 +8,15 @@ import (
 	"k8s.io/apimachinery/pkg/labels"
 )
 
+type compiledASGRef struct {
+	ref          v1alpha1.ASGReference
+	canonicalKey string
+}
+
 type compiledEntry struct {
 	namespace string
 	selector  labels.Selector
-	asgs      []v1alpha1.ASGReference
+	asgs      []compiledASGRef
 }
 
 // MappingIndex holds compiled mapping entries for efficient pod-to-ASG lookup.
@@ -29,7 +34,13 @@ func BuildIndex(mappings []v1alpha1.PodASGMapping) *MappingIndex {
 		for j := range m.Spec.Mappings {
 			rule := &m.Spec.Mappings[j]
 			sel, _ := CompileSelector(rule.PodSelector)
-			asgs := append([]v1alpha1.ASGReference(nil), rule.ApplicationSecurityGroups...)
+			asgs := make([]compiledASGRef, len(rule.ApplicationSecurityGroups))
+			for k, asgRef := range rule.ApplicationSecurityGroups {
+				asgs[k] = compiledASGRef{
+					ref:          asgRef,
+					canonicalKey: canonicalASGKey(asgRef.ResourceID),
+				}
+			}
 			entries = append(entries, compiledEntry{
 				namespace: ns,
 				selector:  sel,
@@ -60,13 +71,12 @@ func (idx *MappingIndex) MatchingASGs(pod *corev1.Pod) []v1alpha1.ASGReference {
 		if !e.selector.Matches(podLabels) {
 			continue
 		}
-		for _, asg := range e.asgs {
-			key := canonicalASGKey(asg.ResourceID)
-			if _, exists := seen[key]; exists {
+		for _, asgRef := range e.asgs {
+			if _, exists := seen[asgRef.canonicalKey]; exists {
 				continue
 			}
-			seen[key] = struct{}{}
-			result = append(result, asg)
+			seen[asgRef.canonicalKey] = struct{}{}
+			result = append(result, asgRef.ref)
 		}
 	}
 	return result
