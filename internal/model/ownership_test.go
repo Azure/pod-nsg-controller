@@ -128,7 +128,7 @@ func TestPhase2_OwnershipKey_AmbiguousDashBoundaries(t *testing.T) {
 	// but MUST be distinct when any of the three inputs differ.
 	// E.g., ("a-b", "c", "d") vs ("a", "b-c", "d") vs ("a", "b", "c-d")
 	tests := []struct {
-		name string
+		name    string
 		c, n, m string
 	}{
 		{"dashes in cluster", "a-b", "c", "d"},
