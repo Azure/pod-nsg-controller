@@ -38,12 +38,8 @@ func TestPhase2_T22_ParseInvalidResourceIDWrongProvider(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected error for wrong provider, got nil")
 	}
-	if !strings.Contains(err.Error(), "") {
-		// Error should be descriptive
-	}
-	// Verify it's a descriptive error (not just empty)
-	if len(err.Error()) == 0 {
-		t.Errorf("error message should be descriptive, got empty string")
+	if !strings.Contains(err.Error(), "Microsoft.Network") {
+		t.Errorf("error message should mention expected provider 'Microsoft.Network', got: %q", err.Error())
 	}
 }
 
