@@ -81,6 +81,8 @@ These principles govern all implementation phases:
 
 6. **Structured logging via `go.uber.org/zap`:** All components use the [Uber Zap](https://github.com/uber-go/zap) structured logger as the single logging backend. The controller-runtime integration uses `zapr.NewLogger(zapLog)` to bridge `logr.Logger` calls to Zap. Direct Zap loggers (`*zap.Logger` or `*zap.SugaredLogger`) are used in non-controller-runtime code (Azure clients, domain model utilities). All log output is structured JSON with fields: `timestamp` (ISO 8601), `level`, `msg`, and context-specific keys (`namespace`, `pod`, `asg`, `subscriptionID`, `operation`, `duration`).
 
+7. **Error wrapping via `github.com/pkg/errors`:** All error wrapping must use `errors.Wrap` and `errors.Wrapf` from [`github.com/pkg/errors`](https://github.com/pkg/errors). Do not use `fmt.Errorf("…: %w", err)` for wrapping. This ensures stack traces are captured at wrap sites and error chains are consistent across the codebase. Use `errors.New` from `pkg/errors` for sentinel errors that need stack traces, and `errors.WithMessage` / `errors.WithMessagef` when adding context without a new stack frame.
+
 ---
 
 ## Logging Standard
