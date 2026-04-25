@@ -107,6 +107,7 @@ func main() {
 	}
 
 	setupLog.Info("starting manager",
+		"clusterName", cfg.ClusterName,
 		"subscriptionID", cfg.SubscriptionID,
 		"resourceGroup", cfg.ResourceGroup,
 		"nsgName", cfg.NSGName,
