@@ -798,9 +798,8 @@ func TestIntegration_LargeScale_ManyMappingsAndPods(t *testing.T) {
 		mappings = append(mappings, m)
 
 		for j := 0; j < podsPerMapping; j++ {
-			ip := "10.0." + string(rune('0'+i)) + "." + string(rune('0'+j))
 			// Use numeric approach for deterministic IPs.
-			ip = fmt.Sprintf("10.%d.%d.%d", i/256, i%256, j)
+			ip := fmt.Sprintf("10.%d.%d.%d", i/256, i%256, j)
 			pods = append(pods, makePod("default", fmt.Sprintf("pod-%d-%d", i, j),
 				map[string]string{"app": appLabel}, ip))
 		}
