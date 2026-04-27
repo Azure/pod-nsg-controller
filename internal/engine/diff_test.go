@@ -278,13 +278,13 @@ func TestPhase3_Diff_NilInputsHandledAsEmpty(t *testing.T) {
 	})
 }
 
-// Test case sensitivity bug in struct-based map key comparison
-func TestPhase3_Diff_CaseSensitivityBug(t *testing.T) {
-	// Desired state built from resource ID with "MyRG"
+// Test that targets differing only by resource group casing are treated as the same identity.
+// Azure resource IDs are case-insensitive, so "MyRG" and "MYRG" refer to the same resource.
+func TestPhase3_Diff_CaseInsensitiveResourceGroupMatch(t *testing.T) {
+	// Desired state built with "MyRG" casing.
 	target1 := makeTarget("sub-1", "MyRG", "asg-a", "cluster-ns-mapping")
 
-	// Actual state from Azure (or different mapping) with "MYRG"
-	// Azure resource IDs are case-insensitive, so this is the SAME resource
+	// Actual state returned by Azure with "MYRG" casing — same resource, different case.
 	target2 := makeTarget("sub-1", "MYRG", "asg-a", "cluster-ns-mapping")
 
 	desired := map[ASGTarget]DesiredPrefixSet{
@@ -296,16 +296,15 @@ func TestPhase3_Diff_CaseSensitivityBug(t *testing.T) {
 
 	actions := ComputeDiff(desired, actual)
 
-	// BUG: Should produce 0 actions (same resource, same IPs)
-	// But produces 2 actions (Create + Delete) because struct equality fails
+	// Case-insensitive identity matching means these two targets resolve to the same key.
+	// IPs are identical, so no actions should be produced.
 	t.Logf("Number of actions: %d", len(actions))
 	for _, action := range actions {
 		t.Logf("  %s: %s (RG=%s)", action.Kind, action.Target.ASGName, action.Target.ResourceGroup)
 	}
 
 	if len(actions) != 0 {
-		t.Errorf("BUG: Got %d actions, want 0 (case-insensitive Azure resource IDs should match)", len(actions))
-		t.Errorf("This will cause spurious Create/Delete actions in production!")
+		t.Errorf("Got %d actions, want 0 (case-insensitive Azure resource IDs must match)", len(actions))
 	}
 }
 
