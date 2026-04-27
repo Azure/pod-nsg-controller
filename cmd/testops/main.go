@@ -34,7 +34,14 @@ func main() {
 	zapCfg := zap.NewProductionConfig()
 	zapCfg.EncoderConfig.TimeKey = "timestamp"
 	zapCfg.EncoderConfig.EncodeTime = zapcore.ISO8601TimeEncoder
-	zapLog, _ := zapCfg.Build()
+	zapLog, err := zapCfg.Build()
+	if err != nil {
+		fmt.Printf("FATAL: cannot build logger: %v\n", err)
+		os.Exit(1)
+	}
+	defer func() {
+		_ = zapLog.Sync()
+	}()
 	logger := zapr.NewLogger(zapLog)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
