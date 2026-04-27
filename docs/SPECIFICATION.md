@@ -81,6 +81,8 @@ These principles govern all implementation phases:
 
 6. **Structured logging via `go.uber.org/zap`:** All components use the [Uber Zap](https://github.com/uber-go/zap) structured logger as the single logging backend. The controller-runtime integration uses `zapr.NewLogger(zapLog)` to bridge `logr.Logger` calls to Zap. Direct Zap loggers (`*zap.Logger` or `*zap.SugaredLogger`) are used in non-controller-runtime code (Azure clients, domain model utilities). All log output is structured JSON with fields: `timestamp` (ISO 8601), `level`, `msg`, and context-specific keys (`namespace`, `pod`, `asg`, `subscriptionID`, `operation`, `duration`).
 
+7. **Error wrapping via `github.com/pkg/errors`:** All error wrapping must use `errors.Wrap` and `errors.Wrapf` from [`github.com/pkg/errors`](https://github.com/pkg/errors). Do not use `fmt.Errorf("…: %w", err)` for wrapping. This ensures stack traces are captured at wrap sites and error chains are consistent across the codebase. Use `errors.New` from `pkg/errors` for sentinel errors that need stack traces, and `errors.WithMessage` / `errors.WithMessagef` when adding context without a new stack frame.
+
 ---
 
 ## Logging Standard
@@ -270,6 +272,8 @@ Build the pure domain logic that sits between the Kubernetes API and Azure API. 
    - `OwnershipKey(clusterName, namespace, mappingName string) string`
    - Returns `"{clusterName}-{namespace}-{mappingName}"`
    - This is the `addressPrefixSetName` used per ASG
+   - Ownership is per `{clusterName}-{namespace}-{mappingName}`; two different mappings never share a prefix set, even when they reference the same ASG
+   - Engine target identity compares both the ASG resource ID and `addressPrefixSetName` case-insensitively, matching Azure's case-insensitive resource naming behavior
 5. **Implement Mapping index** in `internal/model/index.go`:
    - `BuildIndex(mappings []PodASGMapping) *MappingIndex`
    - `(*MappingIndex).MatchingASGs(pod *corev1.Pod) []ASGReference`
@@ -354,7 +358,7 @@ Given the set of `PodASGMapping` CRs and live Pods, compute the **desired conten
 | `T3.1` | Single mapping, 3 pods match, 1 ASG | Desired state has 3 IPs in one prefix set |
 | `T3.2` | Single mapping, pod has no IP yet | Pod excluded from desired state |
 | `T3.3` | Two mappings, overlapping selectors, different ASGs | Each ASG gets correct IP set |
-| `T3.4` | Same ASG referenced by two mappings with different selectors | IPs are unioned |
+| `T3.4` | Same ASG referenced by two rules in one mapping with different selectors | IPs are unioned into that mapping's owned prefix set |
 | `T3.5` | Cross-subscription: mapping references ASGs in sub-1 and sub-2 | Desired state has entries for both subs |
 | `T3.6` | No matching pods | Desired prefix set is empty (not absent — still maintain) |
 | `T3.7` | Mapping deleted (not in input) | No desired state for its targets |
@@ -669,6 +673,8 @@ Each controller instance creates a uniquely named `addressPrefixSet` child resou
 addressPrefixSetName = "{clusterName}-{mappingNamespace}-{mappingName}"
 ```
 
+The controller's ownership boundary is the full `{clusterName}-{mappingNamespace}-{mappingName}` tuple. Two different `PodASGMapping` objects therefore manage different prefix sets even if they point at the same ASG. Within the desired-state engine, target identity is the pair `(ASG resource ID, addressPrefixSetName)`, and both parts are compared case-insensitively to match Azure's treatment of resource IDs and `addressPrefixSet` names.
+
 **Example:**
 
 - Cluster: `aks-prod-eastus2`
@@ -685,6 +691,7 @@ Resulting addressPrefixSet:
 
 - **Deterministic:** Same inputs always produce the same name
 - **Collision-free:** Different clusters/mappings produce different names
+- **Mapping-scoped:** Unioning only occurs when multiple rules resolve to the same `(ASG, addressPrefixSetName)` target; different mappings remain isolated
 - **Discoverable:** A controller can list all prefix sets and identify its own by name prefix
 - **Cleanable:** On PodASGMapping deletion, delete all prefix sets matching the ownership key
 
