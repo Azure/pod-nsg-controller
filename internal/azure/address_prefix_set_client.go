@@ -4,16 +4,16 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
-	"net/url"
+	"strings"
 	"time"
 
 	"github.com/Azure/azure-sdk-for-go/sdk/azcore"
 	"github.com/Azure/azure-sdk-for-go/sdk/azcore/policy"
-	"github.com/Azure/azure-sdk-for-go/sdk/azidentity"
-	"github.com/go-logr/logr"
+	"go.uber.org/zap"
 )
 
 const (
@@ -32,7 +32,7 @@ type AddressPrefixSet struct {
 
 // AddressPrefixSetProperties contains the properties of an address prefix set.
 type AddressPrefixSetProperties struct {
-	AddressPrefixes   []string `json:"addressPrefixes,omitempty"`
+	AddressPrefixes   []string `json:"addressPrefixes"` // no omitempty (T4.10)
 	ProvisioningState *string  `json:"provisioningState,omitempty"`
 }
 
@@ -43,194 +43,62 @@ type AddressPrefixSetListResult struct {
 }
 
 // AddressPrefixSetClient manages AddressPrefixSet operations using direct REST calls
-// against the 2026-01-01 API version.
+// against the 2026-01-01 API version. It implements AddressPrefixSetAPI.
 type AddressPrefixSetClient struct {
-	credential     azcore.TokenCredential
-	subscriptionID string
-	resourceGroup  string
-	log            logr.Logger
+	log        *zap.Logger
+	credential azcore.TokenCredential // nil allowed for tests
+	httpClient *http.Client
+	baseURL    string
 }
 
-// NewAddressPrefixSetClient creates a new AddressPrefixSetClient using DefaultAzureCredential.
-func NewAddressPrefixSetClient(subscriptionID, resourceGroup string, logger logr.Logger) (*AddressPrefixSetClient, error) {
-	log := logger.WithName("AddressPrefixSetClient")
-	cred, err := azidentity.NewDefaultAzureCredential(nil)
-	if err != nil {
-		return nil, fmt.Errorf("creating Azure credential: %w", err)
+// AddressPrefixSetClientOption configures an AddressPrefixSetClient.
+type AddressPrefixSetClientOption func(*AddressPrefixSetClient)
+
+// WithARMBaseURL sets the ARM base URL (used for testing with httptest servers).
+func WithARMBaseURL(baseURL string) AddressPrefixSetClientOption {
+	return func(c *AddressPrefixSetClient) {
+		c.baseURL = baseURL
 	}
-
-	log.Info("client initialized", "subscriptionID", subscriptionID, "resourceGroup", resourceGroup,
-		"apiVersion", apiVersion2026)
-
-	return &AddressPrefixSetClient{
-		credential:     cred,
-		subscriptionID: subscriptionID,
-		resourceGroup:  resourceGroup,
-		log:            log,
-	}, nil
 }
 
-// Get returns the specified address prefix set within an ASG.
-func (c *AddressPrefixSetClient) Get(ctx context.Context, asgName, prefixSetName string) (*AddressPrefixSet, error) {
-	c.log.Info("GET AddressPrefixSet", "asgName", asgName, "prefixSetName", prefixSetName)
-
-	path := c.resourcePath(asgName, prefixSetName)
-	resp, err := c.doRequest(ctx, http.MethodGet, path, nil)
-	if err != nil {
-		c.log.Error(err, "GET AddressPrefixSet request failed", "asgName", asgName, "prefixSetName", prefixSetName)
-		return nil, fmt.Errorf("getting address prefix set %q in ASG %q: %w", prefixSetName, asgName, err)
+// NewAddressPrefixSetClient creates a new AddressPrefixSetClient.
+// credential == nil is allowed and treated as test-mode auth bypass.
+// httpClient == nil defaults to http.DefaultClient.
+func NewAddressPrefixSetClient(
+	log *zap.Logger,
+	credential azcore.TokenCredential,
+	httpClient *http.Client,
+	opts ...AddressPrefixSetClientOption,
+) *AddressPrefixSetClient {
+	c := &AddressPrefixSetClient{
+		log:        log,
+		credential: credential,
+		httpClient: httpClient,
+		baseURL:    armEndpoint,
 	}
-	defer resp.Body.Close()
-
-	body, _ := io.ReadAll(resp.Body)
-	c.log.Info("GET AddressPrefixSet response", "statusCode", resp.StatusCode, "body", string(body))
-
-	if err := checkStatusCode(resp.StatusCode, body, http.StatusOK); err != nil {
-		return nil, err
+	for _, opt := range opts {
+		opt(c)
 	}
-
-	var result AddressPrefixSet
-	if err := json.Unmarshal(body, &result); err != nil {
-		return nil, fmt.Errorf("decoding response: %w", err)
+	if c.httpClient == nil {
+		c.httpClient = http.DefaultClient
 	}
-	return &result, nil
+	return c
 }
 
-// CreateOrUpdate creates or updates an address prefix set within an ASG.
-// This is a long-running operation; the method polls until completion.
-func (c *AddressPrefixSetClient) CreateOrUpdate(ctx context.Context, asgName, prefixSetName string, prefixes []string) (*AddressPrefixSet, error) {
-	c.log.Info("PUT AddressPrefixSet", "asgName", asgName, "prefixSetName", prefixSetName,
-		"prefixes", prefixes)
-
-	path := c.resourcePath(asgName, prefixSetName)
-	reqBody := AddressPrefixSet{
-		Properties: &AddressPrefixSetProperties{
-			AddressPrefixes: prefixes,
-		},
-	}
-
-	resp, err := c.doRequest(ctx, http.MethodPut, path, reqBody)
-	if err != nil {
-		c.log.Error(err, "PUT AddressPrefixSet request failed", "asgName", asgName, "prefixSetName", prefixSetName)
-		return nil, fmt.Errorf("creating/updating address prefix set %q in ASG %q: %w", prefixSetName, asgName, err)
-	}
-	defer resp.Body.Close()
-
-	body, _ := io.ReadAll(resp.Body)
-	c.log.Info("PUT AddressPrefixSet response", "statusCode", resp.StatusCode, "body", string(body))
-
-	if err := checkStatusCode(resp.StatusCode, body, http.StatusOK, http.StatusCreated); err != nil {
-		return nil, err
-	}
-
-	// Poll for LRO completion if we got a 201.
-	if resp.StatusCode == http.StatusCreated {
-		c.log.Info("PUT AddressPrefixSet polling LRO", "prefixSetName", prefixSetName)
-		if err := c.pollLRO(ctx, resp); err != nil {
-			c.log.Error(err, "PUT AddressPrefixSet LRO polling failed", "prefixSetName", prefixSetName)
-			return nil, fmt.Errorf("polling create for address prefix set %q: %w", prefixSetName, err)
-		}
-		return c.Get(ctx, asgName, prefixSetName)
-	}
-
-	var result AddressPrefixSet
-	if err := json.Unmarshal(body, &result); err != nil {
-		return nil, fmt.Errorf("decoding response: %w", err)
-	}
-	c.log.Info("PUT AddressPrefixSet succeeded", "prefixSetName", prefixSetName, "id", ptrVal(result.ID))
-	return &result, nil
+func (c *AddressPrefixSetClient) resourceURL(subscriptionID, resourceGroup, asgName, prefixSetName string) string {
+	return fmt.Sprintf("%s/subscriptions/%s/resourceGroups/%s/providers/Microsoft.Network/applicationSecurityGroups/%s/addressPrefixSets/%s?api-version=%s",
+		c.baseURL, subscriptionID, resourceGroup, asgName, prefixSetName, apiVersion2026)
 }
 
-// Delete removes an address prefix set from an ASG.
-// This is a long-running operation; the method polls until completion.
-func (c *AddressPrefixSetClient) Delete(ctx context.Context, asgName, prefixSetName string) error {
-	c.log.Info("DELETE AddressPrefixSet", "asgName", asgName, "prefixSetName", prefixSetName)
-
-	path := c.resourcePath(asgName, prefixSetName)
-	resp, err := c.doRequest(ctx, http.MethodDelete, path, nil)
-	if err != nil {
-		c.log.Error(err, "DELETE AddressPrefixSet request failed", "asgName", asgName, "prefixSetName", prefixSetName)
-		return fmt.Errorf("deleting address prefix set %q in ASG %q: %w", prefixSetName, asgName, err)
-	}
-	defer resp.Body.Close()
-
-	body, _ := io.ReadAll(resp.Body)
-	c.log.Info("DELETE AddressPrefixSet response", "statusCode", resp.StatusCode, "body", string(body))
-
-	if err := checkStatusCode(resp.StatusCode, body, http.StatusOK, http.StatusAccepted, http.StatusNoContent); err != nil {
-		return err
-	}
-
-	// Poll for LRO completion if we got a 202.
-	if resp.StatusCode == http.StatusAccepted {
-		c.log.Info("DELETE AddressPrefixSet polling LRO", "prefixSetName", prefixSetName)
-		if err := c.pollLRO(ctx, resp); err != nil {
-			c.log.Error(err, "DELETE AddressPrefixSet LRO polling failed", "prefixSetName", prefixSetName)
-			return fmt.Errorf("polling delete for address prefix set %q: %w", prefixSetName, err)
-		}
-	}
-
-	c.log.Info("DELETE AddressPrefixSet succeeded", "asgName", asgName, "prefixSetName", prefixSetName)
-	return nil
+func (c *AddressPrefixSetClient) listURL(subscriptionID, resourceGroup, asgName string) string {
+	return fmt.Sprintf("%s/subscriptions/%s/resourceGroups/%s/providers/Microsoft.Network/applicationSecurityGroups/%s/addressPrefixSets?api-version=%s",
+		c.baseURL, subscriptionID, resourceGroup, asgName, apiVersion2026)
 }
 
-// List returns all address prefix sets in the specified ASG.
-func (c *AddressPrefixSetClient) List(ctx context.Context, asgName string) ([]AddressPrefixSet, error) {
-	c.log.Info("LIST AddressPrefixSets", "asgName", asgName)
-
-	path := fmt.Sprintf("/subscriptions/%s/resourceGroups/%s/providers/Microsoft.Network/applicationSecurityGroups/%s/listAddressPrefixSets",
-		url.PathEscape(c.subscriptionID),
-		url.PathEscape(c.resourceGroup),
-		url.PathEscape(asgName),
-	)
-
-	var allResults []AddressPrefixSet
-	currentPath := path
-	pageNum := 0
-
-	for {
-		pageNum++
-		resp, err := c.doRequest(ctx, http.MethodGet, currentPath, nil)
-		if err != nil {
-			c.log.Error(err, "LIST AddressPrefixSets request failed", "asgName", asgName, "page", pageNum)
-			return nil, fmt.Errorf("listing address prefix sets in ASG %q: %w", asgName, err)
-		}
-		defer resp.Body.Close()
-
-		body, _ := io.ReadAll(resp.Body)
-		c.log.Info("LIST AddressPrefixSets response", "page", pageNum, "statusCode", resp.StatusCode, "body", string(body))
-
-		if err := checkStatusCode(resp.StatusCode, body, http.StatusOK); err != nil {
-			return nil, err
-		}
-
-		var page AddressPrefixSetListResult
-		if err := json.Unmarshal(body, &page); err != nil {
-			return nil, fmt.Errorf("decoding response: %w", err)
-		}
-
-		allResults = append(allResults, page.Value...)
-
-		if page.NextLink == nil || *page.NextLink == "" {
-			break
-		}
-		currentPath = *page.NextLink
+func (c *AddressPrefixSetClient) acquireToken(ctx context.Context) (string, error) {
+	if c.credential == nil {
+		return "", nil
 	}
-
-	c.log.Info("LIST AddressPrefixSets succeeded", "asgName", asgName, "count", len(allResults))
-	return allResults, nil
-}
-
-func (c *AddressPrefixSetClient) resourcePath(asgName, prefixSetName string) string {
-	return fmt.Sprintf("/subscriptions/%s/resourceGroups/%s/providers/Microsoft.Network/applicationSecurityGroups/%s/addressPrefixSets/%s",
-		url.PathEscape(c.subscriptionID),
-		url.PathEscape(c.resourceGroup),
-		url.PathEscape(asgName),
-		url.PathEscape(prefixSetName),
-	)
-}
-
-func (c *AddressPrefixSetClient) getToken(ctx context.Context) (string, error) {
 	token, err := c.credential.GetToken(ctx, policy.TokenRequestOptions{
 		Scopes: []string{"https://management.azure.com/.default"},
 	})
@@ -240,94 +108,272 @@ func (c *AddressPrefixSetClient) getToken(ctx context.Context) (string, error) {
 	return token.Token, nil
 }
 
-func (c *AddressPrefixSetClient) doRequest(ctx context.Context, method, path string, body interface{}) (*http.Response, error) {
-	token, err := c.getToken(ctx)
-	if err != nil {
-		return nil, err
-	}
-
-	var reqURL string
-	if isAbsoluteURL(path) {
-		reqURL = path
-	} else {
-		u, err := url.Parse(armEndpoint + path)
-		if err != nil {
-			return nil, fmt.Errorf("parsing URL: %w", err)
-		}
-		q := u.Query()
-		q.Set("api-version", apiVersion2026)
-		u.RawQuery = q.Encode()
-		reqURL = u.String()
-	}
-
-	var bodyReader io.Reader
-	if body != nil {
-		data, err := json.Marshal(body)
-		if err != nil {
-			return nil, fmt.Errorf("marshaling request body: %w", err)
-		}
-		c.log.V(1).Info("REST request", "method", method, "url", reqURL, "body", string(data))
-		bodyReader = bytes.NewReader(data)
-	} else {
-		c.log.V(1).Info("REST request", "method", method, "url", reqURL)
-	}
-
-	req, err := http.NewRequestWithContext(ctx, method, reqURL, bodyReader)
+func (c *AddressPrefixSetClient) doRequest(ctx context.Context, method, url string, body io.Reader, extraHeaders map[string]string) (*http.Response, error) {
+	req, err := http.NewRequestWithContext(ctx, method, url, body)
 	if err != nil {
 		return nil, fmt.Errorf("creating request: %w", err)
 	}
-
-	req.Header.Set("Authorization", "Bearer "+token)
 	req.Header.Set("Content-Type", "application/json")
 
-	return http.DefaultClient.Do(req)
+	token, err := c.acquireToken(ctx)
+	if err != nil {
+		return nil, err
+	}
+	if token != "" {
+		req.Header.Set("Authorization", "Bearer "+token)
+	}
+
+	for k, v := range extraHeaders {
+		req.Header.Set(k, v)
+	}
+
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("executing request: %w", err)
+	}
+	return resp, nil
 }
 
-// pollLRO polls a long-running operation until completion using the Location header.
-func (c *AddressPrefixSetClient) pollLRO(ctx context.Context, resp *http.Response) error {
-	location := resp.Header.Get("Location")
-	if location == "" {
-		location = resp.Header.Get("Azure-AsyncOperation")
+// armErrorBody is the shape of an ARM error response.
+type armErrorBody struct {
+	Error struct {
+		Code    string `json:"code"`
+		Message string `json:"message"`
+	} `json:"error"`
+}
+
+func parseARMError(statusCode int, body []byte) *ARMStatusError {
+	var armErr armErrorBody
+	if json.Unmarshal(body, &armErr) == nil && armErr.Error.Code != "" {
+		return &ARMStatusError{
+			StatusCode: statusCode,
+			ARMCode:    armErr.Error.Code,
+			Message:    armErr.Error.Message,
+		}
 	}
-	if location == "" {
+	return &ARMStatusError{
+		StatusCode: statusCode,
+		ARMCode:    fmt.Sprintf("HTTP%d", statusCode),
+		Message:    string(body),
+	}
+}
+
+// Get returns the specified address prefix set.
+func (c *AddressPrefixSetClient) Get(ctx context.Context, subscriptionID, resourceGroup, asgName, prefixSetName string) (*AddressPrefixSet, error) {
+	url := c.resourceURL(subscriptionID, resourceGroup, asgName, prefixSetName)
+
+	c.log.Debug("GET AddressPrefixSet",
+		zap.String("subscriptionID", subscriptionID),
+		zap.String("resourceGroup", resourceGroup),
+		zap.String("asgName", asgName),
+		zap.String("prefixSetName", prefixSetName),
+	)
+
+	resp, err := c.doRequest(ctx, http.MethodGet, url, nil, nil)
+	if err != nil {
+		return nil, fmt.Errorf("GET AddressPrefixSet: %w", err)
+	}
+	defer resp.Body.Close()
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("reading response body: %w", err)
+	}
+
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		armErr := parseARMError(resp.StatusCode, body)
+		return nil, fmt.Errorf("GET AddressPrefixSet: %w", armErr)
+	}
+
+	var result AddressPrefixSet
+	if err := json.Unmarshal(body, &result); err != nil {
+		return nil, fmt.Errorf("decoding response: %w", err)
+	}
+
+	// Resolve ETag: header takes precedence over body
+	headerETag := resp.Header.Get("ETag")
+	if headerETag != "" {
+		result.Etag = &headerETag
+	}
+
+	if result.Etag == nil || *result.Etag == "" {
+		return nil, fmt.Errorf("GET AddressPrefixSet %s: %w", prefixSetName, ErrMissingETag)
+	}
+
+	return &result, nil
+}
+
+// Put creates or updates an address prefix set using ETag-based conditional writes.
+func (c *AddressPrefixSetClient) Put(ctx context.Context, subscriptionID, resourceGroup, asgName, prefixSetName string, ips []string) error {
+	url := c.resourceURL(subscriptionID, resourceGroup, asgName, prefixSetName)
+
+	c.log.Debug("PUT AddressPrefixSet",
+		zap.String("subscriptionID", subscriptionID),
+		zap.String("resourceGroup", resourceGroup),
+		zap.String("asgName", asgName),
+		zap.String("prefixSetName", prefixSetName),
+		zap.Int("ipCount", len(ips)),
+	)
+
+	// GET current state to determine ETag / existence
+	headers := make(map[string]string)
+	existing, getErr := c.Get(ctx, subscriptionID, resourceGroup, asgName, prefixSetName)
+	if getErr != nil {
+		if !IsNotFound(getErr) && !errors.Is(getErr, ErrMissingETag) {
+			return fmt.Errorf("pre-PUT GET: %w", getErr)
+		}
+		if IsNotFound(getErr) {
+			headers["If-None-Match"] = "*"
+		}
+	} else if existing != nil && existing.Etag != nil {
+		headers["If-Match"] = *existing.Etag
+	}
+
+	if ips == nil {
+		ips = []string{}
+	}
+	payload := AddressPrefixSet{
+		Properties: &AddressPrefixSetProperties{
+			AddressPrefixes: ips,
+		},
+	}
+	bodyBytes, err := json.Marshal(payload)
+	if err != nil {
+		return fmt.Errorf("marshaling PUT body: %w", err)
+	}
+
+	resp, err := c.doRequest(ctx, http.MethodPut, url, bytes.NewReader(bodyBytes), headers)
+	if err != nil {
+		return fmt.Errorf("PUT AddressPrefixSet: %w", err)
+	}
+	defer resp.Body.Close()
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return fmt.Errorf("reading PUT response body: %w", err)
+	}
+
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		armErr := parseARMError(resp.StatusCode, body)
+		return fmt.Errorf("PUT AddressPrefixSet: %w", armErr)
+	}
+
+	// Handle LRO for 201/202
+	if resp.StatusCode == http.StatusCreated || resp.StatusCode == http.StatusAccepted {
+		if loc := resp.Header.Get("Location"); loc != "" {
+			if err := c.pollLRO(ctx, loc); err != nil {
+				return fmt.Errorf("polling PUT LRO: %w", err)
+			}
+		}
+	}
+
+	return nil
+}
+
+// Delete removes an address prefix set. 404 is treated as success (idempotent).
+func (c *AddressPrefixSetClient) Delete(ctx context.Context, subscriptionID, resourceGroup, asgName, prefixSetName string) error {
+	url := c.resourceURL(subscriptionID, resourceGroup, asgName, prefixSetName)
+
+	c.log.Debug("DELETE AddressPrefixSet",
+		zap.String("subscriptionID", subscriptionID),
+		zap.String("resourceGroup", resourceGroup),
+		zap.String("asgName", asgName),
+		zap.String("prefixSetName", prefixSetName),
+	)
+
+	resp, err := c.doRequest(ctx, http.MethodDelete, url, nil, nil)
+	if err != nil {
+		return fmt.Errorf("DELETE AddressPrefixSet: %w", err)
+	}
+	defer resp.Body.Close()
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return fmt.Errorf("reading DELETE response body: %w", err)
+	}
+
+	// 404 is success for delete (idempotent)
+	if resp.StatusCode == http.StatusNotFound {
 		return nil
 	}
 
-	c.log.Info("polling LRO", "location", location)
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		armErr := parseARMError(resp.StatusCode, body)
+		return fmt.Errorf("DELETE AddressPrefixSet: %w", armErr)
+	}
+
+	// Handle LRO for 202
+	if resp.StatusCode == http.StatusAccepted {
+		if loc := resp.Header.Get("Location"); loc != "" {
+			if err := c.pollLRO(ctx, loc); err != nil {
+				return fmt.Errorf("polling DELETE LRO: %w", err)
+			}
+		}
+	}
+
+	return nil
+}
+
+// List returns all address prefix sets in an ASG.
+func (c *AddressPrefixSetClient) List(ctx context.Context, subscriptionID, resourceGroup, asgName string) ([]AddressPrefixSet, error) {
+	url := c.listURL(subscriptionID, resourceGroup, asgName)
+
+	c.log.Debug("LIST AddressPrefixSets",
+		zap.String("subscriptionID", subscriptionID),
+		zap.String("resourceGroup", resourceGroup),
+		zap.String("asgName", asgName),
+	)
+
+	resp, err := c.doRequest(ctx, http.MethodGet, url, nil, nil)
+	if err != nil {
+		return nil, fmt.Errorf("LIST AddressPrefixSets: %w", err)
+	}
+	defer resp.Body.Close()
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("reading LIST response body: %w", err)
+	}
+
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		armErr := parseARMError(resp.StatusCode, body)
+		return nil, fmt.Errorf("LIST AddressPrefixSets: %w", armErr)
+	}
+
+	var result AddressPrefixSetListResult
+	if err := json.Unmarshal(body, &result); err != nil {
+		return nil, fmt.Errorf("decoding LIST response: %w", err)
+	}
+
+	return result.Value, nil
+}
+
+// pollLRO polls a Location-based LRO endpoint until it returns a terminal status.
+func (c *AddressPrefixSetClient) pollLRO(ctx context.Context, location string) error {
+	// Resolve relative Location URLs against baseURL
+	if !strings.HasPrefix(location, "http") {
+		location = c.baseURL + location
+	}
 
 	for {
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
-		case <-time.After(2 * time.Second):
+		case <-time.After(500 * time.Millisecond):
 		}
 
-		pollResp, err := c.doRequest(ctx, http.MethodGet, location, nil)
+		resp, err := c.doRequest(ctx, http.MethodGet, location, nil, nil)
 		if err != nil {
 			return fmt.Errorf("polling LRO: %w", err)
 		}
-		pollResp.Body.Close()
+		resp.Body.Close()
 
-		c.log.Info("LRO poll result", "statusCode", pollResp.StatusCode)
-
-		if pollResp.StatusCode == http.StatusOK || pollResp.StatusCode == http.StatusNoContent {
+		if resp.StatusCode == http.StatusOK || resp.StatusCode == http.StatusNoContent {
 			return nil
 		}
-		if pollResp.StatusCode != http.StatusAccepted {
-			return fmt.Errorf("unexpected polling status: %d", pollResp.StatusCode)
+		if resp.StatusCode == http.StatusAccepted {
+			continue
 		}
+		return fmt.Errorf("LRO poll returned unexpected status %d", resp.StatusCode)
 	}
-}
-
-func isAbsoluteURL(u string) bool {
-	return len(u) > 8 && (u[:8] == "https://" || u[:7] == "http://")
-}
-
-func checkStatusCode(statusCode int, body []byte, allowed ...int) error {
-	for _, code := range allowed {
-		if statusCode == code {
-			return nil
-		}
-	}
-	return fmt.Errorf("unexpected status %d: %s", statusCode, string(body))
 }

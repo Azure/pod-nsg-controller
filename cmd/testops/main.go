@@ -118,29 +118,35 @@ func main() {
 	results = append(results, r)
 
 	// --- REST-based AddressPrefixSet operations ---
-	apsClient, err := azure.NewAddressPrefixSetClient(subscriptionID, resourceGroup, logger)
+	factory, err := azure.NewClientFactoryWithDefaultCredential(zapLog, nil)
 	if err != nil {
-		fmt.Printf("FATAL: cannot create AddressPrefixSet client: %v\n", err)
+		fmt.Printf("FATAL: cannot create AddressPrefixSet client factory: %v\n", err)
+		os.Exit(1)
+	}
+
+	apsClient, err := factory.ForSubscription(subscriptionID)
+	if err != nil {
+		fmt.Printf("FATAL: cannot get AddressPrefixSet client: %v\n", err)
 		os.Exit(1)
 	}
 
 	prefixSetName := "prefix-set-test"
 
-	// Test 6: CreateOrUpdate AddressPrefixSet (PUT)
+	// Test 6: Put AddressPrefixSet
 	r = testResult{num: 6, name: "PUT AddressPrefixSet"}
-	aps, err := apsClient.CreateOrUpdate(ctx, testASG, prefixSetName, []string{"10.0.0.0/24", "10.0.1.0/24"})
+	err = apsClient.Put(ctx, subscriptionID, resourceGroup, testASG, prefixSetName, []string{"10.0.0.0/24", "10.0.1.0/24"})
 	if err != nil {
 		r.status = "❌ FAIL"
 		r.details = err.Error()
 	} else {
 		r.status = "✅ PASS"
-		r.details = fmt.Sprintf("id=%s", deref(aps.ID))
+		r.details = "created"
 	}
 	results = append(results, r)
 
 	// Test 7: GET AddressPrefixSet
 	r = testResult{num: 7, name: "GET AddressPrefixSet"}
-	aps2, err := apsClient.Get(ctx, testASG, prefixSetName)
+	aps2, err := apsClient.Get(ctx, subscriptionID, resourceGroup, testASG, prefixSetName)
 	if err != nil {
 		r.status = "❌ FAIL"
 		r.details = err.Error()
@@ -152,7 +158,7 @@ func main() {
 
 	// Test 8: LIST AddressPrefixSets
 	r = testResult{num: 8, name: "LIST AddressPrefixSets"}
-	apsList, err := apsClient.List(ctx, testASG)
+	apsList, err := apsClient.List(ctx, subscriptionID, resourceGroup, testASG)
 	if err != nil {
 		r.status = "❌ FAIL"
 		r.details = err.Error()
@@ -164,7 +170,7 @@ func main() {
 
 	// Test 9: DELETE AddressPrefixSet
 	r = testResult{num: 9, name: "DELETE AddressPrefixSet"}
-	err = apsClient.Delete(ctx, testASG, prefixSetName)
+	err = apsClient.Delete(ctx, subscriptionID, resourceGroup, testASG, prefixSetName)
 	if err != nil {
 		r.status = "❌ FAIL"
 		r.details = err.Error()
