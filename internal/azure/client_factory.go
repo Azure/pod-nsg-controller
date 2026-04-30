@@ -27,8 +27,9 @@ type ClientFactory struct {
 	httpClient *http.Client
 	baseURL    string
 
-	credOnce sync.Once
-	credErr  error
+	credExplicit bool // true if credential was explicitly provided (even if nil)
+	credOnce     sync.Once
+	credErr      error
 
 	mu      sync.RWMutex
 	clients map[string]AddressPrefixSetAPI
@@ -47,12 +48,14 @@ func NewClientFactory(log *zap.Logger, opts ...ClientFactoryOption) *ClientFacto
 }
 
 // NewClientFactoryWithCredential creates a ClientFactory with an explicit credential (for testing).
+// Passing nil disables credential resolution entirely (test-mode auth bypass).
 func NewClientFactoryWithCredential(log *zap.Logger, credential azcore.TokenCredential, httpClient *http.Client, opts ...ClientFactoryOption) *ClientFactory {
 	f := &ClientFactory{
-		log:        log,
-		credential: credential,
-		httpClient: httpClient,
-		clients:    make(map[string]AddressPrefixSetAPI),
+		log:          log,
+		credential:   credential,
+		httpClient:   httpClient,
+		credExplicit: true,
+		clients:      make(map[string]AddressPrefixSetAPI),
 	}
 	for _, opt := range opts {
 		opt(f)
@@ -79,7 +82,11 @@ func NewClientFactoryWithDefaultCredential(log *zap.Logger, httpClient *http.Cli
 }
 
 // resolveCredential lazily resolves the DefaultAzureCredential (thread-safe).
+// If the credential was explicitly provided (even as nil), resolution is skipped.
 func (f *ClientFactory) resolveCredential() error {
+	if f.credExplicit {
+		return nil
+	}
 	f.credOnce.Do(func() {
 		if f.credential != nil {
 			return
