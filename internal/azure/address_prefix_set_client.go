@@ -316,9 +316,9 @@ func (c *AddressPrefixSetClient) Delete(ctx context.Context, subscriptionID, res
 	return nil
 }
 
-// List returns all address prefix sets in an ASG.
+// List returns all address prefix sets in an ASG, following NextLink pagination.
 func (c *AddressPrefixSetClient) List(ctx context.Context, subscriptionID, resourceGroup, asgName string) ([]AddressPrefixSet, error) {
-	url := c.listURL(subscriptionID, resourceGroup, asgName)
+	nextURL := c.listURL(subscriptionID, resourceGroup, asgName)
 
 	c.log.Debug("LIST AddressPrefixSets",
 		zap.String("subscriptionID", subscriptionID),
@@ -326,28 +326,39 @@ func (c *AddressPrefixSetClient) List(ctx context.Context, subscriptionID, resou
 		zap.String("asgName", asgName),
 	)
 
-	resp, err := c.doRequest(ctx, http.MethodGet, url, nil, nil)
-	if err != nil {
-		return nil, errors.Wrap(err, "LIST AddressPrefixSets")
-	}
-	defer resp.Body.Close()
+	var all []AddressPrefixSet
+	for nextURL != "" {
+		resp, err := c.doRequest(ctx, http.MethodGet, nextURL, nil, nil)
+		if err != nil {
+			return nil, errors.Wrap(err, "LIST AddressPrefixSets")
+		}
 
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return nil, errors.Wrap(err, "reading LIST response body")
+		body, err := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if err != nil {
+			return nil, errors.Wrap(err, "reading LIST response body")
+		}
+
+		if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+			armErr := parseARMError(resp.StatusCode, body)
+			return nil, errors.Wrap(armErr, "LIST AddressPrefixSets")
+		}
+
+		var result AddressPrefixSetListResult
+		if err := json.Unmarshal(body, &result); err != nil {
+			return nil, errors.Wrap(err, "decoding LIST response")
+		}
+
+		all = append(all, result.Value...)
+
+		if result.NextLink != nil && *result.NextLink != "" {
+			nextURL = *result.NextLink
+		} else {
+			nextURL = ""
+		}
 	}
 
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		armErr := parseARMError(resp.StatusCode, body)
-		return nil, errors.Wrap(armErr, "LIST AddressPrefixSets")
-	}
-
-	var result AddressPrefixSetListResult
-	if err := json.Unmarshal(body, &result); err != nil {
-		return nil, errors.Wrap(err, "decoding LIST response")
-	}
-
-	return result.Value, nil
+	return all, nil
 }
 
 // pollLRO polls a Location-based LRO endpoint until it returns a terminal status.
