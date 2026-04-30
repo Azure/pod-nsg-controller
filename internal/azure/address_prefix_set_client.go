@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
-	stderrors "errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -221,11 +220,10 @@ func (c *AddressPrefixSetClient) Put(ctx context.Context, subscriptionID, resour
 	headers := make(map[string]string)
 	existing, getErr := c.Get(ctx, subscriptionID, resourceGroup, asgName, prefixSetName)
 	if getErr != nil {
-		if !IsNotFound(getErr) && !stderrors.Is(getErr, ErrMissingETag) {
-			return errors.Wrap(getErr, "pre-PUT GET")
-		}
 		if IsNotFound(getErr) {
 			headers["If-None-Match"] = "*"
+		} else {
+			return errors.Wrap(getErr, "pre-PUT GET")
 		}
 	} else if existing != nil && existing.Etag != nil {
 		headers["If-Match"] = *existing.Etag
