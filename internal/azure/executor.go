@@ -17,6 +17,18 @@ type ActionResult struct {
 	Err     error
 }
 
+// armVerb returns the ARM HTTP verb for a given action kind.
+func armVerb(kind engine.ActionKind) string {
+	switch kind {
+	case engine.CreatePrefixSet, engine.UpdatePrefixSet:
+		return "PUT"
+	case engine.DeletePrefixSet:
+		return "DELETE"
+	default:
+		return "UNKNOWN"
+	}
+}
+
 // Executor runs engine actions against Azure with bounded concurrency and ETag retry.
 type Executor struct {
 	log         *zap.Logger
@@ -108,7 +120,8 @@ func (e *Executor) executeWithETagRetry(ctx context.Context, client AddressPrefi
 
 		if attempt == e.maxRetries {
 			e.log.Warn("ETag conflict, retries exhausted",
-				zap.String("operation", string(action.Kind)),
+				zap.String("operation", armVerb(action.Kind)),
+				zap.String("actionKind", string(action.Kind)),
 				zap.String("prefixSetName", action.Target.PrefixSetName),
 				zap.Int("attempt", attempt),
 				zap.Int("maxRetries", e.maxRetries),
@@ -117,7 +130,8 @@ func (e *Executor) executeWithETagRetry(ctx context.Context, client AddressPrefi
 			break
 		}
 		e.log.Warn("ETag conflict, retrying",
-			zap.String("operation", string(action.Kind)),
+			zap.String("operation", armVerb(action.Kind)),
+			zap.String("actionKind", string(action.Kind)),
 			zap.String("prefixSetName", action.Target.PrefixSetName),
 			zap.Int("attempt", attempt),
 			zap.Int("maxRetries", e.maxRetries),
