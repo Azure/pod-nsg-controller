@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"strings"
 	"time"
 
@@ -87,12 +88,12 @@ func NewAddressPrefixSetClient(
 
 func (c *AddressPrefixSetClient) resourceURL(subscriptionID, resourceGroup, asgName, prefixSetName string) string {
 	return fmt.Sprintf("%s/subscriptions/%s/resourceGroups/%s/providers/Microsoft.Network/applicationSecurityGroups/%s/addressPrefixSets/%s?api-version=%s",
-		c.baseURL, subscriptionID, resourceGroup, asgName, prefixSetName, apiVersion2026)
+		c.baseURL, url.PathEscape(subscriptionID), url.PathEscape(resourceGroup), url.PathEscape(asgName), url.PathEscape(prefixSetName), apiVersion2026)
 }
 
 func (c *AddressPrefixSetClient) listURL(subscriptionID, resourceGroup, asgName string) string {
 	return fmt.Sprintf("%s/subscriptions/%s/resourceGroups/%s/providers/Microsoft.Network/applicationSecurityGroups/%s/addressPrefixSets?api-version=%s",
-		c.baseURL, subscriptionID, resourceGroup, asgName, apiVersion2026)
+		c.baseURL, url.PathEscape(subscriptionID), url.PathEscape(resourceGroup), url.PathEscape(asgName), apiVersion2026)
 }
 
 func (c *AddressPrefixSetClient) acquireToken(ctx context.Context) (string, error) {
