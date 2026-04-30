@@ -7,6 +7,7 @@ import (
 
 	"github.com/Azure/azure-sdk-for-go/sdk/azcore"
 	"github.com/Azure/azure-sdk-for-go/sdk/azidentity"
+	"github.com/pkg/errors"
 	"go.uber.org/zap"
 )
 
@@ -67,7 +68,7 @@ func NewClientFactoryWithCredential(log *zap.Logger, credential azcore.TokenCred
 func NewClientFactoryWithDefaultCredential(log *zap.Logger, httpClient *http.Client, opts ...ClientFactoryOption) (*ClientFactory, error) {
 	cred, err := azidentity.NewDefaultAzureCredential(nil)
 	if err != nil {
-		return nil, fmt.Errorf("creating DefaultAzureCredential: %w", err)
+		return nil, errors.Wrap(err, "creating DefaultAzureCredential")
 	}
 	f := &ClientFactory{
 		log:        log,
@@ -93,7 +94,7 @@ func (f *ClientFactory) resolveCredential() error {
 		}
 		cred, err := azidentity.NewDefaultAzureCredential(nil)
 		if err != nil {
-			f.credErr = fmt.Errorf("creating DefaultAzureCredential: %w", err)
+			f.credErr = errors.Wrap(err, "creating DefaultAzureCredential")
 			return
 		}
 		f.credential = cred
@@ -116,7 +117,7 @@ func (f *ClientFactory) ForSubscription(subscriptionID string) (AddressPrefixSet
 
 	// Resolve credential lazily
 	if err := f.resolveCredential(); err != nil {
-		return nil, fmt.Errorf("resolving credential: %w", err)
+		return nil, errors.Wrap(err, "resolving credential")
 	}
 
 	f.mu.Lock()
