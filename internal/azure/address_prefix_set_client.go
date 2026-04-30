@@ -20,6 +20,11 @@ import (
 const (
 	apiVersion2026 = "2026-01-01"
 	armEndpoint    = "https://management.azure.com"
+
+	// defaultMaxRetries is the number of retries for transient HTTP failures.
+	defaultMaxRetries = 3
+	// defaultRetryBackoff is the fixed delay between retries.
+	defaultRetryBackoff = 200 * time.Millisecond
 )
 
 // AddressPrefixSet represents an address prefix set child resource of an ASG.
@@ -109,30 +114,85 @@ func (c *AddressPrefixSetClient) acquireToken(ctx context.Context) (string, erro
 	return token.Token, nil
 }
 
-func (c *AddressPrefixSetClient) doRequest(ctx context.Context, method, url string, body io.Reader, extraHeaders map[string]string) (*http.Response, error) {
-	req, err := http.NewRequestWithContext(ctx, method, url, body)
-	if err != nil {
-		return nil, errors.Wrap(err, "creating request")
-	}
-	req.Header.Set("Content-Type", "application/json")
+func (c *AddressPrefixSetClient) doRequest(ctx context.Context, method, url string, body []byte, extraHeaders map[string]string) (*http.Response, error) {
+	var lastResp *http.Response
+	var lastErr error
+	for attempt := 0; attempt <= defaultMaxRetries; attempt++ {
+		if attempt > 0 {
+			select {
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			case <-time.After(defaultRetryBackoff):
+			}
+		}
 
-	token, err := c.acquireToken(ctx)
-	if err != nil {
-		return nil, err
-	}
-	if token != "" {
-		req.Header.Set("Authorization", "Bearer "+token)
-	}
+		var bodyReader io.Reader
+		if body != nil {
+			bodyReader = bytes.NewReader(body)
+		}
 
-	for k, v := range extraHeaders {
-		req.Header.Set(k, v)
-	}
+		req, err := http.NewRequestWithContext(ctx, method, url, bodyReader)
+		if err != nil {
+			return nil, errors.Wrap(err, "creating request")
+		}
+		req.Header.Set("Content-Type", "application/json")
 
-	resp, err := c.httpClient.Do(req)
-	if err != nil {
-		return nil, errors.Wrap(err, "executing request")
+		token, err := c.acquireToken(ctx)
+		if err != nil {
+			return nil, err
+		}
+		if token != "" {
+			req.Header.Set("Authorization", "Bearer "+token)
+		}
+
+		for k, v := range extraHeaders {
+			req.Header.Set(k, v)
+		}
+
+		resp, err := c.httpClient.Do(req)
+		if err != nil {
+			lastErr = errors.Wrap(err, "executing request")
+			lastResp = nil
+			c.log.Warn("transient request error, retrying",
+				zap.String("method", method),
+				zap.Int("attempt", attempt+1),
+				zap.Error(err),
+			)
+			continue
+		}
+
+		if isRetryableStatus(resp.StatusCode) {
+			c.log.Warn("retryable status, retrying",
+				zap.String("method", method),
+				zap.Int("statusCode", resp.StatusCode),
+				zap.Int("attempt", attempt+1),
+			)
+			// Keep last response for final return; close previous if any
+			if lastResp != nil {
+				io.Copy(io.Discard, lastResp.Body)
+				lastResp.Body.Close()
+			}
+			lastResp = resp
+			lastErr = nil
+			continue
+		}
+
+		return resp, nil
 	}
-	return resp, nil
+	// Retries exhausted: return last response so caller can parse the ARM error
+	if lastResp != nil {
+		return lastResp, nil
+	}
+	return nil, errors.Wrap(lastErr, "all retries exhausted")
+}
+
+// isRetryableStatus returns true for HTTP status codes that indicate a transient failure.
+func isRetryableStatus(statusCode int) bool {
+	return statusCode == http.StatusTooManyRequests ||
+		statusCode == http.StatusInternalServerError ||
+		statusCode == http.StatusBadGateway ||
+		statusCode == http.StatusServiceUnavailable ||
+		statusCode == http.StatusGatewayTimeout
 }
 
 // armErrorBody is the shape of an ARM error response.
@@ -242,7 +302,7 @@ func (c *AddressPrefixSetClient) Put(ctx context.Context, subscriptionID, resour
 		return errors.Wrap(err, "marshaling PUT body")
 	}
 
-	resp, err := c.doRequest(ctx, http.MethodPut, url, bytes.NewReader(bodyBytes), headers)
+	resp, err := c.doRequest(ctx, http.MethodPut, url, bodyBytes, headers)
 	if err != nil {
 		return errors.Wrap(err, "PUT AddressPrefixSet")
 	}

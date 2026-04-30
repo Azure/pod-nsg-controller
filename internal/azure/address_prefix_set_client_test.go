@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync/atomic"
 	"testing"
 
 	"go.uber.org/zap/zaptest"
@@ -480,5 +481,83 @@ func TestAddressPrefixSetClient_AllHTTPFailuresReturnARMStatusError(t *testing.T
 				t.Errorf("expected ARMStatusError.StatusCode=%d, got %d", tc.statusCode, armErr.StatusCode)
 			}
 		})
+	}
+}
+
+// TestAddressPrefixSetClient_RetriesTransientThenSucceeds verifies that doRequest
+// retries on 503 and succeeds when the server recovers within the retry limit.
+func TestAddressPrefixSetClient_RetriesTransientThenSucceeds(t *testing.T) {
+	var calls atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		n := calls.Add(1)
+		if n <= 2 {
+			// First 2 calls return 503
+			w.WriteHeader(http.StatusServiceUnavailable)
+			json.NewEncoder(w).Encode(map[string]interface{}{
+				"error": map[string]interface{}{"code": "ServiceUnavailable", "message": "retry later"},
+			})
+			return
+		}
+		// 3rd call succeeds
+		w.Header().Set("ETag", `"etag-ok"`)
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"id":   "/subscriptions/sub1/resourceGroups/rg1/providers/Microsoft.Network/applicationSecurityGroups/asg1/addressPrefixSets/ps1",
+			"name": "ps1",
+			"properties": map[string]interface{}{
+				"addressPrefixes": []string{"10.0.0.1/32"},
+			},
+		})
+	}))
+	defer srv.Close()
+
+	log := zaptest.NewLogger(t)
+	client := NewAddressPrefixSetClient(log, nil, srv.Client(), WithARMBaseURL(srv.URL))
+
+	result, err := client.Get(context.Background(), "sub1", "rg1", "asg1", "ps1")
+	if err != nil {
+		t.Fatalf("expected success after retries, got error: %v", err)
+	}
+	if result == nil || result.Etag == nil || *result.Etag != `"etag-ok"` {
+		t.Fatalf("unexpected result: %+v", result)
+	}
+	if got := calls.Load(); got != 3 {
+		t.Errorf("expected 3 total requests (2 retries + 1 success), got %d", got)
+	}
+}
+
+// TestAddressPrefixSetClient_RetriesExhaustedReturnsLastError verifies that when all
+// retries are exhausted, the final retryable response is returned as an ARMStatusError.
+func TestAddressPrefixSetClient_RetriesExhaustedReturnsLastError(t *testing.T) {
+	var calls atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls.Add(1)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusTooManyRequests)
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"error": map[string]interface{}{"code": "TooManyRequests", "message": "throttled"},
+		})
+	}))
+	defer srv.Close()
+
+	log := zaptest.NewLogger(t)
+	client := NewAddressPrefixSetClient(log, nil, srv.Client(), WithARMBaseURL(srv.URL))
+
+	_, err := client.Get(context.Background(), "sub1", "rg1", "asg1", "ps1")
+	if err == nil {
+		t.Fatal("expected error after retries exhausted")
+	}
+
+	var armErr *ARMStatusError
+	if !errors.As(err, &armErr) {
+		t.Fatalf("expected *ARMStatusError, got %T: %v", err, err)
+	}
+	if armErr.StatusCode != http.StatusTooManyRequests {
+		t.Errorf("expected status 429, got %d", armErr.StatusCode)
+	}
+
+	// 1 initial + 3 retries = 4 total
+	if got := calls.Load(); got != 4 {
+		t.Errorf("expected 4 total requests, got %d", got)
 	}
 }
