@@ -7,6 +7,7 @@ import (
 	"sync"
 
 	"github.com/Azure/pod-nsg-controller/internal/engine"
+	pkgerrors "github.com/pkg/errors"
 	"go.uber.org/zap"
 )
 
@@ -73,7 +74,7 @@ func (e *Executor) Execute(ctx context.Context, actions []engine.Action) []Actio
 
 			client, err := e.factory.ForSubscription(act.Target.SubscriptionID)
 			if err != nil {
-				results[idx] = ActionResult{Action: act, Success: false, Err: fmt.Errorf("getting client: %w", err)}
+				results[idx] = ActionResult{Action: act, Success: false, Err: pkgerrors.Wrap(err, "getting client")}
 				return
 			}
 
@@ -152,7 +153,7 @@ func (e *Executor) executeWithETagRetry(ctx context.Context, client AddressPrefi
 		current, getErr := client.Get(ctx, t.SubscriptionID, t.ResourceGroup, t.ASGName, t.PrefixSetName)
 		next, done, recomputeErr := recomputeSingleTargetActionViaDiff(action, current, getErr)
 		if recomputeErr != nil {
-			return fmt.Errorf("recompute after 412: %w", recomputeErr)
+			return pkgerrors.Wrap(recomputeErr, "recompute after 412")
 		}
 		if done {
 			return nil
@@ -170,7 +171,7 @@ func recomputeSingleTargetActionViaDiff(action engine.Action, current *AddressPr
 	desired := buildSingleTargetDesired(action)
 	actual, err := buildSingleTargetActual(action, current, getErr)
 	if err != nil {
-		return nil, false, fmt.Errorf("building actual state: %w", err)
+		return nil, false, pkgerrors.Wrap(err, "building actual state")
 	}
 
 	actions := engine.ComputeDiff(desired, actual)
@@ -207,7 +208,7 @@ func buildSingleTargetActual(action engine.Action, current *AddressPrefixSet, ge
 			// Resource doesn't exist — empty actual map triggers Create
 			return map[engine.ASGTarget]engine.ActualPrefixSet{}, nil
 		}
-		return nil, fmt.Errorf("Get failed: %w", getErr)
+		return nil, pkgerrors.Wrap(getErr, "Get failed")
 	}
 	if current == nil {
 		// Defensive fallback for a violated client contract: treat nil current with
