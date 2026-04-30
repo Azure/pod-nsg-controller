@@ -4,7 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
-	"errors"
+	stderrors "errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/Azure/azure-sdk-for-go/sdk/azcore"
+	"github.com/pkg/errors"
 	"github.com/Azure/azure-sdk-for-go/sdk/azcore/policy"
 	"go.uber.org/zap"
 )
@@ -104,7 +105,7 @@ func (c *AddressPrefixSetClient) acquireToken(ctx context.Context) (string, erro
 		Scopes: []string{"https://management.azure.com/.default"},
 	})
 	if err != nil {
-		return "", fmt.Errorf("acquiring token: %w", err)
+		return "", errors.Wrap(err, "acquiring token")
 	}
 	return token.Token, nil
 }
@@ -112,7 +113,7 @@ func (c *AddressPrefixSetClient) acquireToken(ctx context.Context) (string, erro
 func (c *AddressPrefixSetClient) doRequest(ctx context.Context, method, url string, body io.Reader, extraHeaders map[string]string) (*http.Response, error) {
 	req, err := http.NewRequestWithContext(ctx, method, url, body)
 	if err != nil {
-		return nil, fmt.Errorf("creating request: %w", err)
+		return nil, errors.Wrap(err, "creating request")
 	}
 	req.Header.Set("Content-Type", "application/json")
 
@@ -130,7 +131,7 @@ func (c *AddressPrefixSetClient) doRequest(ctx context.Context, method, url stri
 
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
-		return nil, fmt.Errorf("executing request: %w", err)
+		return nil, errors.Wrap(err, "executing request")
 	}
 	return resp, nil
 }
@@ -172,23 +173,23 @@ func (c *AddressPrefixSetClient) Get(ctx context.Context, subscriptionID, resour
 
 	resp, err := c.doRequest(ctx, http.MethodGet, url, nil, nil)
 	if err != nil {
-		return nil, fmt.Errorf("GET AddressPrefixSet: %w", err)
+		return nil, errors.Wrap(err, "GET AddressPrefixSet")
 	}
 	defer resp.Body.Close()
 
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
-		return nil, fmt.Errorf("reading response body: %w", err)
+		return nil, errors.Wrap(err, "reading response body")
 	}
 
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		armErr := parseARMError(resp.StatusCode, body)
-		return nil, fmt.Errorf("GET AddressPrefixSet: %w", armErr)
+		return nil, errors.Wrap(armErr, "GET AddressPrefixSet")
 	}
 
 	var result AddressPrefixSet
 	if err := json.Unmarshal(body, &result); err != nil {
-		return nil, fmt.Errorf("decoding response: %w", err)
+		return nil, errors.Wrap(err, "decoding response")
 	}
 
 	// Resolve ETag: header takes precedence over body
@@ -198,7 +199,7 @@ func (c *AddressPrefixSetClient) Get(ctx context.Context, subscriptionID, resour
 	}
 
 	if result.Etag == nil || *result.Etag == "" {
-		return nil, fmt.Errorf("GET AddressPrefixSet %s: %w", prefixSetName, ErrMissingETag)
+		return nil, errors.Wrapf(ErrMissingETag, "GET AddressPrefixSet %s", prefixSetName)
 	}
 
 	return &result, nil
@@ -220,8 +221,8 @@ func (c *AddressPrefixSetClient) Put(ctx context.Context, subscriptionID, resour
 	headers := make(map[string]string)
 	existing, getErr := c.Get(ctx, subscriptionID, resourceGroup, asgName, prefixSetName)
 	if getErr != nil {
-		if !IsNotFound(getErr) && !errors.Is(getErr, ErrMissingETag) {
-			return fmt.Errorf("pre-PUT GET: %w", getErr)
+		if !IsNotFound(getErr) && !stderrors.Is(getErr, ErrMissingETag) {
+			return errors.Wrap(getErr, "pre-PUT GET")
 		}
 		if IsNotFound(getErr) {
 			headers["If-None-Match"] = "*"
@@ -240,30 +241,30 @@ func (c *AddressPrefixSetClient) Put(ctx context.Context, subscriptionID, resour
 	}
 	bodyBytes, err := json.Marshal(payload)
 	if err != nil {
-		return fmt.Errorf("marshaling PUT body: %w", err)
+		return errors.Wrap(err, "marshaling PUT body")
 	}
 
 	resp, err := c.doRequest(ctx, http.MethodPut, url, bytes.NewReader(bodyBytes), headers)
 	if err != nil {
-		return fmt.Errorf("PUT AddressPrefixSet: %w", err)
+		return errors.Wrap(err, "PUT AddressPrefixSet")
 	}
 	defer resp.Body.Close()
 
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
-		return fmt.Errorf("reading PUT response body: %w", err)
+		return errors.Wrap(err, "reading PUT response body")
 	}
 
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		armErr := parseARMError(resp.StatusCode, body)
-		return fmt.Errorf("PUT AddressPrefixSet: %w", armErr)
+		return errors.Wrap(armErr, "PUT AddressPrefixSet")
 	}
 
 	// Handle LRO for 201/202
 	if resp.StatusCode == http.StatusCreated || resp.StatusCode == http.StatusAccepted {
 		if loc := resp.Header.Get("Location"); loc != "" {
 			if err := c.pollLRO(ctx, loc); err != nil {
-				return fmt.Errorf("polling PUT LRO: %w", err)
+				return errors.Wrap(err, "polling PUT LRO")
 			}
 		}
 	}
@@ -284,13 +285,13 @@ func (c *AddressPrefixSetClient) Delete(ctx context.Context, subscriptionID, res
 
 	resp, err := c.doRequest(ctx, http.MethodDelete, url, nil, nil)
 	if err != nil {
-		return fmt.Errorf("DELETE AddressPrefixSet: %w", err)
+		return errors.Wrap(err, "DELETE AddressPrefixSet")
 	}
 	defer resp.Body.Close()
 
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
-		return fmt.Errorf("reading DELETE response body: %w", err)
+		return errors.Wrap(err, "reading DELETE response body")
 	}
 
 	// 404 is success for delete (idempotent)
@@ -300,14 +301,14 @@ func (c *AddressPrefixSetClient) Delete(ctx context.Context, subscriptionID, res
 
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		armErr := parseARMError(resp.StatusCode, body)
-		return fmt.Errorf("DELETE AddressPrefixSet: %w", armErr)
+		return errors.Wrap(armErr, "DELETE AddressPrefixSet")
 	}
 
 	// Handle LRO for 202
 	if resp.StatusCode == http.StatusAccepted {
 		if loc := resp.Header.Get("Location"); loc != "" {
 			if err := c.pollLRO(ctx, loc); err != nil {
-				return fmt.Errorf("polling DELETE LRO: %w", err)
+				return errors.Wrap(err, "polling DELETE LRO")
 			}
 		}
 	}
@@ -327,23 +328,23 @@ func (c *AddressPrefixSetClient) List(ctx context.Context, subscriptionID, resou
 
 	resp, err := c.doRequest(ctx, http.MethodGet, url, nil, nil)
 	if err != nil {
-		return nil, fmt.Errorf("LIST AddressPrefixSets: %w", err)
+		return nil, errors.Wrap(err, "LIST AddressPrefixSets")
 	}
 	defer resp.Body.Close()
 
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
-		return nil, fmt.Errorf("reading LIST response body: %w", err)
+		return nil, errors.Wrap(err, "reading LIST response body")
 	}
 
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		armErr := parseARMError(resp.StatusCode, body)
-		return nil, fmt.Errorf("LIST AddressPrefixSets: %w", armErr)
+		return nil, errors.Wrap(armErr, "LIST AddressPrefixSets")
 	}
 
 	var result AddressPrefixSetListResult
 	if err := json.Unmarshal(body, &result); err != nil {
-		return nil, fmt.Errorf("decoding LIST response: %w", err)
+		return nil, errors.Wrap(err, "decoding LIST response")
 	}
 
 	return result.Value, nil
@@ -365,7 +366,7 @@ func (c *AddressPrefixSetClient) pollLRO(ctx context.Context, location string) e
 
 		resp, err := c.doRequest(ctx, http.MethodGet, location, nil, nil)
 		if err != nil {
-			return fmt.Errorf("polling LRO: %w", err)
+			return errors.Wrap(err, "polling LRO")
 		}
 		resp.Body.Close()
 
