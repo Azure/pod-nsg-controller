@@ -1025,9 +1025,10 @@ func TestPhase4_Executor_RecomputeSingleTargetActionViaDiff_UsesComputeDiff(t *t
 	}
 }
 
-// TestDeleteActionRecomputeBug demonstrates the bug where a DELETE action
-// on 412 retry incorrectly recomputes as an UPDATE.
-func TestDeleteActionRecomputeBug(t *testing.T) {
+// TestDeleteActionRecomputePreservesKind verifies that a DELETE action
+// recomputed after a 412 retry still produces a DeletePrefixSet action
+// (not an UpdatePrefixSet) when the resource still exists.
+func TestDeleteActionRecomputePreservesKind(t *testing.T) {
 	action := engine.Action{
 		Kind: engine.DeletePrefixSet,
 		Target: engine.ASGTarget{
@@ -1057,10 +1058,8 @@ func TestDeleteActionRecomputeBug(t *testing.T) {
 		t.Fatal("expected recompute to produce an action, got nil")
 	}
 
-	// BUG: next.Kind should be DeletePrefixSet, but it's UpdatePrefixSet
 	if next.Kind != engine.DeletePrefixSet {
-		t.Errorf("BUG: DELETE action recomputed as %s instead of DeletePrefixSet", next.Kind)
-		t.Logf("Expected: DeletePrefixSet, Got: %s with DesiredIPs=%v", next.Kind, next.DesiredIPs)
+		t.Errorf("expected DeletePrefixSet, got %s (DesiredIPs=%v)", next.Kind, next.DesiredIPs)
 	}
 }
 
