@@ -28,10 +28,13 @@ rules:
     verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
   - apiGroups: ["networking.azure.com"]
     resources: ["podasgmappings"]
-    verbs: ["get", "list", "watch"]
+    verbs: ["get", "list", "watch", "patch", "update"]
   - apiGroups: ["networking.azure.com"]
     resources: ["podasgmappings/status"]
     verbs: ["get", "patch", "update"]
+  - apiGroups: ["networking.azure.com"]
+    resources: ["podasgmappings/finalizers"]
+    verbs: ["update"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding
