@@ -72,28 +72,22 @@ func main() {
 		os.Exit(1)
 	}
 
-	asgClient, err := azure.NewASGClient(cfg.SubscriptionID, cfg.ResourceGroup, ctrl.Log.WithName("azure"))
-	if err != nil {
-		setupLog.Error(err, "unable to create Azure ASG client")
-		os.Exit(1)
-	}
+	prefixSetFactory := azure.NewClientFactory(zapLog.With(zap.String("component", "azure-client-factory")))
+	executor := azure.NewExecutor(zapLog.With(zap.String("component", "azure-executor")), prefixSetFactory, 5)
 
-	nicClient, err := azure.NewNICClient(cfg.SubscriptionID, cfg.ResourceGroup)
-	if err != nil {
-		setupLog.Error(err, "unable to create Azure NIC client")
-		os.Exit(1)
-	}
-
-	reconciler := &controller.PodReconciler{
-		Client:    mgr.GetClient(),
-		Scheme:    mgr.GetScheme(),
-		ASGClient: asgClient,
-		NICClient: nicClient,
-		Config:    cfg,
+	reconciler := &controller.MappingReconciler{
+		Client:               mgr.GetClient(),
+		Scheme:               mgr.GetScheme(),
+		ClusterName:          cfg.ClusterName,
+		DefaultSubscription:  cfg.SubscriptionID,
+		DefaultResourceGroup: cfg.ResourceGroup,
+		ResyncInterval:       cfg.ResyncInterval,
+		PrefixSetFactory:     prefixSetFactory,
+		Executor:             executor,
 	}
 
 	if err := reconciler.SetupWithManager(mgr); err != nil {
-		setupLog.Error(err, "unable to create controller", "controller", "Pod")
+		setupLog.Error(err, "unable to create controller", "controller", "MappingReconciler")
 		os.Exit(1)
 	}
 
@@ -106,12 +100,17 @@ func main() {
 		os.Exit(1)
 	}
 
-	setupLog.Info("starting manager",
+	startupFields := []interface{}{
 		"clusterName", cfg.ClusterName,
-		"subscriptionID", cfg.SubscriptionID,
-		"resourceGroup", cfg.ResourceGroup,
-		"nsgName", cfg.NSGName,
-	)
+		"resyncIntervalSeconds", int(cfg.ResyncInterval.Seconds()),
+	}
+	if cfg.SubscriptionID != "" {
+		startupFields = append(startupFields, "subscriptionID", cfg.SubscriptionID)
+	}
+	if cfg.ResourceGroup != "" {
+		startupFields = append(startupFields, "resourceGroup", cfg.ResourceGroup)
+	}
+	setupLog.Info("starting manager", startupFields...)
 
 	if err := mgr.Start(ctrl.SetupSignalHandler()); err != nil {
 		setupLog.Error(err, "problem running manager")
