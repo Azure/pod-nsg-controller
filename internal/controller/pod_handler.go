@@ -2,7 +2,6 @@ package controller
 
 import (
 	"context"
-	"fmt"
 	"sort"
 	"strconv"
 	"strings"
@@ -10,6 +9,7 @@ import (
 
 	v1alpha1 "github.com/Azure/pod-nsg-controller/api/v1alpha1"
 	"github.com/Azure/pod-nsg-controller/internal/model"
+	"github.com/pkg/errors"
 	"github.com/go-logr/logr"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/labels"
@@ -140,7 +140,7 @@ func (h *PodToMappingEventHandler) matchingMappingsForPod(ctx context.Context, p
 func listPodASGMappings(ctx context.Context, c client.Reader, namespace string) (v1alpha1.PodASGMappingList, error) {
 	var mappingList v1alpha1.PodASGMappingList
 	if err := c.List(ctx, &mappingList, client.InNamespace(namespace)); err != nil {
-		return v1alpha1.PodASGMappingList{}, fmt.Errorf("listing PodASGMappings in namespace %s: %w", namespace, err)
+		return v1alpha1.PodASGMappingList{}, errors.Wrapf(err, "listing PodASGMappings in namespace %s", namespace)
 	}
 	return mappingList, nil
 }
