@@ -2,6 +2,7 @@ package controller
 
 import (
 	"context"
+	"strings"
 	"testing"
 
 	v1alpha1 "github.com/Azure/pod-nsg-controller/api/v1alpha1"
@@ -326,43 +327,18 @@ func TestPodMappingCacheKey_OrderIndependentWithoutListResourceVersion(t *testin
 // ---------------------------------------------------------------------------
 func TestMatchingMappingsForPod_ListError_ReturnsError(t *testing.T) {
 	ctx := context.Background()
-	scheme := podHandlerTestScheme(t)
 
-	// Pod in namespace where we cannot list mappings (empty fake client but namespace exists)
-	pod := makePod("no-such-ns", "pod-1", map[string]string{"app": "web"}, "10.0.0.1")
+	pod := makePod("default", "pod-1", map[string]string{"app": "web"}, "10.0.0.1")
 
-	fakeReader := fakeclient.NewClientBuilder().
-		WithScheme(scheme).
-		Build()
-
-	reqs, err := MatchingMappingsForPod(ctx, fakeReader, pod)
-
-	// Stub returns nil,nil — real impl should return error on list failure.
-	// For now, we verify that when no mappings exist, we get empty (stub behavior).
-	// Once implemented, if a real list error occurs, err should be non-nil.
-	if err == nil && len(reqs) == 0 {
-		// This is expected from stub — the real impl test would check error path
-		// When the list succeeds but returns 0 items, that's fine
+	reqs, err := MatchingMappingsForPod(ctx, failingListReader{}, pod)
+	if err == nil {
+		t.Fatal("expected non-nil error when List fails")
 	}
-
-	// The key assertion: MatchingMappingsForPod must actually list and match.
-	// This test verifies it returns empty when no mappings exist in the namespace.
-	// Re-run with a mapping to ensure it WOULD match.
-	mapping := makeMapping("test-ns", "m1",
-		map[string]string{"app": "web"},
-		handlerASGResourceID("sub1", "rg1", "asg1"))
-	readerWithMapping := fakeclient.NewClientBuilder().
-		WithScheme(scheme).
-		WithObjects(mapping).
-		Build()
-
-	pod2 := makePod("test-ns", "pod-1", map[string]string{"app": "web"}, "10.0.0.1")
-	reqs2, err2 := MatchingMappingsForPod(ctx, readerWithMapping, pod2)
-	if err2 != nil {
-		t.Fatalf("unexpected error: %v", err2)
+	if reqs != nil {
+		t.Errorf("expected nil requests on list error, got %v", reqs)
 	}
-	if len(reqs2) == 0 {
-		t.Error("expected MatchingMappingsForPod to return requests when matching mappings exist")
+	if !strings.Contains(err.Error(), "listing PodASGMappings") {
+		t.Errorf("error should mention listing PodASGMappings, got: %v", err)
 	}
 }
 
