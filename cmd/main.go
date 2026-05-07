@@ -4,6 +4,7 @@ import (
 	"flag"
 	"fmt"
 	"os"
+	"time"
 
 	"github.com/go-logr/zapr"
 	"go.uber.org/zap"
@@ -75,6 +76,8 @@ func main() {
 	prefixSetFactory := azure.NewClientFactory(zapLog.With(zap.String("component", "azure-client-factory")))
 	executor := azure.NewExecutor(zapLog.With(zap.String("component", "azure-executor")), prefixSetFactory, 5)
 
+	statusUpdater := controller.NewMappingStatusUpdater(mgr.GetClient(), time.Now)
+
 	reconciler := &controller.MappingReconciler{
 		Client:               mgr.GetClient(),
 		Scheme:               mgr.GetScheme(),
@@ -84,6 +87,7 @@ func main() {
 		ResyncInterval:       cfg.ResyncInterval,
 		PrefixSetFactory:     prefixSetFactory,
 		Executor:             executor,
+		StatusUpdater:        statusUpdater,
 	}
 
 	if err := reconciler.SetupWithManager(mgr); err != nil {

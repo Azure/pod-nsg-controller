@@ -2,6 +2,7 @@ package controller
 
 import (
 	"context"
+	stderrors "errors"
 	"fmt"
 	"strings"
 	"time"
@@ -34,8 +35,7 @@ type StatusUpdater interface {
 	UpdateAfterReconcile(
 		ctx context.Context,
 		mapping *v1alpha1.PodASGMapping,
-		results []azure.ActionResult,
-		reconcileErr error,
+		input ReconcileStatusInput,
 	) error
 }
 
@@ -103,12 +103,49 @@ func (r *MappingReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 		return ctrl.Result{}, nil
 	}
 
-	// Ensure finalizer. If added, return immediately with Requeue: true.
+	// Ensure finalizer. If added, re-fetch, compute pod counts, validate, write status, and return.
 	added, err := r.ensureFinalizer(ctx, &mapping)
 	if err != nil {
 		return ctrl.Result{}, errors.Wrap(err, "ensuring finalizer")
 	}
 	if added {
+		// Re-fetch object to get fresh resourceVersion after finalizer patch.
+		if err := r.Get(ctx, req.NamespacedName, &mapping); err != nil {
+			return ctrl.Result{}, errors.Wrap(err, "refetching after finalizer")
+		}
+
+		if r.StatusUpdater != nil {
+			// Compute pod counts for status.
+			var podList corev1.PodList
+			if err := r.List(ctx, &podList, client.InNamespace(mapping.Namespace)); err != nil {
+				return ctrl.Result{}, errors.Wrap(err, "listing pods for bootstrap status")
+			}
+			podCounts := ComputePodCountsFromPods(mapping.Spec, podList.Items)
+
+			// Validate spec.
+			validation := validateASGResourceIDs(mapping.Spec)
+			if validation.HasErrors() {
+				input := ReconcileStatusInput{
+					Phase:            StatusPhaseValidationFailed,
+					ProcessedGen:     mapping.Generation,
+					ProcessedSpec:    mapping.Spec,
+					PodCounts:        podCounts,
+					ValidationErrors: validation.ValidationErrors,
+				}
+				_ = r.StatusUpdater.UpdateAfterReconcile(ctx, &mapping, input)
+				return ctrl.Result{Requeue: true}, nil
+			}
+
+			// Write bootstrap pending status.
+			input := ReconcileStatusInput{
+				Phase:         StatusPhaseBootstrapPending,
+				ProcessedGen:  mapping.Generation,
+				ProcessedSpec: mapping.Spec,
+				PodCounts:     podCounts,
+			}
+			_ = r.StatusUpdater.UpdateAfterReconcile(ctx, &mapping, input)
+		}
+
 		return ctrl.Result{Requeue: true}, nil
 	}
 
@@ -116,6 +153,22 @@ func (r *MappingReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 	var podList corev1.PodList
 	if err := r.List(ctx, &podList, client.InNamespace(mapping.Namespace)); err != nil {
 		return ctrl.Result{}, errors.Wrap(err, "listing pods")
+	}
+
+	// Validation gate: run on every non-delete reconcile path (Design §3.5A).
+	if r.StatusUpdater != nil {
+		validation := validateASGResourceIDs(mapping.Spec)
+		if validation.HasErrors() {
+			podCounts := ComputePodCountsFromPods(mapping.Spec, podList.Items)
+			input := ReconcileStatusInput{
+				Phase:            StatusPhaseValidationFailed,
+				ProcessedGen:     mapping.Generation,
+				ProcessedSpec:    mapping.Spec,
+				PodCounts:        podCounts,
+				ValidationErrors: validation.ValidationErrors,
+			}
+			return r.writeEarlyPhaseStatus(ctx, req.NamespacedName, &mapping, input, logger)
+		}
 	}
 
 	// Compute desired state for this mapping.
@@ -231,8 +284,41 @@ func (r *MappingReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 		if err := r.Get(ctx, types.NamespacedName{Name: mapping.Name, Namespace: mapping.Namespace}, &mapping); err != nil {
 			return ctrl.Result{}, errors.Wrap(err, "refetching mapping after patch")
 		}
-		if err := r.StatusUpdater.UpdateAfterReconcile(ctx, &mapping, results, reconcileErr); err != nil {
-			logger.Error(err, "failed to update status")
+
+		// Compute pod counts for status.
+		statusPodCounts := ComputePodCountsFromPods(mapping.Spec, podList.Items)
+
+		statusInput := ReconcileStatusInput{
+			Phase:                      StatusPhasePostExecution,
+			ProcessedGen:               mapping.Generation,
+			ProcessedSpec:              mapping.Spec,
+			PreviousMappingStatuses:    append([]v1alpha1.MappingStatus(nil), mapping.Status.MappingStatuses...),
+			PreviousObservedGeneration: observedGenerationForCondition(mapping.Status.Conditions, ConditionReconciled),
+			Results:                    results,
+			PodCounts:                  statusPodCounts,
+			ReconcileErr:               reconcileErr,
+		}
+
+		statusErr := r.StatusUpdater.UpdateAfterReconcile(ctx, &mapping, statusInput)
+		if statusErr != nil {
+			// Check for generation drift.
+			var driftErr *StatusGenerationDriftError
+			if stderrors.As(statusErr, &driftErr) {
+				logger.V(1).Info("stale status write skipped",
+					"processedGeneration", driftErr.ProcessedGeneration,
+					"liveGeneration", driftErr.LiveGeneration,
+					"phase", string(StatusPhasePostExecution),
+				)
+				if reconcileErr != nil {
+					return ctrl.Result{}, reconcileErr
+				}
+				return ctrl.Result{Requeue: true}, nil
+			}
+			logger.Error(statusErr, "failed to update status")
+			combined := combineReconcileAndStatusErrors(reconcileErr, statusErr)
+			if combined != nil {
+				return ctrl.Result{}, combined
+			}
 		}
 	}
 
@@ -498,4 +584,25 @@ func withinPromptFollowUpWindow(createdAt time.Time, promptWindow time.Duration)
 		return false
 	}
 	return time.Since(createdAt) < promptWindow
+}
+
+// combineReconcileAndStatusErrors combines reconcile and status update errors.
+// Rules:
+// 1. both nil -> nil
+// 2. reconcile only -> reconcileErr
+// 3. status only -> errors.Wrap(statusErr, "updating PodASGMapping status")
+// 4. both -> wrap reconcileErr with status context using pkg/errors
+func combineReconcileAndStatusErrors(reconcileErr, statusErr error) error {
+	if reconcileErr == nil && statusErr == nil {
+		return nil
+	}
+	if reconcileErr != nil && statusErr == nil {
+		return reconcileErr
+	}
+	if reconcileErr == nil && statusErr != nil {
+		return errors.Wrap(statusErr, "updating PodASGMapping status")
+	}
+	// Both present: wrap reconcileErr as primary cause with status context.
+	wrappedStatus := errors.Wrap(statusErr, "updating PodASGMapping status")
+	return errors.Wrap(reconcileErr, wrappedStatus.Error())
 }

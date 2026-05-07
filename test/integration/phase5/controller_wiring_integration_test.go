@@ -22,6 +22,7 @@ import (
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/envtest"
+	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
 
 	"go.uber.org/zap/zaptest"
 
@@ -152,7 +153,8 @@ func setupTestEnv(t *testing.T) *testEnv {
 	ctrl.SetLogger(zapr.NewLogger(zapLog))
 
 	mgr, err := ctrl.NewManager(cfg, ctrl.Options{
-		Scheme: scheme,
+		Scheme:  scheme,
+		Metrics: metricsserver.Options{BindAddress: "0"},
 	})
 	if err != nil {
 		env.Stop()
