@@ -524,8 +524,6 @@ func TestUpdateAfterReconcile_StatusOnlyMutation_DoesNotChangeSpecOrMetadata(t *
 	if fetched.Status.MappingCount != 1 {
 		t.Errorf("MappingCount = %d, want 1 (status was not updated)", fetched.Status.MappingCount)
 	}
-
-	_ = fmt.Sprintf("verified T6.7: status-only mutation")
 }
 
 // ---------------------------------------------------------------------------
