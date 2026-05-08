@@ -983,8 +983,8 @@ func TestIntegration_PodWithoutIP_ExcludedByBothIndexAndEngine(t *testing.T) {
 
 	pods := []corev1.Pod{
 		makePod("default", "pod-with-ip", map[string]string{"app": "test"}, "10.0.0.1"),
-		makePod("default", "pod-no-ip", map[string]string{"app": "test"}, ""),   // no IP yet
-		makePod("default", "pod-pending", map[string]string{"app": "test"}, ""), // also no IP
+		makePod("default", "pod-no-ip", map[string]string{"app": "test"}, ""),        // no IP yet
+		makePod("default", "pod-pending", map[string]string{"app": "test"}, ""),       // also no IP
 	}
 
 	// BuildIndex matches by labels (both pods match), but engine excludes empty IPs.

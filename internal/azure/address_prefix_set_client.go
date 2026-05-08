@@ -12,8 +12,8 @@ import (
 	"time"
 
 	"github.com/Azure/azure-sdk-for-go/sdk/azcore"
-	"github.com/Azure/azure-sdk-for-go/sdk/azcore/policy"
 	"github.com/pkg/errors"
+	"github.com/Azure/azure-sdk-for-go/sdk/azcore/policy"
 	"go.uber.org/zap"
 )
 
