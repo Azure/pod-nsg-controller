@@ -32,8 +32,12 @@ lint: ## Run golangci-lint against code.
 
 .PHONY: test
 test: generate manifests fmt vet setup-envtest ## Run tests.
+	go test $$(go list ./... | grep -v -E '(api/v1alpha1$$|test/integration/)') -coverprofile cover-unit.out
 	KUBEBUILDER_ASSETS="$$(cd "$$( $(SETUP_ENVTEST) use $(ENVTEST_K8S_VERSION) --bin-dir $(LOCALBIN) -p path )" && pwd)" \
-	go test -p 1 ./... -coverprofile cover.out
+	go test -p 1 ./api/... ./test/integration/... -coverprofile cover-envtest.out
+	@echo "mode: set" > cover.out
+	@grep -hv '^mode:' cover-unit.out cover-envtest.out >> cover.out
+	@rm -f cover-unit.out cover-envtest.out
 
 .PHONY: test-coverage
 test-coverage: test ## Run tests with coverage report.
