@@ -12,6 +12,11 @@ func targetIdentityKey(fullResourceID, prefixSetName string) string {
 	return strings.ToLower(fullResourceID + "/" + prefixSetName)
 }
 
+// TargetIdentityKey is the exported form of targetIdentityKey.
+func TargetIdentityKey(fullResourceID, prefixSetName string) string {
+	return targetIdentityKey(fullResourceID, prefixSetName)
+}
+
 func canonicalASGResourceID(subscriptionID, resourceGroup, asgName string) string {
 	return "/subscriptions/" + subscriptionID +
 		"/resourceGroups/" + resourceGroup +

@@ -25,6 +25,7 @@ import (
 
 	"go.uber.org/zap/zaptest"
 
+	"github.com/Azure/pod-nsg-controller/test/integration/testutil"
 	"github.com/go-logr/zapr"
 )
 
@@ -151,13 +152,7 @@ func setupTestEnv(t *testing.T) *testEnv {
 
 	ctrl.SetLogger(zapr.NewLogger(zapLog))
 
-	mgr, err := ctrl.NewManager(cfg, ctrl.Options{
-		Scheme: scheme,
-	})
-	if err != nil {
-		env.Stop()
-		t.Fatalf("failed to create manager: %v", err)
-	}
+	mgr := testutil.NewEnvtestManager(t, cfg, scheme)
 
 	fakeFactory := fake.NewClientFactory()
 	fakeAzClient := fake.NewClient()

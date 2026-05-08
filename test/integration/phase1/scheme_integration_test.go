@@ -20,13 +20,12 @@ import (
 	"k8s.io/client-go/discovery"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
 	"k8s.io/client-go/rest"
-	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/envtest"
 	"sigs.k8s.io/controller-runtime/pkg/log"
-	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
 
 	v1alpha1 "github.com/Azure/pod-nsg-controller/api/v1alpha1"
+	"github.com/Azure/pod-nsg-controller/test/integration/testutil"
 )
 
 const envtestK8sVersion = "1.31.x"
@@ -271,13 +270,7 @@ func TestIntegration_ManagerCreationWithCRD(t *testing.T) {
 	_, cfg, _, s := startFullEnvtest(t)
 
 	// Create a manager the same way cmd/main.go does, but with a random metrics port
-	mgr, err := ctrl.NewManager(cfg, ctrl.Options{
-		Scheme:  s,
-		Metrics: metricsserver.Options{BindAddress: "0"},
-	})
-	if err != nil {
-		t.Fatalf("failed to create manager: %v", err)
-	}
+	mgr := testutil.NewEnvtestManager(t, cfg, s)
 
 	t.Run("ManagerSchemeRecognizesCRDType", func(t *testing.T) {
 		_, err := mgr.GetScheme().New(v1alpha1.GroupVersion.WithKind("PodASGMapping"))
@@ -344,13 +337,7 @@ func TestIntegration_CacheInformerForCRD(t *testing.T) {
 
 	_, cfg, _, s := startFullEnvtest(t)
 
-	mgr, err := ctrl.NewManager(cfg, ctrl.Options{
-		Scheme:  s,
-		Metrics: metricsserver.Options{BindAddress: "0"},
-	})
-	if err != nil {
-		t.Fatalf("failed to create manager: %v", err)
-	}
+	mgr := testutil.NewEnvtestManager(t, cfg, s)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
