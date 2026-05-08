@@ -68,6 +68,10 @@ func (u *MappingStatusUpdater) UpdatePending(
 			Now:                u.Now(),
 		})
 
+		if statusSemanticEqual(mapping.Status, newStatus) {
+			return nil
+		}
+
 		mapping.Status = newStatus
 		if err := u.Client.Status().Update(ctx, &mapping); err != nil {
 			if apierrors.IsConflict(err) && attempt < u.MaxAttempts {
@@ -120,6 +124,10 @@ func (u *MappingStatusUpdater) UpdateAfterReconcile(
 			Phase:              StatusPhaseFinal,
 			Now:                u.Now(),
 		})
+
+		if statusSemanticEqual(mapping.Status, newStatus) {
+			return nil
+		}
 
 		mapping.Status = newStatus
 		if err := u.Client.Status().Update(ctx, &mapping); err != nil {

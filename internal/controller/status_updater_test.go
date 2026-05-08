@@ -845,3 +845,226 @@ func TestUpdateAfterReconcile_T64_PreservesLastSyncTimeOnReorderBySelectorHash(t
 			fetched.Status.MappingStatuses[1].LastSyncTime, timeA)
 	}
 }
+
+// ---------------------------------------------------------------------------
+// TestStatusSemanticEqual
+// ---------------------------------------------------------------------------
+
+func TestStatusSemanticEqual(t *testing.T) {
+	now := metav1.Now()
+	earlier := metav1.NewTime(now.Add(-time.Hour))
+
+	base := v1alpha1.PodASGMappingStatus{
+		MappingCount: 1,
+		Conditions: []metav1.Condition{
+			{
+				Type:               ConditionAccepted,
+				Status:             metav1.ConditionTrue,
+				Reason:             ReasonSpecValid,
+				ObservedGeneration: 1,
+				LastTransitionTime: earlier,
+			},
+		},
+		MappingStatuses: []v1alpha1.MappingStatus{
+			{SelectorHash: "abc", MatchedPods: 3, ASGSyncState: SyncStateSynced, LastSyncTime: earlier},
+		},
+	}
+
+	// Same content, different LastTransitionTime → equal.
+	sameDiffTime := base.DeepCopy()
+	sameDiffTime.Conditions[0].LastTransitionTime = now
+	if !statusSemanticEqual(base, *sameDiffTime) {
+		t.Error("expected equal when only LastTransitionTime differs")
+	}
+
+	// Different MappingCount → not equal.
+	diffCount := base.DeepCopy()
+	diffCount.MappingCount = 2
+	if statusSemanticEqual(base, *diffCount) {
+		t.Error("expected not equal when MappingCount differs")
+	}
+
+	// Different condition status → not equal.
+	diffCondStatus := base.DeepCopy()
+	diffCondStatus.Conditions[0].Status = metav1.ConditionFalse
+	if statusSemanticEqual(base, *diffCondStatus) {
+		t.Error("expected not equal when condition Status differs")
+	}
+
+	// Different condition reason → not equal.
+	diffCondReason := base.DeepCopy()
+	diffCondReason.Conditions[0].Reason = "OtherReason"
+	if statusSemanticEqual(base, *diffCondReason) {
+		t.Error("expected not equal when condition Reason differs")
+	}
+
+	// Different ObservedGeneration → not equal.
+	diffGen := base.DeepCopy()
+	diffGen.Conditions[0].ObservedGeneration = 2
+	if statusSemanticEqual(base, *diffGen) {
+		t.Error("expected not equal when ObservedGeneration differs")
+	}
+
+	// Different MatchedPods → not equal.
+	diffPods := base.DeepCopy()
+	diffPods.MappingStatuses[0].MatchedPods = 5
+	if statusSemanticEqual(base, *diffPods) {
+		t.Error("expected not equal when MatchedPods differs")
+	}
+
+	// Different ASGSyncState → not equal.
+	diffState := base.DeepCopy()
+	diffState.MappingStatuses[0].ASGSyncState = SyncStateError
+	if statusSemanticEqual(base, *diffState) {
+		t.Error("expected not equal when ASGSyncState differs")
+	}
+
+	// Different LastSyncTime → not equal.
+	diffSync := base.DeepCopy()
+	diffSync.MappingStatuses[0].LastSyncTime = now
+	if statusSemanticEqual(base, *diffSync) {
+		t.Error("expected not equal when LastSyncTime differs")
+	}
+
+	// Different number of conditions → not equal.
+	diffCondLen := base.DeepCopy()
+	diffCondLen.Conditions = append(diffCondLen.Conditions, metav1.Condition{Type: "Extra"})
+	if statusSemanticEqual(base, *diffCondLen) {
+		t.Error("expected not equal when condition count differs")
+	}
+
+	// Both empty → equal.
+	if !statusSemanticEqual(v1alpha1.PodASGMappingStatus{}, v1alpha1.PodASGMappingStatus{}) {
+		t.Error("expected equal for two empty statuses")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// TestUpdatePending_SkipsWriteWhenStatusUnchanged
+// ---------------------------------------------------------------------------
+
+func TestUpdatePending_SkipsWriteWhenStatusUnchanged(t *testing.T) {
+	scheme := statusTestScheme(t)
+	mapping := &v1alpha1.PodASGMapping{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:       "noop-pending",
+			Namespace:  "default",
+			Generation: 1,
+		},
+		Spec: v1alpha1.PodASGMappingSpec{
+			Mappings: []v1alpha1.Mapping{
+				{
+					PodSelector:               v1alpha1.PodSelector{MatchLabels: map[string]string{"app": "web"}},
+					ApplicationSecurityGroups: []v1alpha1.ASGReference{{ResourceID: "/subscriptions/sub1/resourceGroups/rg1/providers/Microsoft.Network/applicationSecurityGroups/asg1"}},
+				},
+			},
+		},
+	}
+
+	fc := fakeclient.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(mapping).WithObjects(mapping).Build()
+	updater := &MappingStatusUpdater{
+		Client:      fc,
+		Logger:      statusTestLogger(t),
+		Now:         metav1.Now,
+		MaxAttempts: 3,
+	}
+
+	key := types.NamespacedName{Name: "noop-pending", Namespace: "default"}
+
+	// First call: writes pending status.
+	if err := updater.UpdatePending(context.Background(), key, 1, "prefix", []int{2}); err != nil {
+		t.Fatalf("first UpdatePending returned error: %v", err)
+	}
+
+	// Track writes via a conflict-injecting client with 0 remaining conflicts.
+	updateCalls := 0
+	conflictsRemaining := 0
+	cc := &conflictInjectingClient{
+		Client: fc,
+		statusWriter: &conflictInjectingStatusWriter{
+			SubResourceWriter:  fc.Status(),
+			conflictsRemaining: &conflictsRemaining,
+			updateCalls:        &updateCalls,
+		},
+	}
+	updater.Client = cc
+
+	// Second call with same inputs: should skip the write.
+	if err := updater.UpdatePending(context.Background(), key, 1, "prefix", []int{2}); err != nil {
+		t.Fatalf("second UpdatePending returned error: %v", err)
+	}
+
+	if updateCalls != 0 {
+		t.Errorf("status update calls = %d, want 0 (should have been skipped)", updateCalls)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// TestUpdateAfterReconcile_SkipsWriteWhenValidationStatusUnchanged
+// ---------------------------------------------------------------------------
+
+func TestUpdateAfterReconcile_SkipsWriteWhenValidationStatusUnchanged(t *testing.T) {
+	scheme := statusTestScheme(t)
+	mapping := &v1alpha1.PodASGMapping{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:       "noop-validation",
+			Namespace:  "default",
+			Generation: 1,
+		},
+		Spec: v1alpha1.PodASGMappingSpec{
+			Mappings: []v1alpha1.Mapping{
+				{
+					PodSelector:               v1alpha1.PodSelector{MatchLabels: map[string]string{"app": "bad"}},
+					ApplicationSecurityGroups: []v1alpha1.ASGReference{{ResourceID: "not-a-valid-id"}},
+				},
+			},
+		},
+	}
+
+	fc := fakeclient.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(mapping).WithObjects(mapping).Build()
+	updater := &MappingStatusUpdater{
+		Client:      fc,
+		Logger:      statusTestLogger(t),
+		Now:         metav1.Now,
+		MaxAttempts: 3,
+	}
+
+	validationIssues := []ValidationIssue{
+		{MappingIndex: 0, ASGIndex: 0, ResourceID: "not-a-valid-id", Err: fmt.Errorf("invalid resource ID")},
+	}
+
+	key := types.NamespacedName{Name: "noop-validation", Namespace: "default"}
+
+	// First call: writes validation failure status.
+	if err := updater.UpdateAfterReconcile(
+		context.Background(), key, 1, "prefix",
+		nil, fmt.Errorf("validation failed"), validationIssues, []int{0},
+	); err != nil {
+		t.Fatalf("first UpdateAfterReconcile returned error: %v", err)
+	}
+
+	// Track writes.
+	updateCalls := 0
+	conflictsRemaining := 0
+	cc := &conflictInjectingClient{
+		Client: fc,
+		statusWriter: &conflictInjectingStatusWriter{
+			SubResourceWriter:  fc.Status(),
+			conflictsRemaining: &conflictsRemaining,
+			updateCalls:        &updateCalls,
+		},
+	}
+	updater.Client = cc
+
+	// Second call with same validation failure: should skip the write.
+	if err := updater.UpdateAfterReconcile(
+		context.Background(), key, 1, "prefix",
+		nil, fmt.Errorf("validation failed"), validationIssues, []int{0},
+	); err != nil {
+		t.Fatalf("second UpdateAfterReconcile returned error: %v", err)
+	}
+
+	if updateCalls != 0 {
+		t.Errorf("status update calls = %d, want 0 (should have been skipped)", updateCalls)
+	}
+}

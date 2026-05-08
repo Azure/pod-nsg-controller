@@ -251,6 +251,38 @@ func dedupStrings(ss []string) []string {
 	return result
 }
 
+// statusSemanticEqual reports whether two PodASGMappingStatus values are
+// semantically identical, ignoring condition LastTransitionTime fields
+// (which are set to metav1.Now() on every ComputeStatus call).
+func statusSemanticEqual(a, b v1alpha1.PodASGMappingStatus) bool {
+	if a.MappingCount != b.MappingCount {
+		return false
+	}
+	if len(a.Conditions) != len(b.Conditions) {
+		return false
+	}
+	for i := range a.Conditions {
+		ca, cb := a.Conditions[i], b.Conditions[i]
+		if ca.Type != cb.Type || ca.Status != cb.Status ||
+			ca.Reason != cb.Reason || ca.Message != cb.Message ||
+			ca.ObservedGeneration != cb.ObservedGeneration {
+			return false
+		}
+	}
+	if len(a.MappingStatuses) != len(b.MappingStatuses) {
+		return false
+	}
+	for i := range a.MappingStatuses {
+		ma, mb := a.MappingStatuses[i], b.MappingStatuses[i]
+		if ma.SelectorHash != mb.SelectorHash || ma.MatchedPods != mb.MatchedPods ||
+			ma.ASGSyncState != mb.ASGSyncState || ma.Error != mb.Error ||
+			!ma.LastSyncTime.Equal(&mb.LastSyncTime) {
+			return false
+		}
+	}
+	return true
+}
+
 // hasFailedResults returns true if any ActionResult indicates failure.
 func hasFailedResults(results []azure.ActionResult) bool {
 	for _, r := range results {
