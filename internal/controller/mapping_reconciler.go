@@ -121,6 +121,7 @@ func (r *MappingReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 	validationIssues := validateASGResourceIDs(mapping.Spec.Mappings)
 	if len(validationIssues) > 0 {
 		validationErr := aggregateValidationErrors(validationIssues)
+		logger.Error(validationErr, "spec validation failed, waiting for spec update")
 		if r.StatusUpdater != nil {
 			statusErr := r.StatusUpdater.UpdateAfterReconcile(ctx, req.NamespacedName, mapping.Generation, ownershipKey, nil, validationErr, validationIssues, matchedPodsByIndex)
 			if statusErr != nil {
@@ -130,7 +131,10 @@ func (r *MappingReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 				logger.Error(statusErr, "failed to update status for validation failure")
 			}
 		}
-		return ctrl.Result{}, validationErr
+		// Return nil error: validation failures are deterministic and retrying
+		// won't help. Status has been updated; a watch event will trigger
+		// reconciliation when the user fixes the spec.
+		return ctrl.Result{}, nil
 	}
 
 	// Write pending status before Azure operations.
