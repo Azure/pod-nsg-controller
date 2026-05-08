@@ -45,6 +45,7 @@ func (u *MappingStatusUpdater) UpdatePending(
 	prefixSetName string,
 	matchedPodsByIndex []int,
 ) error {
+	var lastErr error
 	for attempt := 1; attempt <= u.MaxAttempts; attempt++ {
 		var mapping v1alpha1.PodASGMapping
 		if err := u.Client.Get(ctx, key, &mapping); err != nil {
@@ -74,6 +75,7 @@ func (u *MappingStatusUpdater) UpdatePending(
 
 		mapping.Status = newStatus
 		if err := u.Client.Status().Update(ctx, &mapping); err != nil {
+			lastErr = err
 			if apierrors.IsConflict(err) && attempt < u.MaxAttempts {
 				u.Logger.V(1).Info("conflict on pending status update, retrying",
 					"attempt", attempt,
@@ -85,7 +87,7 @@ func (u *MappingStatusUpdater) UpdatePending(
 		}
 		return nil
 	}
-	return errors.Errorf("updating pending status: max attempts exceeded")
+	return errors.Wrap(lastErr, "updating pending status: max attempts exceeded")
 }
 
 // UpdateAfterReconcile writes the final status after Azure operations complete.
@@ -99,6 +101,7 @@ func (u *MappingStatusUpdater) UpdateAfterReconcile(
 	validationIssues []ValidationIssue,
 	matchedPodsByIndex []int,
 ) error {
+	var lastErr error
 	for attempt := 1; attempt <= u.MaxAttempts; attempt++ {
 		var mapping v1alpha1.PodASGMapping
 		if err := u.Client.Get(ctx, key, &mapping); err != nil {
@@ -131,6 +134,7 @@ func (u *MappingStatusUpdater) UpdateAfterReconcile(
 
 		mapping.Status = newStatus
 		if err := u.Client.Status().Update(ctx, &mapping); err != nil {
+			lastErr = err
 			if apierrors.IsConflict(err) && attempt < u.MaxAttempts {
 				u.Logger.V(1).Info("conflict on final status update, retrying",
 					"attempt", attempt,
@@ -142,5 +146,5 @@ func (u *MappingStatusUpdater) UpdateAfterReconcile(
 		}
 		return nil
 	}
-	return errors.Errorf("updating final status: max attempts exceeded")
+	return errors.Wrap(lastErr, "updating final status: max attempts exceeded")
 }
