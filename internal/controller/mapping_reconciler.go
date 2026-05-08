@@ -29,14 +29,10 @@ type Executor interface {
 	Execute(ctx context.Context, actions []engine.Action) []azure.ActionResult
 }
 
-// StatusUpdater abstracts status updates (Phase 6 hook).
+// StatusUpdater abstracts status updates for the reconcile loop.
 type StatusUpdater interface {
-	UpdateAfterReconcile(
-		ctx context.Context,
-		mapping *v1alpha1.PodASGMapping,
-		results []azure.ActionResult,
-		reconcileErr error,
-	) error
+	UpdatePending(ctx context.Context, key types.NamespacedName, observedGeneration int64, prefixSetName string, matchedPodsByIndex []int) error
+	UpdateAfterReconcile(ctx context.Context, key types.NamespacedName, observedGeneration int64, prefixSetName string, results []azure.ActionResult, reconcileErr error, validationIssues []ValidationIssue, matchedPodsByIndex []int) error
 }
 
 // MappingReconciler reconciles PodASGMapping objects.
@@ -116,6 +112,35 @@ func (r *MappingReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 	var podList corev1.PodList
 	if err := r.List(ctx, &podList, client.InNamespace(mapping.Namespace)); err != nil {
 		return ctrl.Result{}, errors.Wrap(err, "listing pods")
+	}
+
+	// Compute matched pods per mapping index.
+	matchedPodsByIndex := ComputeMatchedPodsByMapping(mapping.Spec, podList.Items)
+
+	// Validate ASG resource IDs.
+	validationIssues := validateASGResourceIDs(mapping.Spec.Mappings)
+	if len(validationIssues) > 0 {
+		validationErr := aggregateValidationErrors(validationIssues)
+		if r.StatusUpdater != nil {
+			statusErr := r.StatusUpdater.UpdateAfterReconcile(ctx, req.NamespacedName, mapping.Generation, ownershipKey, nil, validationErr, validationIssues, matchedPodsByIndex)
+			if statusErr != nil {
+				if statusErr == ErrStatusObjectNotFound || statusErr == ErrStatusStaleGeneration {
+					return ctrl.Result{}, nil
+				}
+				logger.Error(statusErr, "failed to update status for validation failure")
+			}
+		}
+		return ctrl.Result{}, validationErr
+	}
+
+	// Write pending status before Azure operations.
+	if r.StatusUpdater != nil {
+		if pendingErr := r.StatusUpdater.UpdatePending(ctx, req.NamespacedName, mapping.Generation, ownershipKey, matchedPodsByIndex); pendingErr != nil {
+			if pendingErr == ErrStatusObjectNotFound || pendingErr == ErrStatusStaleGeneration {
+				return ctrl.Result{}, nil
+			}
+			logger.Error(pendingErr, "failed to update pending status, continuing")
+		}
 	}
 
 	// Compute desired state for this mapping.
@@ -226,18 +251,24 @@ func (r *MappingReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 		}
 	}
 
-	// Refetch mapping after metadata patch before optional status update.
+	// Write final status after Azure operations.
+	var statusErr error
 	if r.StatusUpdater != nil {
-		if err := r.Get(ctx, types.NamespacedName{Name: mapping.Name, Namespace: mapping.Namespace}, &mapping); err != nil {
-			return ctrl.Result{}, errors.Wrap(err, "refetching mapping after patch")
-		}
-		if err := r.StatusUpdater.UpdateAfterReconcile(ctx, &mapping, results, reconcileErr); err != nil {
-			logger.Error(err, "failed to update status")
+		statusErr = r.StatusUpdater.UpdateAfterReconcile(ctx, req.NamespacedName, mapping.Generation, ownershipKey, results, reconcileErr, nil, matchedPodsByIndex)
+		if statusErr != nil {
+			if statusErr == ErrStatusObjectNotFound || statusErr == ErrStatusStaleGeneration {
+				return ctrl.Result{}, nil
+			}
+			logger.Error(statusErr, "failed to update final status")
 		}
 	}
 
 	if reconcileErr != nil {
 		return ctrl.Result{}, reconcileErr
+	}
+
+	if statusErr != nil {
+		return ctrl.Result{}, statusErr
 	}
 
 	// When no targets exist, schedule a short follow-up while pods/IPs or informer
@@ -498,4 +529,34 @@ func withinPromptFollowUpWindow(createdAt time.Time, promptWindow time.Duration)
 		return false
 	}
 	return time.Since(createdAt) < promptWindow
+}
+
+// validateASGResourceIDs validates all ASG resource IDs in the spec mappings.
+func validateASGResourceIDs(mappings []v1alpha1.Mapping) []ValidationIssue {
+	var issues []ValidationIssue
+	for i, m := range mappings {
+		for j, asgRef := range m.ApplicationSecurityGroups {
+			if _, err := model.ParseASGResourceID(asgRef.ResourceID); err != nil {
+				issues = append(issues, ValidationIssue{
+					MappingIndex: i,
+					ASGIndex:     j,
+					ResourceID:   asgRef.ResourceID,
+					Err:          err,
+				})
+			}
+		}
+	}
+	return issues
+}
+
+// aggregateValidationErrors combines validation issues into a single error.
+func aggregateValidationErrors(issues []ValidationIssue) error {
+	if len(issues) == 0 {
+		return nil
+	}
+	var parts []string
+	for _, vi := range issues {
+		parts = append(parts, fmt.Sprintf("mapping[%d].asg[%d] %q: %v", vi.MappingIndex, vi.ASGIndex, vi.ResourceID, vi.Err))
+	}
+	return fmt.Errorf("validation failed: %s", strings.Join(parts, "; "))
 }

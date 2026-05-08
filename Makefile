@@ -33,7 +33,7 @@ lint: ## Run golangci-lint against code.
 .PHONY: test
 test: generate manifests fmt vet setup-envtest ## Run tests.
 	KUBEBUILDER_ASSETS="$$(cd "$$( $(SETUP_ENVTEST) use $(ENVTEST_K8S_VERSION) --bin-dir $(LOCALBIN) -p path )" && pwd)" \
-	go test ./... -coverprofile cover.out
+	go test -p 1 ./... -coverprofile cover.out
 
 .PHONY: test-coverage
 test-coverage: test ## Run tests with coverage report.
