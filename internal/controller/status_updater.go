@@ -2,10 +2,9 @@ package controller
 
 import (
 	"context"
-	"errors"
-	"fmt"
 
 	"github.com/go-logr/logr"
+	"github.com/pkg/errors"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
@@ -52,7 +51,7 @@ func (u *MappingStatusUpdater) UpdatePending(
 			if apierrors.IsNotFound(err) {
 				return ErrStatusObjectNotFound
 			}
-			return fmt.Errorf("fetching mapping for pending status: %w", err)
+			return errors.Wrap(err, "fetching mapping for pending status")
 		}
 
 		if mapping.Generation > observedGeneration {
@@ -78,11 +77,11 @@ func (u *MappingStatusUpdater) UpdatePending(
 				)
 				continue
 			}
-			return fmt.Errorf("updating pending status: %w", err)
+			return errors.Wrap(err, "updating pending status")
 		}
 		return nil
 	}
-	return fmt.Errorf("updating pending status: max attempts exceeded")
+	return errors.Errorf("updating pending status: max attempts exceeded")
 }
 
 // UpdateAfterReconcile writes the final status after Azure operations complete.
@@ -102,7 +101,7 @@ func (u *MappingStatusUpdater) UpdateAfterReconcile(
 			if apierrors.IsNotFound(err) {
 				return ErrStatusObjectNotFound
 			}
-			return fmt.Errorf("fetching mapping for final status: %w", err)
+			return errors.Wrap(err, "fetching mapping for final status")
 		}
 
 		if mapping.Generation > observedGeneration {
@@ -131,9 +130,9 @@ func (u *MappingStatusUpdater) UpdateAfterReconcile(
 				)
 				continue
 			}
-			return fmt.Errorf("updating final status: %w", err)
+			return errors.Wrap(err, "updating final status")
 		}
 		return nil
 	}
-	return fmt.Errorf("updating final status: max attempts exceeded")
+	return errors.Errorf("updating final status: max attempts exceeded")
 }
