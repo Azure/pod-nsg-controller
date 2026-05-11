@@ -33,6 +33,12 @@ type Config struct {
 
 	// ResyncInterval is the periodic resync interval for drift correction.
 	ResyncInterval time.Duration
+
+	// ARMRateLimitRPS is the per-subscription ARM call rate limit (default: 10).
+	ARMRateLimitRPS float64
+
+	// MaxConcurrentActions is the max parallel ARM mutations per reconcile (default: 5).
+	MaxConcurrentActions int
 }
 
 // Load reads configuration from environment variables and validates required fields.
@@ -56,6 +62,36 @@ func Load() (*Config, error) {
 			return nil, fmt.Errorf("RESYNC_INTERVAL_SECONDS must be >= 1, got %d", val)
 		}
 		cfg.ResyncInterval = time.Duration(val) * time.Second
+	}
+
+	// Parse ARM rate limit RPS.
+	rpsStr := os.Getenv("ARM_RATE_LIMIT_RPS")
+	if rpsStr == "" {
+		cfg.ARMRateLimitRPS = 10.0
+	} else {
+		val, err := strconv.ParseFloat(rpsStr, 64)
+		if err != nil {
+			return nil, errors.Wrap(err, "ARM_RATE_LIMIT_RPS must be a valid number")
+		}
+		if val <= 0 {
+			return nil, fmt.Errorf("ARM_RATE_LIMIT_RPS must be > 0, got %v", val)
+		}
+		cfg.ARMRateLimitRPS = val
+	}
+
+	// Parse max concurrent actions.
+	concStr := os.Getenv("MAX_CONCURRENT_ACTIONS")
+	if concStr == "" {
+		cfg.MaxConcurrentActions = 5
+	} else {
+		val, err := strconv.Atoi(concStr)
+		if err != nil {
+			return nil, errors.Wrap(err, "MAX_CONCURRENT_ACTIONS must be a valid integer")
+		}
+		if val < 1 {
+			return nil, fmt.Errorf("MAX_CONCURRENT_ACTIONS must be >= 1, got %d", val)
+		}
+		cfg.MaxConcurrentActions = val
 	}
 
 	if err := cfg.Validate(); err != nil {

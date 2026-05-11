@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"time"
 )
 
 // AddressPrefixSetAPI defines the interface for address prefix set operations.
@@ -29,6 +30,9 @@ type ARMStatusError struct {
 	StatusCode int
 	ARMCode    string
 	Message    string
+	Operation  ARMOperation
+	RequestURL string
+	RetryAfter time.Duration
 }
 
 func (e *ARMStatusError) Error() string {

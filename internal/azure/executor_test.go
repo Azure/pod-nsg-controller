@@ -1139,3 +1139,338 @@ func TestPhase4_BuildSingleTargetActual_NilCurrentTreatsResourceAsAbsent(t *test
 		t.Fatalf("expected CreatePrefixSet, got %s", next.Kind)
 	}
 }
+
+// ---------- T7.7: ETag conflict during retry loop → re-GET + recompute succeeds ----------
+
+func TestPhase7_T77_ETagConflict_ReGETRecomputeSuccess(t *testing.T) {
+	log := zaptest.NewLogger(t)
+
+	// The client will return 412 on the first two PUTs, then succeed on the third.
+	client := newStubClient()
+	client.fail412Count = 2
+
+	factory := newStubFactory()
+	factory.Register("sub-1", client)
+
+	// Pre-populate the resource so the update path is valid.
+	client.store[stubKey("sub-1", "rg-1", "asg-1", "ps-1")] = []string{"10.0.0.0/32"}
+
+	executor := NewExecutor(log, factory, 1)
+
+	actions := []engine.Action{
+		{
+			Kind: engine.UpdatePrefixSet,
+			Target: engine.ASGTarget{
+				SubscriptionID: "sub-1",
+				ResourceGroup:  "rg-1",
+				ASGName:        "asg-1",
+				PrefixSetName:  "ps-1",
+			},
+			DesiredIPs: []string{"10.0.0.1/32", "10.0.0.2/32"},
+		},
+	}
+
+	results := executor.Execute(context.Background(), actions)
+	if len(results) != 1 {
+		t.Fatalf("T7.7: expected 1 result, got %d", len(results))
+	}
+	if !results[0].Success {
+		t.Errorf("T7.7: expected retry to succeed after ETag conflicts, got error: %v", results[0].Err)
+	}
+
+	// Verify the resource was updated to the desired IPs after re-GET + recompute.
+	got, err := client.Get(context.Background(), "sub-1", "rg-1", "asg-1", "ps-1")
+	if err != nil {
+		t.Fatalf("T7.7: Get after execute failed: %v", err)
+	}
+	if got == nil || got.Properties == nil {
+		t.Fatal("T7.7: resource should exist after retry")
+	}
+
+	wantIPs := []string{"10.0.0.1/32", "10.0.0.2/32"}
+	if len(got.Properties.AddressPrefixes) != len(wantIPs) {
+		t.Errorf("T7.7: expected %d IPs, got %d: %v",
+			len(wantIPs), len(got.Properties.AddressPrefixes), got.Properties.AddressPrefixes)
+	}
+
+	// Verify the executor performed re-GET + recompute by checking PUT call count.
+	// With fail412Count=2, we expect: PUT(412) → re-GET → PUT(412) → re-GET → PUT(ok) = 3 PUTs.
+	if client.putCalls != 3 {
+		t.Errorf("T7.7: expected 3 PUT attempts (2 x 412 + 1 success), got %d", client.putCalls)
+	}
+
+	// T7.7 Phase 7 assertion: verify that the executor's retry logs include the
+	// Operation metadata from RetryContext, indicating the retry path is governed
+	// by the RetryPolicy (not hardcoded constants from Phase 4).
+	// Re-run with observed logs to check for Operation field.
+	coreObs, obs := observer.New(zap.WarnLevel)
+	obsLog := zap.New(coreObs)
+
+	client2 := newStubClient()
+	client2.fail412Count = 1
+	factory2 := newStubFactory()
+	factory2.Register("sub-1", client2)
+	client2.store[stubKey("sub-1", "rg-1", "asg-1", "ps-1")] = []string{"10.0.0.0/32"}
+
+	executor2 := NewExecutor(obsLog, factory2, 1)
+	results2 := executor2.Execute(context.Background(), actions)
+	if len(results2) != 1 || !results2[0].Success {
+		t.Fatalf("T7.7: expected success in observed run, got %v", results2)
+	}
+
+	// Check that the retry warning log includes an "operation" field matching the ARM operation.
+	// With Phase 7 implementation, the retry path should log structured RetryContext metadata.
+	// With current Phase 4 code, the "operation" field logs armVerb (e.g., "PUT") not ARMOperation.
+	found := false
+	for _, entry := range obs.All() {
+		for _, field := range entry.Context {
+			if field.Key == "operation" && field.String == string(ARMOperationPutPrefixSet) {
+				found = true
+			}
+		}
+	}
+	if !found {
+		t.Errorf("T7.7: expected retry log to contain operation=%q from RetryContext, got logs: %v",
+			ARMOperationPutPrefixSet, obs.All())
+	}
+}
+
+// ---------------------------------------------------------------------------
+// T7.6 Executor Acceptance Tests — Bounded Parallelism & No Dropped Results
+// ---------------------------------------------------------------------------
+
+// TestPhase7_T76_Executor_BoundedParallelism_NoDroppedResults verifies that
+// the executor respects maxParallel and returns results for every input action.
+func TestPhase7_T76_Executor_BoundedParallelism_NoDroppedResults(t *testing.T) {
+	log := zaptest.NewLogger(t)
+
+	client := newStubClient()
+	factory := newStubFactory()
+	factory.Register("sub1", client)
+
+	maxParallel := 3
+	executor := NewExecutor(log, factory, maxParallel)
+
+	// 20 actions
+	actions := make([]engine.Action, 20)
+	for i := 0; i < 20; i++ {
+		actions[i] = engine.Action{
+			Kind: engine.CreatePrefixSet,
+			Target: engine.ASGTarget{
+				SubscriptionID: "sub1",
+				ResourceGroup:  "rg1",
+				ASGName:        "asg1",
+				PrefixSetName:  fmt.Sprintf("ps-%d", i),
+			},
+			DesiredIPs: []string{fmt.Sprintf("10.0.0.%d/32", i)},
+		}
+	}
+
+	// ExecuteWithMetrics returns results and metrics including PeakConcurrency.
+	results, metrics := executor.ExecuteWithMetrics(context.Background(), actions)
+
+	// Assert: all 20 results returned (no drops)
+	if len(results) != 20 {
+		t.Fatalf("T7.6: expected 20 results, got %d", len(results))
+	}
+
+	// Assert: peak concurrency <= maxParallel
+	if metrics.PeakConcurrency > maxParallel {
+		t.Errorf("T7.6: PeakConcurrency = %d, want <= %d", metrics.PeakConcurrency, maxParallel)
+	}
+	if metrics.PeakConcurrency == 0 {
+		t.Errorf("T7.6: PeakConcurrency = 0, want > 0 (stub not implemented)")
+	}
+
+	// Assert: no dropped results
+	if metrics.DroppedCount != 0 {
+		t.Errorf("T7.6: DroppedCount = %d, want 0", metrics.DroppedCount)
+	}
+
+	// Assert: TotalActions matches input
+	if metrics.TotalActions != 20 {
+		t.Errorf("T7.6: TotalActions = %d, want 20", metrics.TotalActions)
+	}
+
+	// Assert: every input target appears exactly once in output
+	targetSet := make(map[string]int)
+	for _, r := range results {
+		targetSet[r.Action.Target.PrefixSetName]++
+	}
+	for i := 0; i < 20; i++ {
+		ps := fmt.Sprintf("ps-%d", i)
+		if targetSet[ps] != 1 {
+			t.Errorf("T7.6: target %q appeared %d times, want exactly 1", ps, targetSet[ps])
+		}
+	}
+}
+
+// TestPhase7_T76_Executor_PartialFailure_NoDroppedResults verifies that
+// when a subset of actions fail, all results are preserved.
+func TestPhase7_T76_Executor_PartialFailure_NoDroppedResults(t *testing.T) {
+	log := zaptest.NewLogger(t)
+
+	// Use a client that fails for specific prefix set names.
+	failClient := &selectiveFailClient{
+		failNames: map[string]bool{"ps-1": true, "ps-3": true, "ps-4": true},
+		store:     make(map[string][]string),
+	}
+	factory := newStubFactory()
+	factory.Register("sub1", failClient)
+
+	executor := NewExecutor(log, factory, 5)
+
+	actions := make([]engine.Action, 5)
+	for i := 0; i < 5; i++ {
+		actions[i] = engine.Action{
+			Kind: engine.CreatePrefixSet,
+			Target: engine.ASGTarget{
+				SubscriptionID: "sub1",
+				ResourceGroup:  "rg1",
+				ASGName:        "asg1",
+				PrefixSetName:  fmt.Sprintf("ps-%d", i),
+			},
+			DesiredIPs: []string{fmt.Sprintf("10.0.0.%d/32", i)},
+		}
+	}
+
+	results, metrics := executor.ExecuteWithMetrics(context.Background(), actions)
+
+	// Assert: all results returned
+	if len(results) != 5 {
+		t.Fatalf("T7.6: expected 5 results, got %d", len(results))
+	}
+
+	// Assert: success + failure == input count
+	if metrics.SuccessCount+metrics.FailureCount != 5 {
+		t.Errorf("T7.6: SuccessCount(%d) + FailureCount(%d) = %d, want 5",
+			metrics.SuccessCount, metrics.FailureCount, metrics.SuccessCount+metrics.FailureCount)
+	}
+
+	// Assert: 2 successes, 3 failures
+	if metrics.SuccessCount != 2 {
+		t.Errorf("T7.6: SuccessCount = %d, want 2", metrics.SuccessCount)
+	}
+	if metrics.FailureCount != 3 {
+		t.Errorf("T7.6: FailureCount = %d, want 3", metrics.FailureCount)
+	}
+
+	// Assert: failed subset preserved with error
+	for _, r := range results {
+		name := r.Action.Target.PrefixSetName
+		if failClient.failNames[name] {
+			if r.Success {
+				t.Errorf("T7.6: expected failure for %q, got success", name)
+			}
+			if r.Err == nil {
+				t.Errorf("T7.6: expected error for %q, got nil", name)
+			}
+		}
+	}
+}
+
+// TestPhase7_T76_Executor_ContextCancel_WhileWaitingSemaphore verifies that
+// cancellation while blocked on the semaphore produces a context.Canceled result.
+func TestPhase7_T76_Executor_ContextCancel_WhileWaitingSemaphore(t *testing.T) {
+	log := zaptest.NewLogger(t)
+
+	blockCh := make(chan struct{})
+	blocking := &blockingClient{blockCh: blockCh}
+	factory := newStubFactory()
+	factory.Register("sub1", blocking)
+
+	executor := NewExecutor(log, factory, 1)
+
+	ctx, cancel := context.WithCancel(context.Background())
+
+	actions := []engine.Action{
+		{
+			Kind: engine.CreatePrefixSet,
+			Target: engine.ASGTarget{
+				SubscriptionID: "sub1",
+				ResourceGroup:  "rg1",
+				ASGName:        "asg1",
+				PrefixSetName:  "ps-blocking",
+			},
+			DesiredIPs: []string{"10.0.0.1/32"},
+		},
+		{
+			Kind: engine.CreatePrefixSet,
+			Target: engine.ASGTarget{
+				SubscriptionID: "sub1",
+				ResourceGroup:  "rg1",
+				ASGName:        "asg1",
+				PrefixSetName:  "ps-waiting",
+			},
+			DesiredIPs: []string{"10.0.0.2/32"},
+		},
+	}
+
+	done := make(chan struct{})
+	var results []ActionResult
+	var metrics ExecutorMetrics
+	go func() {
+		results, metrics = executor.ExecuteWithMetrics(ctx, actions)
+		close(done)
+	}()
+
+	// Give time for first action to acquire semaphore, then cancel
+	time.Sleep(50 * time.Millisecond)
+	cancel()
+	close(blockCh)
+	<-done
+
+	// Assert: full result slice returned (no goroutine leak behavior)
+	if len(results) != 2 {
+		t.Fatalf("T7.6: expected 2 results, got %d", len(results))
+	}
+
+	// Assert: waiting action has context.Canceled
+	waitingResult := results[1]
+	if waitingResult.Err == nil {
+		t.Error("T7.6: expected error for cancelled action, got nil")
+	}
+	if waitingResult.Err != nil && !errors.Is(waitingResult.Err, context.Canceled) {
+		t.Errorf("T7.6: expected context.Canceled, got: %v", waitingResult.Err)
+	}
+
+	// Assert: metrics reflect the cancellation
+	if metrics.TotalActions != 2 {
+		t.Errorf("T7.6: TotalActions = %d, want 2", metrics.TotalActions)
+	}
+}
+
+// selectiveFailClient fails Put for specific prefix set names.
+type selectiveFailClient struct {
+	failNames map[string]bool
+	mu        sync.Mutex
+	store     map[string][]string
+}
+
+func (s *selectiveFailClient) Get(_ context.Context, sub, rg, asg, ps string) (*AddressPrefixSet, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	k := stubKey(sub, rg, asg, ps)
+	ips, ok := s.store[k]
+	if !ok {
+		return nil, ErrNotFound
+	}
+	name := ps
+	etag := `"etag-` + k + `"`
+	return &AddressPrefixSet{Name: &name, Etag: &etag, Properties: &AddressPrefixSetProperties{AddressPrefixes: ips}}, nil
+}
+
+func (s *selectiveFailClient) Put(_ context.Context, sub, rg, asg, ps string, ips []string) error {
+	if s.failNames[ps] {
+		return &ARMStatusError{StatusCode: 500, ARMCode: "InternalServerError", Message: "injected failure"}
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.store[stubKey(sub, rg, asg, ps)] = ips
+	return nil
+}
+
+func (s *selectiveFailClient) Delete(_ context.Context, _, _, _, _ string) error { return nil }
+func (s *selectiveFailClient) List(_ context.Context, _, _, _ string) ([]AddressPrefixSet, error) {
+	return nil, nil
+}

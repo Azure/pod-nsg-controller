@@ -20,11 +20,6 @@ import (
 const (
 	apiVersion2026 = "2026-01-01"
 	armEndpoint    = "https://management.azure.com"
-
-	// defaultMaxRetries is the number of retries for transient HTTP failures.
-	defaultMaxRetries = 3
-	// defaultRetryBackoff is the fixed delay between retries.
-	defaultRetryBackoff = 200 * time.Millisecond
 )
 
 // AddressPrefixSet represents an address prefix set child resource of an ASG.
@@ -51,10 +46,12 @@ type AddressPrefixSetListResult struct {
 // AddressPrefixSetClient manages AddressPrefixSet operations using direct REST calls
 // against the 2026-01-01 API version. It implements AddressPrefixSetAPI.
 type AddressPrefixSetClient struct {
-	log        *zap.Logger
-	credential azcore.TokenCredential // nil allowed for tests
-	httpClient *http.Client
-	baseURL    string
+	log         *zap.Logger
+	credential  azcore.TokenCredential // nil allowed for tests
+	httpClient  *http.Client
+	baseURL     string
+	retryPolicy RetryPolicy
+	rateLimiter SubscriptionRateLimiter
 }
 
 // AddressPrefixSetClientOption configures an AddressPrefixSetClient.
@@ -77,16 +74,17 @@ func NewAddressPrefixSetClient(
 	opts ...AddressPrefixSetClientOption,
 ) *AddressPrefixSetClient {
 	c := &AddressPrefixSetClient{
-		log:        log,
-		credential: credential,
-		httpClient: httpClient,
-		baseURL:    armEndpoint,
+		log:         log,
+		credential:  credential,
+		httpClient:  httpClient,
+		baseURL:     armEndpoint,
+		retryPolicy: DefaultRetryPolicy(),
 	}
 	for _, opt := range opts {
 		opt(c)
 	}
 	if c.httpClient == nil {
-		c.httpClient = http.DefaultClient
+		c.httpClient = newStubHTTPClient()
 	}
 	return c
 }
@@ -114,15 +112,18 @@ func (c *AddressPrefixSetClient) acquireToken(ctx context.Context) (string, erro
 	return token.Token, nil
 }
 
-func (c *AddressPrefixSetClient) doRequest(ctx context.Context, method, url string, body []byte, extraHeaders map[string]string) (*http.Response, error) {
-	var lastResp *http.Response
-	var lastErr error
-	for attempt := 0; attempt <= defaultMaxRetries; attempt++ {
-		if attempt > 0 {
-			select {
-			case <-ctx.Done():
-				return nil, ctx.Err()
-			case <-time.After(defaultRetryBackoff):
+func (c *AddressPrefixSetClient) doRequest(ctx context.Context, retryCtx RetryContext, method, requestURL string, body []byte, extraHeaders map[string]string) (*http.Response, error) {
+	policy := c.retryPolicy
+
+	for attempt := 1; ; attempt++ {
+		if ctx.Err() != nil {
+			return nil, ctx.Err()
+		}
+
+		// Rate limit before each attempt.
+		if c.rateLimiter != nil && retryCtx.SubscriptionID != "" {
+			if err := c.rateLimiter.Wait(ctx, retryCtx.SubscriptionID); err != nil {
+				return nil, err
 			}
 		}
 
@@ -131,7 +132,7 @@ func (c *AddressPrefixSetClient) doRequest(ctx context.Context, method, url stri
 			bodyReader = bytes.NewReader(body)
 		}
 
-		req, err := http.NewRequestWithContext(ctx, method, url, bodyReader)
+		req, err := http.NewRequestWithContext(ctx, method, requestURL, bodyReader)
 		if err != nil {
 			return nil, errors.Wrap(err, "creating request")
 		}
@@ -149,50 +150,62 @@ func (c *AddressPrefixSetClient) doRequest(ctx context.Context, method, url stri
 			req.Header.Set(k, v)
 		}
 
-		resp, err := c.httpClient.Do(req)
-		if err != nil {
-			lastErr = errors.Wrap(err, "executing request")
-			lastResp = nil
+		resp, httpErr := c.httpClient.Do(req)
+		if httpErr != nil {
+			decision := DecideRetry(httpErr, attempt, policy)
+			if !decision.Retry {
+				return nil, errors.Wrap(httpErr, "executing request")
+			}
 			c.log.Warn("transient request error, retrying",
 				zap.String("method", method),
-				zap.Int("attempt", attempt+1),
-				zap.Error(err),
+				zap.String("operation", string(retryCtx.Operation)),
+				zap.Int("attempt", attempt),
+				zap.Int("maxRetries", policy.MaxRetries),
+				zap.String("retryReason", decision.RetryReason),
+				zap.Duration("retryDelay", decision.Delay),
+				zap.Error(httpErr),
 			)
-			continue
-		}
-
-		if isRetryableStatus(resp.StatusCode) {
-			c.log.Warn("retryable status, retrying",
-				zap.String("method", method),
-				zap.Int("statusCode", resp.StatusCode),
-				zap.Int("attempt", attempt+1),
-			)
-			// Keep last response for final return; close previous if any
-			if lastResp != nil {
-				io.Copy(io.Discard, lastResp.Body)
-				lastResp.Body.Close()
+			select {
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			case <-time.After(decision.Delay):
 			}
-			lastResp = resp
-			lastErr = nil
 			continue
 		}
 
-		return resp, nil
-	}
-	// Retries exhausted: return last response so caller can parse the ARM error
-	if lastResp != nil {
-		return lastResp, nil
-	}
-	return nil, errors.Wrap(lastErr, "all retries exhausted")
-}
+		// 2xx success.
+		if resp.StatusCode >= 200 && resp.StatusCode < 300 {
+			return resp, nil
+		}
 
-// isRetryableStatus returns true for HTTP status codes that indicate a transient failure.
-func isRetryableStatus(statusCode int) bool {
-	return statusCode == http.StatusTooManyRequests ||
-		statusCode == http.StatusInternalServerError ||
-		statusCode == http.StatusBadGateway ||
-		statusCode == http.StatusServiceUnavailable ||
-		statusCode == http.StatusGatewayTimeout
+		// Non-2xx: parse ARM error with context.
+		respBody, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+
+		armErr := ParseARMErrorWithContext(resp.StatusCode, respBody, resp.Header, retryCtx)
+
+		decision := DecideRetry(armErr, attempt, policy)
+		if !decision.Retry {
+			return nil, armErr
+		}
+
+		c.log.Warn("retryable ARM error, retrying",
+			zap.String("method", method),
+			zap.String("operation", string(retryCtx.Operation)),
+			zap.Int("statusCode", resp.StatusCode),
+			zap.String("armCode", armErr.ARMCode),
+			zap.Int("attempt", attempt),
+			zap.Int("maxRetries", policy.MaxRetries),
+			zap.String("retryReason", decision.RetryReason),
+			zap.Duration("retryDelay", decision.Delay),
+		)
+
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-time.After(decision.Delay):
+		}
+	}
 }
 
 // armErrorBody is the shape of an ARM error response.
@@ -221,7 +234,7 @@ func parseARMError(statusCode int, body []byte) *ARMStatusError {
 
 // Get returns the specified address prefix set.
 func (c *AddressPrefixSetClient) Get(ctx context.Context, subscriptionID, resourceGroup, asgName, prefixSetName string) (*AddressPrefixSet, error) {
-	url := c.resourceURL(subscriptionID, resourceGroup, asgName, prefixSetName)
+	reqURL := c.resourceURL(subscriptionID, resourceGroup, asgName, prefixSetName)
 
 	c.log.Debug("GET AddressPrefixSet",
 		zap.String("subscriptionID", subscriptionID),
@@ -230,7 +243,17 @@ func (c *AddressPrefixSetClient) Get(ctx context.Context, subscriptionID, resour
 		zap.String("prefixSetName", prefixSetName),
 	)
 
-	resp, err := c.doRequest(ctx, http.MethodGet, url, nil, nil)
+	retryCtx := RetryContext{
+		Operation:      ARMOperationGetPrefixSet,
+		Method:         http.MethodGet,
+		URL:            reqURL,
+		SubscriptionID: subscriptionID,
+		ResourceGroup:  resourceGroup,
+		ASGName:        asgName,
+		PrefixSetName:  prefixSetName,
+	}
+
+	resp, err := c.doRequest(ctx, retryCtx, http.MethodGet, reqURL, nil, nil)
 	if err != nil {
 		return nil, errors.Wrap(err, "GET AddressPrefixSet")
 	}
@@ -239,11 +262,6 @@ func (c *AddressPrefixSetClient) Get(ctx context.Context, subscriptionID, resour
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
 		return nil, errors.Wrap(err, "reading response body")
-	}
-
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		armErr := parseARMError(resp.StatusCode, body)
-		return nil, errors.Wrap(armErr, "GET AddressPrefixSet")
 	}
 
 	var result AddressPrefixSet
@@ -266,7 +284,7 @@ func (c *AddressPrefixSetClient) Get(ctx context.Context, subscriptionID, resour
 
 // Put creates or updates an address prefix set using ETag-based conditional writes.
 func (c *AddressPrefixSetClient) Put(ctx context.Context, subscriptionID, resourceGroup, asgName, prefixSetName string, ips []string) error {
-	url := c.resourceURL(subscriptionID, resourceGroup, asgName, prefixSetName)
+	reqURL := c.resourceURL(subscriptionID, resourceGroup, asgName, prefixSetName)
 
 	c.log.Debug("PUT AddressPrefixSet",
 		zap.String("subscriptionID", subscriptionID),
@@ -302,26 +320,29 @@ func (c *AddressPrefixSetClient) Put(ctx context.Context, subscriptionID, resour
 		return errors.Wrap(err, "marshaling PUT body")
 	}
 
-	resp, err := c.doRequest(ctx, http.MethodPut, url, bodyBytes, headers)
+	retryCtx := RetryContext{
+		Operation:      ARMOperationPutPrefixSet,
+		Method:         http.MethodPut,
+		URL:            reqURL,
+		SubscriptionID: subscriptionID,
+		ResourceGroup:  resourceGroup,
+		ASGName:        asgName,
+		PrefixSetName:  prefixSetName,
+	}
+
+	resp, err := c.doRequest(ctx, retryCtx, http.MethodPut, reqURL, bodyBytes, headers)
 	if err != nil {
 		return errors.Wrap(err, "PUT AddressPrefixSet")
 	}
 	defer resp.Body.Close()
 
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return errors.Wrap(err, "reading PUT response body")
-	}
-
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		armErr := parseARMError(resp.StatusCode, body)
-		return errors.Wrap(armErr, "PUT AddressPrefixSet")
-	}
+	// Drain response body
+	io.ReadAll(resp.Body)
 
 	// Handle LRO for 201/202
 	if resp.StatusCode == http.StatusCreated || resp.StatusCode == http.StatusAccepted {
 		if loc := resp.Header.Get("Location"); loc != "" {
-			if err := c.pollLRO(ctx, loc); err != nil {
+			if err := c.pollLRO(ctx, loc, subscriptionID); err != nil {
 				return errors.Wrap(err, "polling PUT LRO")
 			}
 		}
@@ -332,7 +353,7 @@ func (c *AddressPrefixSetClient) Put(ctx context.Context, subscriptionID, resour
 
 // Delete removes an address prefix set. 404 is treated as success (idempotent).
 func (c *AddressPrefixSetClient) Delete(ctx context.Context, subscriptionID, resourceGroup, asgName, prefixSetName string) error {
-	url := c.resourceURL(subscriptionID, resourceGroup, asgName, prefixSetName)
+	reqURL := c.resourceURL(subscriptionID, resourceGroup, asgName, prefixSetName)
 
 	c.log.Debug("DELETE AddressPrefixSet",
 		zap.String("subscriptionID", subscriptionID),
@@ -341,31 +362,33 @@ func (c *AddressPrefixSetClient) Delete(ctx context.Context, subscriptionID, res
 		zap.String("prefixSetName", prefixSetName),
 	)
 
-	resp, err := c.doRequest(ctx, http.MethodDelete, url, nil, nil)
+	retryCtx := RetryContext{
+		Operation:      ARMOperationDeletePrefixSet,
+		Method:         http.MethodDelete,
+		URL:            reqURL,
+		SubscriptionID: subscriptionID,
+		ResourceGroup:  resourceGroup,
+		ASGName:        asgName,
+		PrefixSetName:  prefixSetName,
+	}
+
+	resp, err := c.doRequest(ctx, retryCtx, http.MethodDelete, reqURL, nil, nil)
 	if err != nil {
+		// 404 is success for delete (idempotent)
+		if IsNotFound(err) {
+			return nil
+		}
 		return errors.Wrap(err, "DELETE AddressPrefixSet")
 	}
 	defer resp.Body.Close()
 
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return errors.Wrap(err, "reading DELETE response body")
-	}
-
-	// 404 is success for delete (idempotent)
-	if resp.StatusCode == http.StatusNotFound {
-		return nil
-	}
-
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		armErr := parseARMError(resp.StatusCode, body)
-		return errors.Wrap(armErr, "DELETE AddressPrefixSet")
-	}
+	// Drain response body
+	io.ReadAll(resp.Body)
 
 	// Handle LRO for 202
 	if resp.StatusCode == http.StatusAccepted {
 		if loc := resp.Header.Get("Location"); loc != "" {
-			if err := c.pollLRO(ctx, loc); err != nil {
+			if err := c.pollLRO(ctx, loc, subscriptionID); err != nil {
 				return errors.Wrap(err, "polling DELETE LRO")
 			}
 		}
@@ -384,9 +407,19 @@ func (c *AddressPrefixSetClient) List(ctx context.Context, subscriptionID, resou
 		zap.String("asgName", asgName),
 	)
 
+	retryCtx := RetryContext{
+		Operation:      ARMOperationListPrefixSets,
+		Method:         http.MethodGet,
+		URL:            nextURL,
+		SubscriptionID: subscriptionID,
+		ResourceGroup:  resourceGroup,
+		ASGName:        asgName,
+	}
+
 	var all []AddressPrefixSet
 	for nextURL != "" {
-		resp, err := c.doRequest(ctx, http.MethodGet, nextURL, nil, nil)
+		retryCtx.URL = nextURL
+		resp, err := c.doRequest(ctx, retryCtx, http.MethodGet, nextURL, nil, nil)
 		if err != nil {
 			return nil, errors.Wrap(err, "LIST AddressPrefixSets")
 		}
@@ -395,11 +428,6 @@ func (c *AddressPrefixSetClient) List(ctx context.Context, subscriptionID, resou
 		resp.Body.Close()
 		if err != nil {
 			return nil, errors.Wrap(err, "reading LIST response body")
-		}
-
-		if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-			armErr := parseARMError(resp.StatusCode, body)
-			return nil, errors.Wrap(armErr, "LIST AddressPrefixSets")
 		}
 
 		var result AddressPrefixSetListResult
@@ -420,10 +448,17 @@ func (c *AddressPrefixSetClient) List(ctx context.Context, subscriptionID, resou
 }
 
 // pollLRO polls a Location-based LRO endpoint until it returns a terminal status.
-func (c *AddressPrefixSetClient) pollLRO(ctx context.Context, location string) error {
+func (c *AddressPrefixSetClient) pollLRO(ctx context.Context, location, subscriptionID string) error {
 	// Resolve relative Location URLs against baseURL
 	if !strings.HasPrefix(location, "http") {
 		location = c.baseURL + location
+	}
+
+	retryCtx := RetryContext{
+		Operation:      ARMOperationPollLRO,
+		Method:         http.MethodGet,
+		URL:            location,
+		SubscriptionID: subscriptionID,
 	}
 
 	for {
@@ -433,7 +468,7 @@ func (c *AddressPrefixSetClient) pollLRO(ctx context.Context, location string) e
 		case <-time.After(500 * time.Millisecond):
 		}
 
-		resp, err := c.doRequest(ctx, http.MethodGet, location, nil, nil)
+		resp, err := c.doRequest(ctx, retryCtx, http.MethodGet, location, nil, nil)
 		if err != nil {
 			return errors.Wrap(err, "polling LRO")
 		}

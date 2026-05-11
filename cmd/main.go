@@ -72,8 +72,17 @@ func main() {
 		os.Exit(1)
 	}
 
-	prefixSetFactory := azure.NewClientFactory(zapLog.With(zap.String("component", "azure-client-factory")))
-	executor := azure.NewExecutor(zapLog.With(zap.String("component", "azure-executor")), prefixSetFactory, 5)
+	prefixSetFactory := azure.NewClientFactory(
+		zapLog.With(zap.String("component", "azure-client-factory")),
+		azure.WithFactoryRetryPolicy(azure.DefaultRetryPolicy()),
+		azure.WithFactorySubscriptionRateLimiter(
+			azure.NewARMRateLimiter(
+				zapLog.With(zap.String("component", "azure-rate-limiter")),
+				cfg.ARMRateLimitRPS,
+			),
+		),
+	)
+	executor := azure.NewExecutor(zapLog.With(zap.String("component", "azure-executor")), prefixSetFactory, cfg.MaxConcurrentActions)
 	statusUpdater := controller.NewMappingStatusUpdater(mgr.GetClient(), ctrl.Log.WithName("status-updater"))
 
 	reconciler := &controller.MappingReconciler{

@@ -1406,3 +1406,98 @@ func TestPopPreviousLastSync(t *testing.T) {
 		t.Error("popPreviousLastSync returned true for non-existent key, want false")
 	}
 }
+
+// ---------------------------------------------------------------------------
+// Phase 7 Acceptance: T7.5 Status Contract Validation
+// ---------------------------------------------------------------------------
+
+func TestPhase7_T75_StatusContract_ConditionsAndMappingRows(t *testing.T) {
+	now := metav1.Now()
+
+	spec := v1alpha1.PodASGMappingSpec{
+		Mappings: []v1alpha1.Mapping{
+			{
+				PodSelector: v1alpha1.PodSelector{
+					MatchLabels: map[string]string{"app": "test"},
+				},
+				ApplicationSecurityGroups: []v1alpha1.ASGReference{
+					{ResourceID: "/subscriptions/sub1/resourceGroups/rg1/providers/Microsoft.Network/applicationSecurityGroups/asg-ok"},
+					{ResourceID: "/subscriptions/sub1/resourceGroups/rg1/providers/Microsoft.Network/applicationSecurityGroups/asg-fail"},
+					{ResourceID: "/subscriptions/sub1/resourceGroups/rg1/providers/Microsoft.Network/applicationSecurityGroups/asg-perm"},
+				},
+			},
+		},
+	}
+
+	results := []azure.ActionResult{
+		{
+			Action: engine.Action{
+				Kind: engine.UpdatePrefixSet,
+				Target: engine.ASGTarget{
+					SubscriptionID: "sub1", ResourceGroup: "rg1", ASGName: "asg-ok",
+					FullResourceID: "/subscriptions/sub1/resourceGroups/rg1/providers/Microsoft.Network/applicationSecurityGroups/asg-ok",
+					PrefixSetName:  "test-prefix",
+				},
+				DesiredIPs: []string{"10.0.0.1"},
+			},
+			Err: nil,
+		},
+		{
+			Action: engine.Action{
+				Kind: engine.UpdatePrefixSet,
+				Target: engine.ASGTarget{
+					SubscriptionID: "sub1", ResourceGroup: "rg1", ASGName: "asg-fail",
+					FullResourceID: "/subscriptions/sub1/resourceGroups/rg1/providers/Microsoft.Network/applicationSecurityGroups/asg-fail",
+					PrefixSetName:  "test-prefix",
+				},
+				DesiredIPs: []string{"10.0.0.2"},
+			},
+			Err: &azure.ARMStatusError{StatusCode: 500, ARMCode: "InternalServerError", Message: "transient"},
+		},
+		{
+			Action: engine.Action{
+				Kind: engine.UpdatePrefixSet,
+				Target: engine.ASGTarget{
+					SubscriptionID: "sub1", ResourceGroup: "rg1", ASGName: "asg-perm",
+					FullResourceID: "/subscriptions/sub1/resourceGroups/rg1/providers/Microsoft.Network/applicationSecurityGroups/asg-perm",
+					PrefixSetName:  "test-prefix",
+				},
+				DesiredIPs: []string{"10.0.0.3"},
+			},
+			Err: &azure.ARMStatusError{StatusCode: 403, ARMCode: "AuthorizationFailed", Message: "forbidden"},
+		},
+	}
+
+	// Validate Phase 7 status contract against the partial failure results.
+	// The stub returns nil (no violations), but the contract should find violations
+	// if status doesn't match expectations.
+	violations := ValidatePhase7StatusContract(
+		v1alpha1.PodASGMappingStatus{
+			Conditions: []metav1.Condition{
+				{
+					Type:               "Accepted",
+					Status:             metav1.ConditionTrue,
+					LastTransitionTime: now,
+				},
+			},
+		},
+		results,
+		spec,
+		"test-prefix",
+	)
+
+	// T7.5 acceptance: status contract violations should be detected.
+	// The stub returns nil, so this test should fail because we expect violations
+	// for missing Reconciled=False condition and missing per-ASG sync states.
+	if len(violations) == 0 {
+		t.Errorf("T7.5: ValidatePhase7StatusContract returned 0 violations; want > 0 for incomplete status")
+	}
+
+	// Specific contract expectations from spec:
+	// - Reconciled condition should be False with Reason=ReconcileFailed
+	// - Per-row asgSyncState: Synced for asg-ok, Error for asg-fail and asg-perm
+	// - Error field non-empty for failed rows
+	// - lastSyncTime updated only for Synced rows
+
+	_ = fmt.Sprintf("violations: %v", violations)
+}

@@ -14,6 +14,21 @@ import (
 // ClientFactoryOption configures a ClientFactory.
 type ClientFactoryOption func(*ClientFactory)
 
+// WithFactoryRetryPolicy sets the retry policy for clients created by the factory.
+func WithFactoryRetryPolicy(p RetryPolicy) ClientFactoryOption {
+	return func(f *ClientFactory) {
+		f.retryPolicy = p
+		f.retryPolicySet = true
+	}
+}
+
+// WithFactorySubscriptionRateLimiter sets the rate limiter for clients created by the factory.
+func WithFactorySubscriptionRateLimiter(l SubscriptionRateLimiter) ClientFactoryOption {
+	return func(f *ClientFactory) {
+		f.rateLimiter = l
+	}
+}
+
 // WithFactoryARMBaseURL sets the ARM base URL for clients created by the factory.
 func WithFactoryARMBaseURL(baseURL string) ClientFactoryOption {
 	return func(f *ClientFactory) {
@@ -27,6 +42,10 @@ type ClientFactory struct {
 	credential azcore.TokenCredential
 	httpClient *http.Client
 	baseURL    string
+
+	retryPolicy    RetryPolicy
+	retryPolicySet bool
+	rateLimiter    SubscriptionRateLimiter
 
 	credExplicit bool // true if credential was explicitly provided (even if nil)
 	credOnce     sync.Once
@@ -129,6 +148,12 @@ func (f *ClientFactory) ForSubscription(subscriptionID string) (AddressPrefixSet
 	var clientOpts []AddressPrefixSetClientOption
 	if f.baseURL != "" {
 		clientOpts = append(clientOpts, WithARMBaseURL(f.baseURL))
+	}
+	if f.retryPolicySet {
+		clientOpts = append(clientOpts, WithRetryPolicy(f.retryPolicy))
+	}
+	if f.rateLimiter != nil {
+		clientOpts = append(clientOpts, WithSubscriptionRateLimiter(f.rateLimiter))
 	}
 
 	client = NewAddressPrefixSetClient(
