@@ -397,8 +397,16 @@ func TestEnvtest_DeletePath_CleanupFailure_FinalizerRetained(t *testing.T) {
 		t.Fatalf("delete mapping: %v", err)
 	}
 
-	// Wait a bit for the reconciler to process deletion attempts
-	time.Sleep(3 * time.Second)
+	// Wait for the reconciler to process the deletion attempt; the finalizer
+	// should be retained because cleanup fails with the injected 500 error.
+	waitForCondition(t, 10*time.Second, "mapping reconciled for deletion with finalizer retained", func() bool {
+		var m v1alpha1.PodASGMapping
+		if err := te.k8sClient.Get(ctx, types.NamespacedName{Name: "del-mapping", Namespace: ns}, &m); err != nil {
+			return false // mapping gone or unreachable — keep waiting
+		}
+		// DeletionTimestamp set + finalizer still present = reconciler attempted cleanup.
+		return m.DeletionTimestamp != nil && controllerutil.ContainsFinalizer(&m, controller.CleanupFinalizer)
+	})
 
 	// Verify the mapping still exists with finalizer (cleanup failed)
 	var current v1alpha1.PodASGMapping
