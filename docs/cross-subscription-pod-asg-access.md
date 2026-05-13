@@ -238,7 +238,7 @@ ASG_RESOURCE="/subscriptions/9b8218f9-902a-4d20-a65c-e98acec5362f/resourceGroups
 kubectl exec arm-test -- curl -s \
   -H "Authorization: Bearer ${TOKEN}" \
   -H "Content-Type: application/json" \
-  "https://management.azure.com${ASG_RESOURCE}?api-version=2024-05-01"
+  "https://management.azure.com${ASG_RESOURCE}?api-version=2025-07-01"
 ```
 
 **Successful response:**
