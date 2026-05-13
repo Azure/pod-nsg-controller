@@ -16,7 +16,8 @@
 - [Phase 5: Controller Wiring — Watches, Enqueue & Resync](#phase-5-controller-wiring--watches-enqueue--resync)
 - [Phase 6: Status Reporting](#phase-6-status-reporting)
 - [Phase 7: Error Handling, Resilience & Concurrency Control](#phase-7-error-handling-resilience--concurrency-control)
-- [Phase 8: Integration & E2E Testing](#phase-8-integration--e2e-testing)
+- [Phase 8: Observability & Metrics](#phase-8-observability--metrics)
+- [Phase 9: Integration & E2E Testing](#phase-9-integration--e2e-testing)
 - [Appendix A: Ownership Model](#appendix-a-ownership-model)
 - [Appendix B: Test Strategy Summary](#appendix-b-test-strategy-summary)
 - [Appendix C: Configuration Reference](#appendix-c-configuration-reference)
@@ -56,7 +57,8 @@ detailed gap analysis.
 | **Controller wiring** | SPEC Phase 5 | No PodASGMapping watch, no pod→mapping enqueue, no finalizer, no cleanup |
 | **Status reporting** | SPEC Phase 6 | No status subresource, no conditions, no per-mapping sync state |
 | **Error handling** | SPEC Phase 7 | No retry with backoff, no rate limiting, no partial failure handling |
-| **Integration tests** | SPEC Phase 8 | No envtest integration suite, no E2E tests |
+| **Observability & metrics** | SPEC Phase 8 | No Prometheus metrics for pod churn, ARM latency, convergence, or reconciliation |
+| **Integration tests** | SPEC Phase 9 | No envtest integration suite, no E2E tests |
 | **CLUSTER_NAME config** | SPEC Appendix A | Not in current config; required for ownership model |
 | **Makefile code generation** | SPEC Phase 1 | `generate` and `manifests` targets are stubs |
 
@@ -604,7 +606,104 @@ Harden the controller for production: retry logic, rate limiting, partial failur
 
 ---
 
-## Phase 8: Integration & E2E Testing
+## Phase 8: Observability & Metrics
+
+### Goal
+
+Expose Prometheus metrics that give operators full visibility into pod churn, ARM interaction latency, prefix-set convergence times, and reconciliation performance — from initial startup through steady-state operation.
+
+### Step-by-Step Actions
+
+1. **Register metrics subsystem** in `internal/metrics/metrics.go`:
+   - Use `controller-runtime/pkg/metrics` (backed by Prometheus client) to register all custom metrics under the `pod_nsg_controller` namespace
+   - All metrics must follow the [Prometheus naming conventions](https://prometheus.io/docs/practices/naming/) and carry a consistent label set
+2. **Implement pod churn metrics** in `internal/metrics/pod_churn.go`:
+   - Track the rate of pod IP additions, deletions, and updates as observed by the controller during desired-state computation
+   - Expose as a counter vector partitioned by `namespace`, `mapping_name`, and `operation` (`add`, `delete`, `update`)
+3. **Implement ARM call metrics** in `internal/metrics/arm.go`:
+   - Track per-call latency, status code distribution, and retry counts for all ARM operations
+   - Instrument the executor and retry wrapper (Phase 4 / Phase 7 code paths)
+4. **Implement prefix-set convergence metrics** in `internal/metrics/convergence.go`:
+   - Measure the wall-clock time from a pod IP change being detected to the corresponding ARM PUT completing successfully (end-to-end convergence latency)
+   - Track per-ASG target, partitioned by `subscription_id`, `resource_group`, `asg_name`, and `operation` (`add`, `delete`, `update`)
+5. **Implement reconciliation metrics** in `internal/metrics/reconcile.go`:
+   - Track per-reconcile duration, outcome, and queue depth
+   - Add dedicated initial-reconcile timing for cluster startup (time from controller start to first full convergence)
+6. **Wire metrics into existing components**:
+   - Instrument the desired-state engine (Phase 3) for pod churn counters
+   - Instrument the executor (Phase 4) and retry wrapper (Phase 7) for ARM call metrics
+   - Instrument the reconciler (Phase 5) for reconciliation timing
+   - Instrument the status reporter (Phase 6) for convergence tracking
+7. **Expose `/metrics` endpoint** via controller-runtime's default metrics server (already wired in `cmd/main.go`)
+
+### Metrics Catalogue
+
+#### Pod Churn
+
+| Metric Name | Type | Labels | Description |
+|---|---|---|---|
+| `pod_nsg_controller_pod_ip_changes_total` | Counter | `namespace`, `mapping`, `operation` | Total pod IP changes detected by the controller (`add`, `delete`, `update`) |
+| `pod_nsg_controller_pod_churn_rate` | Gauge | `namespace`, `mapping` | Pod IP changes per second over a sliding window (computed by Prometheus recording rule or in-process) |
+
+#### ARM Calls
+
+| Metric Name | Type | Labels | Description |
+|---|---|---|---|
+| `pod_nsg_controller_arm_requests_total` | Counter | `subscription_id`, `operation`, `status_code` | Total ARM API calls by operation and response status |
+| `pod_nsg_controller_arm_request_duration_seconds` | Histogram | `subscription_id`, `operation` | ARM call latency distribution (buckets: 0.1, 0.25, 0.5, 1, 2.5, 5, 10, 30s) |
+| `pod_nsg_controller_arm_retries_total` | Counter | `subscription_id`, `operation`, `retry_reason` | Total retry attempts by reason (`429-retry-after`, `server-error`, `network`, `etag-conflict`) |
+| `pod_nsg_controller_arm_rate_limit_delays_total` | Counter | `subscription_id` | Times a call was delayed by the per-subscription rate limiter |
+| `pod_nsg_controller_arm_rate_limit_delay_seconds` | Histogram | `subscription_id` | Duration of rate-limiter-imposed delays |
+
+#### Prefix-Set Convergence
+
+| Metric Name | Type | Labels | Description |
+|---|---|---|---|
+| `pod_nsg_controller_prefix_set_convergence_seconds` | Histogram | `subscription_id`, `resource_group`, `asg_name`, `operation` | Time from pod IP change detection to ARM PUT success for the corresponding prefix set (`add`, `delete`, `update`) |
+| `pod_nsg_controller_prefix_set_drift_corrections_total` | Counter | `subscription_id`, `resource_group`, `asg_name` | Drift corrections applied (stale IPs removed or missing IPs re-added) |
+| `pod_nsg_controller_prefix_set_actions_total` | Counter | `operation`, `result` | Prefix-set actions executed, partitioned by operation (`create`, `update`, `delete`) and result (`success`, `failure`) |
+
+#### Reconciliation
+
+| Metric Name | Type | Labels | Description |
+|---|---|---|---|
+| `pod_nsg_controller_reconcile_duration_seconds` | Histogram | `namespace`, `mapping`, `result` | Per-reconcile wall-clock duration (buckets: 0.01, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10, 30s) |
+| `pod_nsg_controller_reconcile_total` | Counter | `namespace`, `mapping`, `result` | Total reconciliations by outcome (`success`, `partial_failure`, `error`, `requeue`) |
+| `pod_nsg_controller_reconcile_queue_depth` | Gauge | — | Current depth of the reconcile work queue |
+| `pod_nsg_controller_reconcile_actions_per_cycle` | Histogram | `namespace`, `mapping` | Number of ARM actions emitted per reconcile cycle (buckets: 0, 1, 2, 5, 10, 25, 50, 100) |
+| `pod_nsg_controller_initial_reconcile_duration_seconds` | Gauge | — | Wall-clock time from controller start to completion of the first full reconciliation of all PodASGMapping CRs |
+| `pod_nsg_controller_initial_reconcile_complete` | Gauge | — | Set to `1` once the initial reconciliation pass has finished; `0` while still in progress |
+| `pod_nsg_controller_crd_resolution_duration_seconds` | Histogram | `namespace`, `mapping`, `operation` | Time to resolve a CRD update into desired-state actions (`add`, `delete`, `update`), before ARM execution |
+
+### TDD Acceptance Tests
+
+| Test ID | Test | Assertion |
+|---|---|---|
+| `T8.1` | 3 pods added, reconcile completes | `pod_ip_changes_total{operation="add"}` incremented by 3 |
+| `T8.2` | 2 pods deleted, reconcile completes | `pod_ip_changes_total{operation="delete"}` incremented by 2 |
+| `T8.3` | ARM PUT succeeds on first call | `arm_requests_total{status_code="200"}` incremented; `arm_request_duration_seconds` observation recorded |
+| `T8.4` | ARM returns 429, retried once | `arm_retries_total{retry_reason="429-retry-after"}` incremented by 1 |
+| `T8.5` | ARM returns 500 three times then 200 | `arm_retries_total{retry_reason="server-error"}` incremented by 3 |
+| `T8.6` | Rate limiter delays a burst of calls | `arm_rate_limit_delays_total` incremented; `arm_rate_limit_delay_seconds` histogram records positive values |
+| `T8.7` | Pod IP added, prefix set PUT completes | `prefix_set_convergence_seconds{operation="add"}` observation recorded between detection and PUT success |
+| `T8.8` | Drift detected: stale IP removed | `prefix_set_drift_corrections_total` incremented by 1 |
+| `T8.9` | Full reconcile cycle completes | `reconcile_duration_seconds` observation recorded; `reconcile_total{result="success"}` incremented |
+| `T8.10` | Partial failure: 2 of 5 actions fail | `reconcile_total{result="partial_failure"}` incremented; `prefix_set_actions_total{result="failure"}` incremented by 2 |
+| `T8.11` | Controller starts, reconciles all CRs | `initial_reconcile_duration_seconds` set to positive value; `initial_reconcile_complete` set to 1 |
+| `T8.12` | CRD update triggers reconcile | `crd_resolution_duration_seconds{operation="update"}` observation recorded before ARM execution begins |
+| `T8.13` | Pod churn during reconcile | `pod_churn_rate` gauge reflects changes/second consistent with the test's pod creation rate |
+
+### Test Files
+
+- `internal/metrics/metrics_test.go`
+- `internal/metrics/pod_churn_test.go`
+- `internal/metrics/arm_test.go`
+- `internal/metrics/convergence_test.go`
+- `internal/metrics/reconcile_test.go`
+
+---
+
+## Phase 9: Integration & E2E Testing
 
 ### Goal
 
@@ -628,26 +727,26 @@ Validate the complete system with envtest-based integration tests and optional l
 
 | Test ID | Scenario | Assertion |
 |---|---|---|
-| `T8.1` | Create PodASGMapping + deploy 3 pods | All 3 IPs appear in fake ASG prefix set |
-| `T8.2` | Scale pods from 3 to 5 | 2 new IPs added |
-| `T8.3` | Scale pods from 5 to 2 | 3 IPs removed |
-| `T8.4` | Delete PodASGMapping | All owned prefix sets cleaned up |
-| `T8.5` | Pod IP changes (recreate) | Old IP removed, new IP added |
-| `T8.6` | Selector change excludes pods | Excluded pod IPs removed |
-| `T8.7` | Cross-sub mapping: 2 ASGs in different subs | Both fake clients receive correct IPs |
-| `T8.8` | Controller restart mid-reconcile | Next reconcile converges to correct state |
-| `T8.9` | Drift injection: manually add stale IP to fake ASG | Reconcile removes stale IP |
-| `T8.10` | Drift injection: manually remove valid IP | Reconcile re-adds the IP |
-| `T8.11` | Two PodASGMappings in same namespace | Each manages its own prefix sets independently |
-| `T8.12` | PodASGMapping with overlapping selectors | Pod IPs appear in union of all referenced ASGs |
+| `T9.1` | Create PodASGMapping + deploy 3 pods | All 3 IPs appear in fake ASG prefix set |
+| `T9.2` | Scale pods from 3 to 5 | 2 new IPs added |
+| `T9.3` | Scale pods from 5 to 2 | 3 IPs removed |
+| `T9.4` | Delete PodASGMapping | All owned prefix sets cleaned up |
+| `T9.5` | Pod IP changes (recreate) | Old IP removed, new IP added |
+| `T9.6` | Selector change excludes pods | Excluded pod IPs removed |
+| `T9.7` | Cross-sub mapping: 2 ASGs in different subs | Both fake clients receive correct IPs |
+| `T9.8` | Controller restart mid-reconcile | Next reconcile converges to correct state |
+| `T9.9` | Drift injection: manually add stale IP to fake ASG | Reconcile removes stale IP |
+| `T9.10` | Drift injection: manually remove valid IP | Reconcile re-adds the IP |
+| `T9.11` | Two PodASGMappings in same namespace | Each manages its own prefix sets independently |
+| `T9.12` | PodASGMapping with overlapping selectors | Pod IPs appear in union of all referenced ASGs |
 
 ### E2E Test Scenarios (live Azure — CI-gated)
 
 | Test ID | Scenario | Assertion |
 |---|---|---|
-| `T8.E1` | Full lifecycle: create mapping → deploy pods → verify ASG → delete | IPs in real ASG, cleanup on delete |
-| `T8.E2` | Cross-subscription ASG update | Pod IPs propagated to ASG in different subscription |
-| `T8.E3` | Scale to 100 pods | All IPs present within SLO (~10s) |
+| `T9.E1` | Full lifecycle: create mapping → deploy pods → verify ASG → delete | IPs in real ASG, cleanup on delete |
+| `T9.E2` | Cross-subscription ASG update | Pod IPs propagated to ASG in different subscription |
+| `T9.E3` | Scale to 100 pods | All IPs present within SLO (~10s) |
 
 ### Test Files
 
@@ -712,7 +811,8 @@ The cluster name is provided via environment variable `CLUSTER_NAME` (required).
 | 5 | Unit + envtest | `go test`, `envtest`, fake client | Controller watches, enqueue, reconcile flow |
 | 6 | Unit | `go test` | Status computation, condition transitions |
 | 7 | Unit | `go test` + fake client | Retry logic, rate limiting, partial failure |
-| 8 | Integration + E2E | `envtest` + fake, live Azure (gated) | Full system scenarios |
+| 8 | Unit | `go test` + Prometheus testutil | Metrics registration, emission, convergence tracking |
+| 9 | Integration + E2E | `envtest` + fake, live Azure (gated) | Full system scenarios |
 
 ### TDD Workflow (per phase)
 
@@ -766,7 +866,8 @@ Phase 1 (CRD Types)
                        └──► Phase 5 (Controller Wiring)  ◄── Phase 3
                               └──► Phase 6 (Status Reporting)
                                      └──► Phase 7 (Error Handling)
-                                            └──► Phase 8 (Integration & E2E)
+                                            └──► Phase 8 (Observability & Metrics)  ◄── Phases 3–7
+                                                   └──► Phase 9 (Integration & E2E)
 ```
 
-Each phase builds on the previous. Phases 1–3 are pure logic with no I/O. Phase 4 introduces Azure interaction (behind interfaces). Phase 5 wires everything together. Phases 6–7 add production hardening. Phase 8 validates the complete system.
+Each phase builds on the previous. Phases 1–3 are pure logic with no I/O. Phase 4 introduces Azure interaction (behind interfaces). Phase 5 wires everything together. Phases 6–7 add production hardening. Phase 8 adds observability by instrumenting Phases 3–7. Phase 9 validates the complete system.
