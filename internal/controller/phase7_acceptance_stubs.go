@@ -60,7 +60,7 @@ func BuildPartialFailureReport(
 	report.StatusSnapshot = ComputeStatus(ComputeStatusInput{
 		Spec:               spec,
 		PrefixSetName:      prefixSetName,
-		Results:            results,
+		Results:            normalized,
 		ReconcileErr:       reconcileErr,
 		ObservedGeneration: 1,
 		Phase:              StatusPhaseFinal,
