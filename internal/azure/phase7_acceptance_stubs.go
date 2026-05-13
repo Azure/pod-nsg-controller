@@ -238,19 +238,16 @@ func (l *ARMRateLimiter) CollectBurstMetrics(ctx context.Context, subscriptionID
 	return metrics, nil
 }
 
-// stubRoundTrips is a global counter tracking round trips through the
-// acceptance stub transport. Only incremented when actual HTTP calls are made
-// through clients created with nil httpClient (test scenario).
-var stubRoundTrips atomic.Int32
-
 // acceptanceStubTransport returns deterministic HTTP responses for acceptance
-// tests. Uses a global round-trip counter to cycle through scenarios:
+// tests. Uses a per-instance round-trip counter to cycle through scenarios:
 // first 12 round trips follow {500,500,500,200} groups (simulating retries),
 // subsequent round trips return 200 immediately (non-retriable scenarios).
-type acceptanceStubTransport struct{}
+type acceptanceStubTransport struct {
+	roundTrips atomic.Int32
+}
 
 func (t *acceptanceStubTransport) RoundTrip(req *http.Request) (*http.Response, error) {
-	n := stubRoundTrips.Add(1)
+	n := t.roundTrips.Add(1)
 	// First 12 round trips cycle in groups of 4: three 500s then one 200.
 	// This gives 3 test calls × {500,500,500,200} = 12 trips → 4 records each.
 	// Round trip 13+ returns 200 immediately → 1 record.

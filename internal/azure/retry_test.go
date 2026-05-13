@@ -4,6 +4,8 @@ import (
 	"context"
 	"fmt"
 	"net"
+	"net/http"
+	"net/http/httptest"
 	"testing"
 	"time"
 
@@ -585,16 +587,24 @@ func TestPhase7_T74_RetryRecord_403SingleAttempt(t *testing.T) {
 		t.Errorf("T7.4: expected status 403, got %d", record.StatusCode)
 	}
 
-	// Verify stub returns exactly 1 attempt record.
+	// Verify DoRequestWithAttemptLog records exactly 1 attempt for a
+	// non-retriable status. Use a dedicated httptest server that returns 403
+	// so the test is independent of stub transport sequencing.
 	log := zaptest.NewLogger(t)
-	client := NewAddressPrefixSetClient(log, nil, nil)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusForbidden)
+		_, _ = w.Write([]byte(`{"error":{"code":"AuthorizationFailed","message":"forbidden"}}`))
+	}))
+	defer srv.Close()
+
+	client := NewAddressPrefixSetClient(log, nil, srv.Client())
 	_, records, err := client.DoRequestWithAttemptLog(
-		context.Background(), RetryContext{}, "GET", "http://test", nil,
+		context.Background(), RetryContext{}, "GET", srv.URL, nil,
 	)
 	if len(records) != 1 {
 		t.Errorf("T7.4: expected exactly 1 attempt record, got %d", len(records))
 	}
-	if err != nil {
-		t.Errorf("T7.4: expected no error for 403 attempt log, got: %v", err)
+	if err == nil {
+		t.Error("T7.4: expected ARM error for 403, got nil")
 	}
 }
