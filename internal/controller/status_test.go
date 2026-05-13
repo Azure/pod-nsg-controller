@@ -1490,14 +1490,36 @@ func TestPhase7_T75_StatusContract_ConditionsAndMappingRows(t *testing.T) {
 	// T7.5 acceptance: the incomplete status above must trigger violations
 	// for missing Reconciled=False condition and missing per-ASG sync states.
 	if len(violations) == 0 {
-		t.Errorf("T7.5: ValidatePhase7StatusContract returned 0 violations; want > 0 for incomplete status")
+		t.Fatalf("T7.5: ValidatePhase7StatusContract returned 0 violations; want > 0 for incomplete status")
 	}
 
-	// Specific contract expectations from spec:
-	// - Reconciled condition should be False with Reason=ReconcileFailed
-	// - Per-row asgSyncState: Synced for asg-ok, Error for asg-fail and asg-perm
-	// - Error field non-empty for failed rows
-	// - lastSyncTime updated only for Synced rows
+	for _, v := range violations {
+		t.Logf("violation: field=%s got=%s want=%s msg=%s", v.Field, v.Got, v.Want, v.Message)
+	}
 
-	_ = fmt.Sprintf("violations: %v", violations)
+	// Assert the specific violations we expect from an incomplete status:
+	// 1. Missing Reconciled condition (results contain failures).
+	// 2. MappingStatuses count mismatch (0 rows vs 1 spec mapping).
+	hasReconciledViolation := false
+	hasMappingStatusesViolation := false
+	for _, v := range violations {
+		switch v.Field {
+		case "conditions[Reconciled]":
+			hasReconciledViolation = true
+			if v.Got != "<missing>" {
+				t.Errorf("T7.5: Reconciled violation: expected Got=<missing>, got %q", v.Got)
+			}
+		case "mappingStatuses":
+			hasMappingStatusesViolation = true
+			if v.Got != "0 rows" {
+				t.Errorf("T7.5: mappingStatuses violation: expected Got=\"0 rows\", got %q", v.Got)
+			}
+		}
+	}
+	if !hasReconciledViolation {
+		t.Error("T7.5: expected violation for missing Reconciled condition")
+	}
+	if !hasMappingStatusesViolation {
+		t.Error("T7.5: expected violation for mismatched mappingStatuses count")
+	}
 }
