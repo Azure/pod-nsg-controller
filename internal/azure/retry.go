@@ -1,14 +1,29 @@
 package azure
 
 import (
+	"crypto/rand"
+	"encoding/binary"
 	"errors"
 	"math"
-	"math/rand"
+	mathrand "math/rand"
 	"net"
 	"net/http"
 	"strconv"
 	"time"
 )
+
+// jitterRng is a package-local random source for retry jitter, seeded from
+// crypto/rand to ensure non-deterministic backoff across controller
+// restarts and replicas.
+var jitterRng = newCryptoSeededRand()
+
+func newCryptoSeededRand() *mathrand.Rand {
+	var seed int64
+	if err := binary.Read(rand.Reader, binary.LittleEndian, &seed); err != nil {
+		seed = time.Now().UnixNano()
+	}
+	return mathrand.New(mathrand.NewSource(seed))
+}
 
 // ARMOperation identifies the ARM operation being performed.
 type ARMOperation string
@@ -111,7 +126,7 @@ func computeBackoff(retriesUsed int, p RetryPolicy) time.Duration {
 		delay = float64(p.MaxDelay)
 	}
 	if p.JitterFactor > 0 {
-		jitter := delay * p.JitterFactor * (rand.Float64()*2 - 1)
+		jitter := delay * p.JitterFactor * (jitterRng.Float64()*2 - 1)
 		delay += jitter
 	}
 	if delay < 0 {
