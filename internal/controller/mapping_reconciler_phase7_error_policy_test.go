@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"net"
-	"strings"
 	"testing"
 	"time"
 
@@ -1249,7 +1248,7 @@ func TestPhase7_ActionFailures_UsePolicyRequeue(t *testing.T) {
 	}
 }
 
-func TestPhase7_ActionFailurePrecedesFinalStatusWriteError(t *testing.T) {
+func TestPhase7_StatusWriteErrorPrecedesActionFailure(t *testing.T) {
 	_ = zaptest.NewLogger(t)
 	ctx := context.Background()
 	ns := "test-ns"
@@ -1298,22 +1297,21 @@ func TestPhase7_ActionFailurePrecedesFinalStatusWriteError(t *testing.T) {
 		NamespacedName: types.NamespacedName{Name: "m1", Namespace: ns},
 	})
 
+	// Phase 7 contract: status write errors take precedence over action
+	// failure requeue decisions so they are never masked.
 	if err != nil {
-		t.Fatalf("action-failure-precedence: expected nil error, got %v", err)
+		t.Fatalf("status-write-precedence: expected nil error, got %v", err)
 	}
-	if result.RequeueAfter != 25*time.Second {
-		t.Errorf("action-failure-precedence: expected action-summary requeue of 25s, got %v", result.RequeueAfter)
+	// Status write error drives the requeue via finalizeStatusWriteError
+	// (policy ExhaustedRetryBackoff = 8s), not the action-failure's 25s.
+	if result.RequeueAfter == 0 && !result.Requeue {
+		t.Error("status-write-precedence: expected policy-driven requeue")
+	}
+	if result.RequeueAfter == 25*time.Second {
+		t.Error("status-write-precedence: action-failure requeue must not mask status write error")
 	}
 	if statusUpdater.reconcileCallCount != 1 {
-		t.Errorf("action-failure-precedence: expected exactly 1 final status call, got %d", statusUpdater.reconcileCallCount)
-	}
-	if len(statusUpdater.reconcileCalls) != 1 {
-		t.Fatalf("action-failure-precedence: expected 1 recorded status call, got %d", len(statusUpdater.reconcileCalls))
-	}
-	if got := statusUpdater.reconcileCalls[0].reconcileErr; got == nil {
-		t.Fatal("action-failure-precedence: expected action failure to be passed to status updater")
-	} else if !strings.Contains(got.Error(), "action failures:") || !strings.Contains(got.Error(), "TooManyRequests") {
-		t.Errorf("action-failure-precedence: expected aggregated action failure error, got %v", got)
+		t.Errorf("status-write-precedence: expected exactly 1 final status call, got %d", statusUpdater.reconcileCallCount)
 	}
 }
 

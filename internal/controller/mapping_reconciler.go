@@ -263,8 +263,13 @@ func (r *MappingReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 			if errors.Is(statusErr, ErrStatusObjectNotFound) || errors.Is(statusErr, ErrStatusStaleGeneration) {
 				return ctrl.Result{}, nil
 			}
-			logger.Error(statusErr, "failed to update final status")
 		}
+	}
+
+	// Status write errors take precedence over action-failure requeue
+	// decisions so they are never masked (Phase 7 contract).
+	if statusErr != nil {
+		return r.finalizeStatusWriteError(statusErr, logger)
 	}
 
 	// Use policy-driven requeue for action failures.
@@ -277,10 +282,6 @@ func (r *MappingReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 			"requeueAfter", result.RequeueAfter,
 		)
 		return result, nil
-	}
-
-	if statusErr != nil {
-		return r.finalizeStatusWriteError(statusErr, logger)
 	}
 
 	// When no targets exist, schedule a short follow-up while pods/IPs or informer
