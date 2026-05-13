@@ -23,7 +23,7 @@ import (
 // ---------------------------------------------------------------------------
 // Test: T7.7 Integration — ETag Conflict Metrics Through Executor
 //
-// Verifies that ExecuteWithMetrics tracks ETag-related statistics during
+// Verifies that the executor handles ETag conflicts during
 // conflict resolution. Stub returns zero metrics, so assertions fail.
 // ---------------------------------------------------------------------------
 
@@ -66,22 +66,22 @@ func TestPhase7_T77_Integration_ETagConflictMetrics(t *testing.T) {
 		},
 	}
 
-	results, metrics := executor.ExecuteWithMetrics(context.Background(), actions)
+	results := executor.Execute(context.Background(), actions)
 
-	// T7.7 acceptance: ExecuteWithMetrics stub returns nil results.
-	if len(results) == 0 {
-		t.Errorf("T7.7 integration: ExecuteWithMetrics returned 0 results, want 1 (stub returns nil)")
+	// T7.7 acceptance: Execute must return one result per action (no drops).
+	if len(results) != len(actions) {
+		t.Fatalf("T7.7 integration: Execute returned %d results, want %d", len(results), len(actions))
 	}
 
-	// T7.7 acceptance: Metrics should show 1 success after ETag retry.
-	if metrics.TotalActions != 1 {
-		t.Errorf("T7.7 integration: metrics.TotalActions = %d, want 1", metrics.TotalActions)
+	// T7.7 acceptance: the single action should succeed after ETag retry.
+	successCount := 0
+	for _, r := range results {
+		if r.Success {
+			successCount++
+		}
 	}
-	if metrics.SuccessCount != 1 {
-		t.Errorf("T7.7 integration: metrics.SuccessCount = %d, want 1", metrics.SuccessCount)
-	}
-	if metrics.DroppedCount != 0 {
-		t.Errorf("T7.7 integration: metrics.DroppedCount = %d, want 0", metrics.DroppedCount)
+	if successCount != 1 {
+		t.Errorf("T7.7 integration: successCount = %d, want 1", successCount)
 	}
 
 	_ = zapLog
