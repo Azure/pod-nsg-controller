@@ -453,7 +453,7 @@ func TestPhase7_T71_RetryRecord_429UsesRetryAfterDelay(t *testing.T) {
 
 	// Verify DoRequestWithAttemptLog returns structured records.
 	log := zaptest.NewLogger(t)
-	client := NewAddressPrefixSetClient(log, nil, nil)
+	client := NewAddressPrefixSetClient(log, nil, newStubHTTPClient())
 	retryCtx := RetryContext{Operation: ARMOperationGetPrefixSet}
 	_, records, err := client.DoRequestWithAttemptLog(
 		context.Background(), retryCtx, "GET", "http://test", nil,
@@ -504,7 +504,7 @@ func TestPhase7_T72_RetryRecord_500x3ThenSuccess(t *testing.T) {
 
 	// Verify the stub returns actual attempt records.
 	log := zaptest.NewLogger(t)
-	client := NewAddressPrefixSetClient(log, nil, nil)
+	client := NewAddressPrefixSetClient(log, nil, newStubHTTPClient())
 	retryCtx := RetryContext{Operation: ARMOperationGetPrefixSet}
 	_, attemptRecords, err := client.DoRequestWithAttemptLog(
 		context.Background(), retryCtx, "GET", "http://test", nil,
@@ -551,7 +551,7 @@ func TestPhase7_T73_RetryRecord_500x4Exhausted(t *testing.T) {
 
 	// Verify stub returns attempt records.
 	log := zaptest.NewLogger(t)
-	client := NewAddressPrefixSetClient(log, nil, nil)
+	client := NewAddressPrefixSetClient(log, nil, newStubHTTPClient())
 	_, attemptRecords, _ := client.DoRequestWithAttemptLog(
 		context.Background(), RetryContext{}, "GET", "http://test", nil,
 	)

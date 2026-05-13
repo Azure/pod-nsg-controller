@@ -84,7 +84,7 @@ func NewAddressPrefixSetClient(
 		opt(c)
 	}
 	if c.httpClient == nil {
-		c.httpClient = newStubHTTPClient()
+		c.httpClient = http.DefaultClient
 	}
 	return c
 }
