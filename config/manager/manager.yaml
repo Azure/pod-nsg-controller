@@ -66,6 +66,10 @@ spec:
                 secretKeyRef:
                   name: pod-nsg-controller-azure
                   key: nsg-name
+            - name: ARM_RATE_LIMIT_RPS
+              value: "10"
+            - name: MAX_CONCURRENT_ACTIONS
+              value: "5"
           livenessProbe:
             httpGet:
               path: /healthz

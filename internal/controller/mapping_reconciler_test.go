@@ -567,9 +567,9 @@ func TestReconcile_DeletePath_ClientAcquisitionError_RetainsFinalizerAndReturnsE
 		NamespacedName: types.NamespacedName{Name: "my-mapping", Namespace: ns},
 	})
 
-	// Fail-closed: reconcile MUST return an error when cleanup cannot complete
-	if err == nil {
-		t.Error("expected reconcile to return error when client acquisition fails during delete, got nil")
+	// Phase 7 contract: reconcile returns nil error with policy-driven requeue
+	if err != nil {
+		t.Fatalf("expected nil error (Phase 7 policy-driven), got: %v", err)
 	}
 
 	// Finalizer MUST be retained
@@ -651,9 +651,9 @@ func TestReconcile_DeletePath_ListError_RetainsFinalizerAndReturnsError(t *testi
 		NamespacedName: types.NamespacedName{Name: "my-mapping", Namespace: ns},
 	})
 
-	// Fail-closed: reconcile MUST return error when list fails during cleanup
-	if err == nil {
-		t.Error("expected reconcile to return error when List fails during delete cleanup, got nil")
+	// Phase 7 contract: reconcile returns nil error with policy-driven requeue
+	if err != nil {
+		t.Fatalf("expected nil error (Phase 7 policy-driven), got: %v", err)
 	}
 
 	// Finalizer MUST be retained
@@ -741,9 +741,9 @@ func TestReconcile_DeletePath_DeleteError_RetainsFinalizerAndReturnsError(t *tes
 		NamespacedName: types.NamespacedName{Name: "my-mapping", Namespace: ns},
 	})
 
-	// Fail-closed: reconcile MUST return error when delete fails during cleanup
-	if err == nil {
-		t.Error("expected reconcile to return error when Delete fails during cleanup, got nil")
+	// Phase 7 contract: reconcile returns nil error with policy-driven requeue
+	if err != nil {
+		t.Fatalf("expected nil error (Phase 7 policy-driven), got: %v", err)
 	}
 
 	// Finalizer MUST be retained
@@ -840,9 +840,9 @@ func TestReconcile_DeletePath_MultipleCleanupErrors_AggregatesAndRetainsFinalize
 		NamespacedName: types.NamespacedName{Name: "my-mapping", Namespace: ns},
 	})
 
-	// Must return an aggregated error
-	if err == nil {
-		t.Error("expected reconcile to return aggregated error for multiple delete failures, got nil")
+	// Phase 7 contract: reconcile returns nil error with policy-driven requeue
+	if err != nil {
+		t.Fatalf("expected nil error (Phase 7 policy-driven), got: %v", err)
 	}
 
 	// Finalizer MUST be retained
@@ -907,9 +907,9 @@ func TestReconcile_DeletePath_OwnedAnnotationParseError_RetainsFinalizerAndRetur
 		NamespacedName: types.NamespacedName{Name: "my-mapping", Namespace: ns},
 	})
 
-	// Fail-closed: corrupt annotation on delete MUST return error immediately
-	if err == nil {
-		t.Error("expected reconcile to return error when owned annotation is corrupt during delete, got nil")
+	// Phase 7 contract: reconcile returns nil error with policy-driven requeue
+	if err != nil {
+		t.Fatalf("expected nil error (Phase 7 policy-driven), got: %v", err)
 	}
 
 	// Finalizer MUST be retained
@@ -1471,8 +1471,9 @@ func TestReconcile_ExecutorPartialFailure_ReturnsError(t *testing.T) {
 		NamespacedName: types.NamespacedName{Name: "my-mapping", Namespace: ns},
 	})
 
-	if err == nil {
-		t.Error("expected reconcile to return error when executor reports failures, got nil")
+	// Phase 7 contract: reconcile returns nil error with policy-driven requeue
+	if err != nil {
+		t.Fatalf("expected nil error (Phase 7 policy-driven), got: %v", err)
 	}
 }
 
@@ -1581,8 +1582,8 @@ func TestReconcile_NonDeletePath_CorruptOwnedAnnotation_ReturnsError(t *testing.
 		NamespacedName: types.NamespacedName{Name: "my-mapping", Namespace: ns},
 	})
 
-	// Fail closed: corrupt annotation on non-delete path MUST return error, not silently fallback
-	if err == nil {
-		t.Error("expected reconcile to return error when owned annotation is corrupt on non-delete path, got nil (silent fallback is not allowed)")
+	// Phase 7 contract: reconcile returns nil error with policy-driven requeue
+	if err != nil {
+		t.Fatalf("expected nil error (Phase 7 policy-driven), got: %v", err)
 	}
 }

@@ -1,0 +1,386 @@
+# Phase 7 Implementation Design (Revision 9): Error Handling, Resilience & Concurrency Control
+
+## 1) Phase extraction from `docs/SPECIFICATION.md`
+
+### Goal
+Harden reconciliation for production with retry logic, rate limiting, partial-failure convergence, and graceful degradation.
+
+### Step-by-step actions (spec)
+1. Implement retry wrapper in `internal/azure/retry.go` (exponential backoff + jitter, default max retries 3, respect `Retry-After` for 429).
+2. Implement per-subscription rate limiter in `internal/azure/ratelimit.go` (default 10 RPS via `golang.org/x/time/rate`).
+3. Implement reconcile error handling in `internal/controller/errors.go` (retriable vs non-retriable classification + requeue strategy).
+4. Wire retry + rate limiting into ARM execution path.
+5. Handle partial failures so successes persist, failures are reported in status, and reconcile requeues for convergence.
+
+### Deliverables for this phase
+1. ARM call loop uses `RetryPolicy`/`DecideRetry`, including `Retry-After` delays.
+2. Per-subscription throttling applies before each ARM attempt.
+3. Requeue decisions use `DecideRequeueFromActionSummary` / `DecideRequeueFromSystemError`.
+4. System/pre-action failures and action failures are consistently surfaced to `PodASGMapping.status` when status is enabled.
+5. Acceptance tests T7.1-T7.7 are covered with explicit implementation-path assertions.
+
+### Type definitions in-scope
+- `azure.RetryPolicy`, `azure.RetryDecision`, `azure.RetryContext`
+- `azure.SubscriptionRateLimiter`
+- `controller.ActionFailureSummary`, `controller.RequeuePolicy`
+- `azure.ARMStatusError` (`StatusCode`, `ARMCode`, `RetryAfter`, `Operation`, `RequestURL`)
+
+### TDD acceptance tests from spec
+| ID | Scenario | Required assertion |
+|---|---|---|
+| T7.1 | ARM returns 429 | Retry waits according to `Retry-After` |
+| T7.2 | ARM returns 500 three times then succeeds | Success on 4th attempt |
+| T7.3 | ARM returns 500 four times | Retry exhausted and failure reported in status |
+| T7.4 | ARM returns 403 | No retry and failure reported immediately in status |
+| T7.5 | 3 of 5 actions fail | 2 succeed and persist, 3 reported, reconcile requeued |
+| T7.6 | Rate limiter throttles burst of 20 calls | Calls spread over time, none dropped |
+| T7.7 | ETag conflict during retry loop | Re-GET + recompute succeeds |
+
+---
+
+## 2) Codebase research summary (current baseline)
+
+1. Retry/rate-limit primitives already exist (`internal/azure/retry.go`, `internal/azure/ratelimit.go`) and should be reused.
+2. `AddressPrefixSetClient.doRequest` still uses fixed retries (`defaultMaxRetries`, `200ms`) and does not apply `RetryPolicy` or `SubscriptionRateLimiter`.
+3. `parseARMError(statusCode, body)` currently cannot read HTTP headers, so real 429 `Retry-After` from ARM responses is not propagated.
+4. `MappingReconciler` currently:
+   - treats `StatusUpdater` as optional (`if r.StatusUpdater != nil`),
+   - returns aggregated action errors directly (`return ctrl.Result{}, reconcileErr`),
+   - has early system-failure returns that bypass final status update.
+5. `Executor.executeWithETagRetry` already owns 412 recompute behavior and must remain the only 412 retry loop.
+6. Existing tests cover retry primitives/classification well, but T7.4 lacks an explicit reconcile-path assertion that 403 is written to CR status.
+
+---
+
+## 3) Revision focus from review feedback (84 -> approval-ready)
+
+This revision explicitly addresses all three critical findings:
+
+1. **Preserve optional `StatusUpdater` contract**
+   - New system-failure finalization path is defined to work when `r.StatusUpdater == nil`.
+   - Action-failure path also keeps `StatusUpdater` optional and behaviorally unchanged for nil.
+
+2. **Add explicit T7.4 status-reporting acceptance coverage**
+   - Add reconcile-path test asserting a 403 action failure is written to `PodASGMapping.status` (not only classified/requeued).
+
+3. **Define error precedence on action-failure final status write**
+   - If `UpdateAfterReconcile(...)` fails (non-stale/non-notfound), return that status-write error directly.
+   - Do not mask it behind `DecideRequeueFromActionSummary(...), nil`.
+
+---
+
+## 4) Implementation design
+
+## 4.1 Files to create
+None.
+
+## 4.2 Files to modify
+1. `internal/config/config.go`
+2. `internal/config/config_test.go`
+3. `cmd/main.go`
+4. `internal/azure/retry.go`
+5. `internal/azure/ratelimit.go`
+6. `internal/azure/client_factory.go`
+7. `internal/azure/client_factory_test.go`
+8. `internal/azure/address_prefix_set_client.go`
+9. `internal/azure/address_prefix_set_client_test.go`
+10. `internal/controller/mapping_reconciler.go`
+11. `internal/controller/mapping_reconciler_test.go`
+12. `internal/controller/errors_test.go`
+13. `test/integration/phase7/error_resilience_integration_test.go`
+
+## 4.3 Config/runtime wiring
+
+### `internal/config/config.go`
+Extend config:
+```go
+type Config struct {
+    SubscriptionID       string
+    ResourceGroup        string
+    ClusterName          string
+    ResyncInterval       time.Duration
+    ARMRateLimitRPS      float64
+    MaxConcurrentActions int
+}
+```
+
+Environment parsing:
+- `ARM_RATE_LIMIT_RPS`: default `10`, must be `> 0`.
+- `MAX_CONCURRENT_ACTIONS`: default `5`, must be `>= 1`.
+
+### `cmd/main.go`
+Wire runtime dependencies:
+1. `retryPolicy := azure.DefaultRetryPolicy()`
+2. `limiter := azure.NewARMRateLimiter(zapLog.With(zap.String("component", "arm-rate-limiter")), cfg.ARMRateLimitRPS)`
+3. `prefixSetFactory := azure.NewClientFactory(..., azure.WithFactoryRetryPolicy(retryPolicy), azure.WithFactorySubscriptionRateLimiter(limiter))`
+4. `executor := azure.NewExecutor(..., cfg.MaxConcurrentActions)`
+
+## 4.4 Retry and limiter contracts
+
+### `internal/azure/retry.go`
+Add policy normalization helper:
+```go
+func NormalizeRetryPolicy(p RetryPolicy) RetryPolicy
+```
+Rules:
+- Invalid/zero values normalize to defaults.
+- Zero-value option input never disables retries unintentionally.
+
+### `internal/azure/ratelimit.go`
+Add no-op limiter:
+```go
+type noopSubscriptionRateLimiter struct{}
+func (noopSubscriptionRateLimiter) Wait(ctx context.Context, subscriptionID string) error
+func NoopSubscriptionRateLimiter() SubscriptionRateLimiter
+```
+
+### `internal/azure/address_prefix_set_client.go`
+Extend client/options:
+```go
+type AddressPrefixSetClient struct {
+    log         *zap.Logger
+    credential  azcore.TokenCredential
+    httpClient  *http.Client
+    baseURL     string
+    retryPolicy RetryPolicy
+    rateLimiter SubscriptionRateLimiter
+}
+
+func WithRetryPolicy(policy RetryPolicy) AddressPrefixSetClientOption
+func WithSubscriptionRateLimiter(limiter SubscriptionRateLimiter) AddressPrefixSetClientOption
+```
+
+Defaults:
+- `retryPolicy = NormalizeRetryPolicy(DefaultRetryPolicy())`
+- `rateLimiter = NoopSubscriptionRateLimiter()`
+- `WithSubscriptionRateLimiter(nil)` -> no-op limiter fallback
+
+### `internal/azure/client_factory.go`
+Extend factory:
+```go
+type ClientFactory struct {
+    // existing fields
+    retryPolicy RetryPolicy
+    rateLimiter SubscriptionRateLimiter
+}
+
+func WithFactoryRetryPolicy(policy RetryPolicy) ClientFactoryOption
+func WithFactorySubscriptionRateLimiter(limiter SubscriptionRateLimiter) ClientFactoryOption
+```
+
+`ForSubscription` forwards retry + limiter options to `NewAddressPrefixSetClient`.
+
+## 4.5 ARM request loop + `Retry-After` propagation
+
+### `internal/azure/address_prefix_set_client.go`
+Change loop signature:
+```go
+func (c *AddressPrefixSetClient) doRequest(
+    ctx context.Context,
+    retryCtx RetryContext,
+    method, url string,
+    body []byte,
+    extraHeaders map[string]string,
+) (*http.Response, error)
+```
+
+Loop behavior:
+1. Attempt numbers are 1-based for `DecideRetry`.
+2. `c.rateLimiter.Wait(ctx, retryCtx.SubscriptionID)` before each attempt.
+3. Build retry decision from transport/ARM error via `DecideRetry(err, attempt, c.retryPolicy)`.
+4. Wait `decision.Delay` with context-aware cancellation.
+5. Preserve 412 exclusion (no generic 412 retry).
+
+Upgrade ARM error parsing:
+```go
+func parseARMError(resp *http.Response, body []byte, op ARMOperation) *ARMStatusError
+```
+Set:
+- `RetryAfter` from `resp.Header.Get("Retry-After")`
+- `Operation` from call-site context
+- `RequestURL` from `resp.Request.URL`
+
+Update `Get/Put/Delete/List/pollLRO` call-sites to pass `RetryContext` + `ARMOperation`.
+
+## 4.6 Reconciler error handling and contract-preserving finalization
+
+### `internal/controller/mapping_reconciler.go`
+Add helper:
+```go
+func (r *MappingReconciler) finalizeSystemFailure(
+    ctx context.Context,
+    req ctrl.Request,
+    observedGeneration int64,
+    prefixSetName string,
+    matchedPodsByIndex []int,
+    reconcileErr error,
+    policy RequeuePolicy,
+    logger logr.Logger,
+) (ctrl.Result, error)
+```
+
+#### **Required contract behavior (`StatusUpdater` optional)**
+1. If `r.StatusUpdater == nil`:
+   - do **not** attempt status write,
+   - return `DecideRequeueFromSystemError(reconcileErr, policy), nil`.
+2. If `r.StatusUpdater != nil`:
+   - call `UpdateAfterReconcile(..., results=nil, reconcileErr=systemErr, validationIssues=nil, matchedPodsByIndex)`.
+   - on `ErrStatusObjectNotFound`/`ErrStatusStaleGeneration` -> return `ctrl.Result{}, nil`.
+   - on other status error -> return that status error.
+   - on success -> return `DecideRequeueFromSystemError(reconcileErr, policy), nil`.
+
+Apply helper to pre-action/system exits once status context exists:
+- `LoadOwnedASGs` parse failure
+- `listActualForTargets` failure
+- pre-action `StoreOwnedASGs` failure
+- pre-action ownership patch failure
+- post-action `StoreOwnedASGs` failure
+- post-action ownership patch failure
+
+### Action-failure path (T7.5 + precedence rule)
+Post-executor flow:
+1. `reconcileErr := aggregateActionFailures(results)`
+2. Attempt final status write **if** `r.StatusUpdater != nil`
+3. Status error handling precedence:
+   - `ErrStatusObjectNotFound`/`ErrStatusStaleGeneration` -> `return ctrl.Result{}, nil`
+   - other status error -> `return ctrl.Result{}, statusErr` (**must win**)
+4. If action failures exist and status write did not fail:
+   - `summary := ClassifyActionResults(results)`
+   - `return DecideRequeueFromActionSummary(summary, policy), nil`
+5. If no failures:
+   - continue successful reconcile scheduling.
+
+This preserves current optional `StatusUpdater` invariant and implements explicit error precedence.
+
+## 4.7 Executor 404 semantics (unchanged 412 ownership)
+
+### `internal/azure/executor.go`
+Refine `buildSingleTargetActual`:
+- `IsParentASGNotFound(getErr)` -> return error (non-convergent parent missing)
+- `IsChildPrefixSetNotFound(getErr)` or `errors.Is(getErr, ErrNotFound)` -> treat as absent child
+- keep `executeWithETagRetry` ownership of 412 retry logic unchanged
+
+---
+
+## 5) Interface contracts and dependency graph
+
+### Contracts preserved
+- `AddressPrefixSetAPI`
+- `AddressPrefixSetClientFactory`
+- `Executor.Execute(ctx, actions)`
+- `StatusUpdater` remains optional in `MappingReconciler`
+
+### Added option contracts
+- `WithRetryPolicy`, `WithSubscriptionRateLimiter`
+- `WithFactoryRetryPolicy`, `WithFactorySubscriptionRateLimiter`
+
+### Dependency graph
+```text
+config.Load
+  -> ARMRateLimitRPS, MaxConcurrentActions
+
+main
+  -> DefaultRetryPolicy
+  -> NewARMRateLimiter
+  -> NewClientFactory(...retryPolicy, limiter)
+  -> NewExecutor(...maxParallel)
+
+AddressPrefixSetClient.doRequest
+  -> rateLimiter.Wait
+  -> HTTP attempt
+  -> parseARMError(resp, body, op)
+  -> DecideRetry
+  -> context-aware retry wait
+
+MappingReconciler.Reconcile
+  -> finalizeSystemFailure (system/pre-action failures)
+  -> Executor.Execute
+  -> UpdateAfterReconcile (if configured)
+  -> ClassifyActionResults
+  -> requeue policy decision
+```
+
+---
+
+## 6) Logging approach (codebase conventions)
+
+### Azure path (`*zap.Logger`)
+Use structured fields:
+- `operation`, `method`, `url`, `attempt`, `maxRetries`
+- `subscriptionID`, `resourceGroup`, `asgName`, `prefixSetName`
+- `statusCode`, `retryReason`, `retryDelay`, `retryAfter`
+- limiter events: `subscriptionID`, `delay`, `error`
+
+### Controller path (`logr` via zapr)
+Use reconcile fields:
+- `mapping`, `namespace`, `generation`
+- `actionCount`, `failedActionCount`, `retriableCount`, `nonRetriableCount`
+- `systemFailure`, `requeueAfter`
+
+---
+
+## 7) Edge cases and error strategy
+
+1. 429 with valid `Retry-After`: retry loop delay uses header-derived duration.
+2. 429 without/invalid header: fallback to policy backoff.
+3. 401/403 auth failures: no generic retry; action/system classification is non-retriable.
+4. 412: excluded from generic retry; handled only by executor recompute loop.
+5. Context cancellation interrupts limiter waits, retry waits, and HTTP requests.
+6. `StatusUpdater == nil`: reconcile behavior stays functional (no status writes attempted).
+7. Final-status write failure precedence: returned directly, never masked by requeue decisions.
+
+---
+
+## 8) Test design and acceptance mapping
+
+## 8.1 Acceptance matrix
+| Spec ID | Test coverage (explicit) |
+|---|---|
+| T7.1 | `TestAddressPrefixSetClient_DoRequest_429RetryAfterHeader_WaitsBeforeRetry` + `TestAddressPrefixSetClient_Get_429RetryAfterHint_PreservedAfterRetryExhaustion` |
+| T7.2 | `TestAddressPrefixSetClient_DoRequest_500_RetriesThreeTimesThenSucceeds` |
+| T7.3 | `TestAddressPrefixSetClient_DoRequest_500_RetriesExhaustedAfterFourthAttempt` + `TestReconcile_SystemFailure_ListActualError_WritesFinalStatusAndRequeues` |
+| T7.4 | `TestAddressPrefixSetClient_DoRequest_403_NoRetrySingleAttempt` + `TestEnvtest_Reconcile_T74_403ActionFailure_ReportedInStatusImmediately` |
+| T7.5 | `TestReconcile_PartialFailure_PersistsSuccesses_ReportsFailures_RequeuesWithNilError` |
+| T7.6 | Existing `TestPhase7_T76_ThrottlesBurstWithoutDropping_DeterministicClock` |
+| T7.7 | Existing executor 412 recompute tests + parent/child 404 split tests |
+
+## 8.2 Required new/updated tests (by file)
+
+### `internal/azure/address_prefix_set_client_test.go`
+- `TestAddressPrefixSetClient_DoRequest_429RetryAfterHeader_WaitsBeforeRetry`
+- `TestAddressPrefixSetClient_DoRequest_500_RetriesThreeTimesThenSucceeds`
+- `TestAddressPrefixSetClient_DoRequest_500_RetriesExhaustedAfterFourthAttempt`
+- `TestAddressPrefixSetClient_DoRequest_403_NoRetrySingleAttempt`
+- `TestAddressPrefixSetClient_Get_429RetryAfterHint_PreservedAfterRetryExhaustion`
+
+### `internal/controller/mapping_reconciler_test.go`
+- `TestReconcile_SystemFailure_LoadOwnedASGsError_StatusUpdaterNil_StillRequeues`
+- `TestReconcile_SystemFailure_LoadOwnedASGsError_WritesFinalStatusAndRequeues`
+- `TestReconcile_SystemFailure_ListActualError_WritesFinalStatusAndRequeues`
+- `TestReconcile_ActionFailure_StatusWriteError_ReturnsStatusError` (**error precedence**)
+- `TestReconcile_PartialFailure_PersistsSuccesses_ReportsFailures_RequeuesWithNilError`
+
+### `test/integration/phase7/error_resilience_integration_test.go`
+- `TestEnvtest_Reconcile_T74_403ActionFailure_ReportedInStatusImmediately`
+  - asserts failing ASG row has `ASGSyncState=Error`
+  - asserts row `Error` includes `403`/`AuthorizationFailed`
+  - asserts `Reconciled=False` without waiting for extra reconcile cycles
+
+### `internal/controller/errors_test.go`
+- `TestSystemRequeue_UsesRetryAfterHint_FromHTTP429ClientError`
+
+### `internal/azure/client_factory_test.go`
+- defaults/options propagation tests for retry policy + limiter
+
+### `internal/azure/executor_test.go`
+- `TestExecutor_BuildSingleTargetActual_ParentASGNotFound_ReturnsError`
+- `TestExecutor_BuildSingleTargetActual_ChildNotFound_TreatedAsAbsent`
+
+---
+
+## 9) Revision notes (delta from previous design)
+
+1. Added explicit **contract-preserving behavior** for `StatusUpdater == nil` in both system-failure and action-failure paths.
+2. Added explicit **action-failure error-precedence rule**: final status write error is returned directly and never masked by requeue.
+3. Added explicit **T7.4 reconcile-path status acceptance** test design proving 403 appears in `PodASGMapping.status` immediately.
+4. Tightened T7.3 linkage to status reporting through system-failure finalization test coverage.

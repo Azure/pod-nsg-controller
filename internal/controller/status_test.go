@@ -1406,3 +1406,120 @@ func TestPopPreviousLastSync(t *testing.T) {
 		t.Error("popPreviousLastSync returned true for non-existent key, want false")
 	}
 }
+
+// ---------------------------------------------------------------------------
+// Phase 7 Acceptance: T7.5 Status Contract Validation
+// ---------------------------------------------------------------------------
+
+func TestPhase7_T75_StatusContract_ConditionsAndMappingRows(t *testing.T) {
+	now := metav1.Now()
+
+	spec := v1alpha1.PodASGMappingSpec{
+		Mappings: []v1alpha1.Mapping{
+			{
+				PodSelector: v1alpha1.PodSelector{
+					MatchLabels: map[string]string{"app": "test"},
+				},
+				ApplicationSecurityGroups: []v1alpha1.ASGReference{
+					{ResourceID: "/subscriptions/sub1/resourceGroups/rg1/providers/Microsoft.Network/applicationSecurityGroups/asg-ok"},
+					{ResourceID: "/subscriptions/sub1/resourceGroups/rg1/providers/Microsoft.Network/applicationSecurityGroups/asg-fail"},
+					{ResourceID: "/subscriptions/sub1/resourceGroups/rg1/providers/Microsoft.Network/applicationSecurityGroups/asg-perm"},
+				},
+			},
+		},
+	}
+
+	results := []azure.ActionResult{
+		{
+			Action: engine.Action{
+				Kind: engine.UpdatePrefixSet,
+				Target: engine.ASGTarget{
+					SubscriptionID: "sub1", ResourceGroup: "rg1", ASGName: "asg-ok",
+					FullResourceID: "/subscriptions/sub1/resourceGroups/rg1/providers/Microsoft.Network/applicationSecurityGroups/asg-ok",
+					PrefixSetName:  "test-prefix",
+				},
+				DesiredIPs: []string{"10.0.0.1"},
+			},
+			Err: nil,
+		},
+		{
+			Action: engine.Action{
+				Kind: engine.UpdatePrefixSet,
+				Target: engine.ASGTarget{
+					SubscriptionID: "sub1", ResourceGroup: "rg1", ASGName: "asg-fail",
+					FullResourceID: "/subscriptions/sub1/resourceGroups/rg1/providers/Microsoft.Network/applicationSecurityGroups/asg-fail",
+					PrefixSetName:  "test-prefix",
+				},
+				DesiredIPs: []string{"10.0.0.2"},
+			},
+			Err: &azure.ARMStatusError{StatusCode: 500, ARMCode: "InternalServerError", Message: "transient"},
+		},
+		{
+			Action: engine.Action{
+				Kind: engine.UpdatePrefixSet,
+				Target: engine.ASGTarget{
+					SubscriptionID: "sub1", ResourceGroup: "rg1", ASGName: "asg-perm",
+					FullResourceID: "/subscriptions/sub1/resourceGroups/rg1/providers/Microsoft.Network/applicationSecurityGroups/asg-perm",
+					PrefixSetName:  "test-prefix",
+				},
+				DesiredIPs: []string{"10.0.0.3"},
+			},
+			Err: &azure.ARMStatusError{StatusCode: 403, ARMCode: "AuthorizationFailed", Message: "forbidden"},
+		},
+	}
+
+	// Validate Phase 7 status contract against the partial failure results.
+	// The status passed here is deliberately incomplete (missing Reconciled
+	// condition and per-ASG MappingStatuses), so the validator should detect
+	// violations.
+	violations := ValidatePhase7StatusContract(
+		v1alpha1.PodASGMappingStatus{
+			Conditions: []metav1.Condition{
+				{
+					Type:               "Accepted",
+					Status:             metav1.ConditionTrue,
+					LastTransitionTime: now,
+				},
+			},
+		},
+		results,
+		spec,
+		"test-prefix",
+	)
+
+	// T7.5 acceptance: the incomplete status above must trigger violations
+	// for missing Reconciled=False condition and missing per-ASG sync states.
+	if len(violations) == 0 {
+		t.Fatalf("T7.5: ValidatePhase7StatusContract returned 0 violations; want > 0 for incomplete status")
+	}
+
+	for _, v := range violations {
+		t.Logf("violation: field=%s got=%s want=%s msg=%s", v.Field, v.Got, v.Want, v.Message)
+	}
+
+	// Assert the specific violations we expect from an incomplete status:
+	// 1. Missing Reconciled condition (results contain failures).
+	// 2. MappingStatuses count mismatch (0 rows vs 1 spec mapping).
+	hasReconciledViolation := false
+	hasMappingStatusesViolation := false
+	for _, v := range violations {
+		switch v.Field {
+		case "conditions[Reconciled]":
+			hasReconciledViolation = true
+			if v.Got != "<missing>" {
+				t.Errorf("T7.5: Reconciled violation: expected Got=<missing>, got %q", v.Got)
+			}
+		case "mappingStatuses":
+			hasMappingStatusesViolation = true
+			if v.Got != "0 rows" {
+				t.Errorf("T7.5: mappingStatuses violation: expected Got=\"0 rows\", got %q", v.Got)
+			}
+		}
+	}
+	if !hasReconciledViolation {
+		t.Error("T7.5: expected violation for missing Reconciled condition")
+	}
+	if !hasMappingStatusesViolation {
+		t.Error("T7.5: expected violation for mismatched mappingStatuses count")
+	}
+}

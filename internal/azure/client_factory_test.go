@@ -109,3 +109,78 @@ func TestPhase4_ClientFactory_PropagatesARMBaseURLToCreatedClient(t *testing.T) 
 		t.Errorf("expected baseURL %q, got %q", customURL, apsClient.baseURL)
 	}
 }
+
+// ---------- Phase 7: Factory propagates RetryPolicy to created clients ----------
+
+func TestClientFactory_PropagatesRetryPolicyToClient(t *testing.T) {
+	log := zaptest.NewLogger(t)
+
+	policy := RetryPolicy{
+		MaxRetries:        5,
+		NetworkMaxRetries: 2,
+		BaseDelay:         2000000000, // 2s
+		MaxDelay:          16000000000,
+		JitterFactor:      0.3,
+	}
+
+	factory := NewClientFactory(log,
+		WithFactoryRetryPolicy(policy),
+	)
+
+	client, err := factory.ForSubscription("sub-policy-test")
+	if err != nil {
+		t.Fatalf("ForSubscription returned error: %v", err)
+	}
+	if client == nil {
+		t.Fatal("expected non-nil client")
+	}
+
+	// Cast to concrete type to inspect the retryPolicy field.
+	apsClient, ok := client.(*AddressPrefixSetClient)
+	if !ok {
+		t.Fatalf("expected *AddressPrefixSetClient, got %T", client)
+	}
+
+	// With the stub (no-op WithFactoryRetryPolicy), the factory does not set
+	// retryPolicy on the client, so it remains the zero value.
+	if apsClient.retryPolicy.MaxRetries != policy.MaxRetries {
+		t.Errorf("expected client retryPolicy.MaxRetries=%d, got %d",
+			policy.MaxRetries, apsClient.retryPolicy.MaxRetries)
+	}
+	if apsClient.retryPolicy.BaseDelay != policy.BaseDelay {
+		t.Errorf("expected client retryPolicy.BaseDelay=%v, got %v",
+			policy.BaseDelay, apsClient.retryPolicy.BaseDelay)
+	}
+}
+
+// ---------- Phase 7: Factory propagates SubscriptionRateLimiter to created clients ----------
+
+func TestClientFactory_PropagatesRateLimiterToClient(t *testing.T) {
+	log := zaptest.NewLogger(t)
+
+	limiter := NewARMRateLimiter(log, 10.0)
+
+	factory := NewClientFactory(log,
+		WithFactorySubscriptionRateLimiter(limiter),
+	)
+
+	client, err := factory.ForSubscription("sub-limiter-test")
+	if err != nil {
+		t.Fatalf("ForSubscription returned error: %v", err)
+	}
+	if client == nil {
+		t.Fatal("expected non-nil client")
+	}
+
+	// Cast to concrete type to inspect the rateLimiter field.
+	apsClient, ok := client.(*AddressPrefixSetClient)
+	if !ok {
+		t.Fatalf("expected *AddressPrefixSetClient, got %T", client)
+	}
+
+	// With the stub (no-op WithFactorySubscriptionRateLimiter), the factory
+	// does not set rateLimiter on the client, so it remains nil.
+	if apsClient.rateLimiter == nil {
+		t.Error("expected client to have non-nil rateLimiter after factory propagation")
+	}
+}

@@ -19,7 +19,13 @@
 #        --input phase="Phase 1: CRD Types, Scaffolding & Scheme Registration" \
 #        --input spec_path="docs/SPECIFICATION.md"
 #
-#   4. With web dashboard:
+#   4. With a pre-existing design (skips design + review):
+#      conductor run .conductor/phase-workflow.yaml \
+#        --input phase="Phase 7: Error Handling, Resilience" \
+#        --input spec_path="docs/SPECIFICATION.md" \
+#        --input design_path=".conductor/designs/phase-7:-error-handling,-resilience-"
+#
+#   5. With web dashboard:
 #      conductor run .conductor/phase-workflow.yaml --web \
 #        --input phase="Phase 1: CRD Types, Scaffolding & Scheme Registration" \
 #        --input spec_path="docs/SPECIFICATION.md"
@@ -27,6 +33,7 @@
 # Flow:
 #   designer → design_reviewer ──(approved)──→ unit_test_writer
 #                ↑  (revise)  ←──(rejected)──┘
+#   designer ──(pre-existing design_path)──→ unit_test_writer  [skip review]
 #   unit_test_writer → coder → unit_test_validator
 #                        ↑  ←──(tests fail)──┘
 #   unit_test_validator ──(pass)──→ integration_tester → qa_validator
@@ -58,6 +65,13 @@ workflow:
       required: true
       description: >-
         Path to the SPECIFICATION.md file (e.g., "docs/SPECIFICATION.md")
+    design_path:
+      type: string
+      required: false
+      description: >-
+        Path to a pre-existing design document. When provided, the designer
+        agent loads this file and skips directly to test writing (bypassing
+        design review and approval gate).
 
   context:
     mode: accumulate
@@ -75,11 +89,14 @@ agents:
   - name: designer
     description: >-
       Reads the spec for the target phase, researches the codebase,
-      and produces a detailed implementation design document.
+      and produces a detailed implementation design document. When a
+      pre-existing design_path is provided, loads it directly and
+      skips review.
     model: gpt-5.3-codex
     input:
       - workflow.input.phase
       - workflow.input.spec_path
+      - workflow.input.design_path?
       - design_reviewer.output?
     system_prompt: |
       You are a Principal Software Architect specializing in Go, Kubernetes
@@ -93,6 +110,35 @@ agents:
       - Azure clients use *zap.Logger directly
       - Tests use zaptest.NewLogger(t)
     prompt: |
+      {% if workflow.input.design_path is defined and workflow.input.design_path %}
+      ## Pre-existing Design — Load and Extract Metadata
+
+      A design document already exists for this phase. Load it and extract
+      the structured metadata so downstream agents can use it.
+
+      **Phase:** {{ workflow.input.phase }}
+      **Design File:** Read `{{ workflow.input.design_path }}`
+
+      ## Tasks
+
+      1. **Read the design document** at `{{ workflow.input.design_path }}`
+
+      2. **Extract metadata** from the document:
+         - `files_to_create`: list of new file paths from the design (look for
+           "Files to create" section). Use an empty list if none.
+         - `files_to_modify`: list of existing file paths from the design (look
+           for "Files to modify" section)
+         - `test_files`: list of test file paths from the design (look for test
+           sections listing test files)
+
+      3. **Set outputs:**
+         - `design_path` = `{{ workflow.input.design_path }}`
+         - `skip_review` = true
+         - `revision_notes` = "Pre-existing design loaded, skipping review"
+
+      **CRITICAL:** Do NOT create a new design. Do NOT modify the design file.
+      Simply read it and extract the file lists.
+      {% else %}
       Create a detailed implementation design for the following phase.
 
       **Phase:** {{ workflow.input.phase }}
@@ -133,6 +179,7 @@ agents:
          - Test file locations and test function names
 
       4. **Save the Design** — Write to `.conductor/designs/{{ workflow.input.phase | replace(' ', '-') | lower }}.design.md`
+      {% endif %}
     output:
       design_path:
         type: string
@@ -149,7 +196,12 @@ agents:
       revision_notes:
         type: string
         description: Summary of changes if this is a revision
+      skip_review:
+        type: boolean
+        description: Whether to skip design review (true when using pre-existing design)
     routes:
+      - to: unit_test_writer
+        when: "{{ output.skip_review }}"
       - to: design_reviewer
 
   # ─── 2. DESIGN REVIEW AGENT ──────────────────────────────────
@@ -259,7 +311,8 @@ agents:
   - name: unit_test_writer
     description: >-
       Writes failing unit tests based on the TDD acceptance criteria
-      from the spec. Tests MUST fail before implementation.
+      from the spec. If tests already exist, validates them and only
+      adds missing coverage.
     model: claude-opus-4.6
     input:
       - workflow.input.phase
@@ -267,8 +320,8 @@ agents:
       - designer.output
     system_prompt: |
       You are a Test Engineer specializing in Go testing, TDD, and Kubernetes
-      controller testing (envtest). You write comprehensive, failing tests
-      BEFORE any implementation code exists.
+      controller testing (envtest). You write comprehensive tests based on
+      spec acceptance criteria.
 
       Testing conventions for this project:
       - Use standard `testing` package with `t.Run()` subtests
@@ -277,8 +330,11 @@ agents:
       - Use envtest for CRD/controller tests
       - Use table-driven tests where appropriate
       - Assert with `if got != want { t.Errorf(...) }` pattern (no testify)
+
+      IMPORTANT: Before writing anything, check if test files and test
+      functions already exist. Do NOT rewrite existing passing tests.
     prompt: |
-      Write failing unit tests for **{{ workflow.input.phase }}**.
+      Write or verify unit tests for **{{ workflow.input.phase }}**.
 
       **Specification:** Read `{{ workflow.input.spec_path }}` — extract the
       TDD Acceptance Tests table for this phase.
@@ -289,48 +345,56 @@ agents:
 
       1. **Extract ALL acceptance test IDs** from the spec (e.g., T1.1–T1.6)
 
-      2. **Create test files** at the paths specified in the design:
+      2. **Check for existing tests** at the paths specified in the design:
       {% for test_file in designer.output.test_files %}
          - `{{ test_file }}`
       {% endfor %}
 
-      3. **Write test functions** for EVERY acceptance criterion:
-         - Each test must have a clear name matching the test ID
+      3. **If test files already exist:**
+         - Run `go test ./... -v -count=1` to see which tests pass
+         - Inventory existing test functions vs. required acceptance tests
+         - Only add tests for MISSING acceptance criteria
+         - Do NOT modify or rewrite passing tests
+         - Report existing coverage alongside any additions
+
+      4. **If test files do NOT exist:**
+         - Write test functions for EVERY acceptance criterion
          - Tests must call functions/types that DON'T EXIST YET
-         - Tests must assert the expected behavior from the spec
-         - Tests MUST FAIL when run (compilation errors are acceptable)
+         - Create minimal stub files so tests compile but FAIL
+         - Run `go test` to confirm tests FAIL
 
-      4. **Create minimal stub files** — Only empty package declarations
-         and placeholder type/function signatures that return zero values,
-         so that tests compile but FAIL on assertions.
+      5. **Run `go test`** to confirm final state
 
-      5. **Run `go test`** to confirm all tests FAIL
-
-      **CRITICAL:** Do NOT implement any real logic. Tests must fail.
+      **CRITICAL:** Never delete or rewrite existing passing tests.
+      Only add what is missing.
     output:
       test_files_created:
         type: array
-        description: List of test files created
+        description: List of test files created or verified
       stub_files_created:
         type: array
-        description: List of stub files created
+        description: List of stub files created (empty if tests already existed)
       test_count:
         type: number
-        description: Total number of test functions written
+        description: Total number of test functions (existing + new)
       all_tests_fail:
         type: boolean
-        description: Whether all tests correctly fail
+        description: Whether all NEW tests correctly fail (true if no new tests needed)
       test_output:
         type: string
-        description: Output from running go test (should show failures)
+        description: Output from running go test
+      existing_tests_found:
+        type: boolean
+        description: Whether existing test implementations were found
     routes:
       - to: coder
 
   # ─── 4. CODER AGENT (Implementation) ─────────────────────────
   - name: coder
     description: >-
-      Implements the production code to make the failing tests pass.
-      Follows the design document and spec precisely.
+      Implements production code to make failing tests pass. If code
+      already exists, verifies it and only fixes specific issues from
+      upstream feedback.
     model: claude-opus-4.6
     input:
       - workflow.input.phase
@@ -338,6 +402,7 @@ agents:
       - designer.output
       - unit_test_writer.output
       - unit_test_validator.output?
+      - qa_validator.output?
     system_prompt: |
       You are a Senior Go Engineer specializing in Kubernetes controllers
       and Azure SDK integration. You write clean, production-ready Go code
@@ -348,12 +413,17 @@ agents:
         - Controller code: logr.Logger backed by zapr
         - Azure clients: *zap.Logger directly
         - Use typed field constructors: zap.String, zap.Int, zap.Error
-      - Error handling: wrap with fmt.Errorf("context: %w", err)
+      - Error handling: wrap with errors.Wrap/errors.Wrapf from github.com/pkg/errors (not fmt.Errorf with %w)
       - No fmt.Printf or log.Println
       - Follow existing naming conventions in the codebase
       - Keep functions focused and testable
+
+      IMPORTANT: Before implementing anything, check if production code
+      already exists. Do NOT rewrite working implementations. Only make
+      targeted changes to fix specific failures or address directed
+      feedback from reviewers/validators.
     prompt: |
-      Implement the code to make all failing tests pass.
+      Implement or verify code for **{{ workflow.input.phase }}**.
 
       **Phase:** {{ workflow.input.phase }}
       **Specification:** `{{ workflow.input.spec_path }}`
@@ -365,29 +435,49 @@ agents:
       {% endfor %}
 
       {% if unit_test_validator is defined and unit_test_validator.output and not unit_test_validator.output.all_pass %}
-      **Previous attempt had failing tests:**
+      **Previous attempt had failing tests — fix ONLY these:**
       {{ unit_test_validator.output.failure_details }}
 
-      Fix the implementation to address these specific failures.
+      Address ONLY the specific failures listed above. Do NOT rewrite
+      unrelated code that is already working.
+      {% endif %}
+
+      {% if qa_validator is defined and qa_validator.output and not qa_validator.output.approved %}
+      **QA validator found gaps — address ONLY these:**
+      {% for gap in qa_validator.output.gaps %}
+      - {{ gap }}
+      {% endfor %}
+      {{ qa_validator.output.feedback }}
+
+      Address ONLY the specific gaps listed above. Do NOT rewrite
+      unrelated code that is already passing QA checks.
       {% endif %}
 
       ## Tasks
 
-      1. **Read the design and tests** — Understand what needs to be implemented
-      2. **Implement production code** in the files specified by the design:
-      {% for f in designer.output.files_to_create %}
-         - Create: `{{ f }}`
-      {% endfor %}
-      {% for f in designer.output.files_to_modify %}
-         - Modify: `{{ f }}`
-      {% endfor %}
-      3. **Run `go build ./...`** — Ensure compilation succeeds
-      4. **Run `go test ./...`** — Check which tests pass
-      5. **Iterate** until all tests pass
-      6. **Run `go vet ./...`** — No warnings
+      1. **Check existing state first:**
+         - Run `go build ./...` — does the code already compile?
+         - Run `go test ./... -count=1` — which tests already pass?
+         - If all tests pass and there is no directed feedback to address,
+           report success and proceed without changes.
 
-      **CRITICAL:** Implement ONLY what is needed for this phase.
-      Do NOT modify test files. Do NOT skip tests.
+      2. **If implementation is needed** (tests fail or gaps exist):
+         - Only create files that don't already exist:
+         {% for f in designer.output.files_to_create %}
+            - `{{ f }}`
+         {% endfor %}
+         - Only modify files where changes are needed:
+         {% for f in designer.output.files_to_modify %}
+            - `{{ f }}`
+         {% endfor %}
+
+      3. **Run `go build ./...`** — Ensure compilation succeeds
+      4. **Run `go test ./... -count=1`** — Verify tests pass
+      5. **Run `go vet ./...`** — No warnings
+
+      **CRITICAL:** Do NOT rewrite existing working code. Make minimal,
+      targeted changes. If all tests pass and no feedback needs addressing,
+      simply report the current passing state.
     output:
       files_created:
         type: array
@@ -489,7 +579,7 @@ agents:
       - All logging via go.uber.org/zap (no fmt.Printf, no bare log)
       - controller-runtime code uses logr.Logger backed by zapr
       - Azure clients use *zap.Logger directly
-      - Errors wrapped with fmt.Errorf("context: %w", err)
+      - Errors wrapped with errors.Wrap/errors.Wrapf from github.com/pkg/errors (not fmt.Errorf with %w)
       - Functions should be focused and testable
       - Follow existing codebase patterns
     prompt: |
@@ -572,8 +662,8 @@ agents:
   # ─── 5c. UNIT TEST WRITER v2 (Swapped: GPT) ──────────────────
   - name: unit_test_writer_v2
     description: >-
-      Second pass: GPT reviews and strengthens the existing tests,
-      adding any missing edge cases or acceptance criteria coverage.
+      Second pass: Reviews existing tests and adds only missing edge
+      cases or acceptance criteria coverage based on code review feedback.
     model: gpt-5.4
     input:
       - workflow.input.phase
@@ -584,15 +674,19 @@ agents:
       - code_reviewer.output
     system_prompt: |
       You are a Test Engineer using a different perspective to strengthen
-      existing tests. You review the current test suite and add any
-      missing edge cases, boundary conditions, or acceptance criteria
-      that the first pass may have missed.
+      existing tests. You review the current test suite and add ONLY
+      missing edge cases or acceptance criteria. You do NOT rewrite
+      existing tests.
 
       Testing conventions for this project:
       - Use standard `testing` package with `t.Run()` subtests
       - Use `zaptest.NewLogger(t)` for test loggers
       - Use table-driven tests where appropriate
       - Assert with `if got != want { t.Errorf(...) }` pattern
+
+      IMPORTANT: Check what tests already exist before adding any.
+      Only add tests that address specific gaps identified by the
+      code reviewer or missing acceptance criteria.
     prompt: |
       Review and strengthen the test suite for **{{ workflow.input.phase }}**.
 
@@ -607,6 +701,13 @@ agents:
       **Code review feedback from iteration 1:**
       {{ code_reviewer.output.review_summary }}
 
+      {% if code_reviewer.output.critical_issues %}
+      **Critical issues that may need test coverage:**
+      {% for i in code_reviewer.output.critical_issues %}
+      - {{ i }}
+      {% endfor %}
+      {% endif %}
+
       {% if code_reviewer.output.suggestions %}
       **Suggestions that may need test coverage:**
       {% for s in code_reviewer.output.suggestions %}
@@ -616,15 +717,18 @@ agents:
 
       ## Tasks
 
-      1. **Read all existing tests** and the spec's acceptance criteria
-      2. **Identify gaps** — any acceptance test IDs (T*.x) not covered,
-         edge cases from the code review, or boundary conditions missing
-      3. **Add new tests** or strengthen existing ones — do NOT remove
-         or weaken passing tests
-      4. **Run `go test ./... -v -count=1`** to confirm all tests pass
-         (existing + new)
+      1. **Run `go test ./... -v -count=1`** to see current test state
+      2. **Inventory existing tests** vs. required acceptance criteria
+      3. **Identify gaps** — ONLY tests that are:
+         - Required by the spec but missing
+         - Addressing specific code reviewer critical issues
+         - Covering edge cases the reviewer flagged
+      4. **Add ONLY the missing tests** — do NOT modify or rewrite
+         passing tests
+      5. **Run `go test ./... -v -count=1`** to confirm all pass
 
-      If the test suite is already comprehensive, report that and proceed.
+      If the test suite is already comprehensive and covers all reviewer
+      feedback, report that and proceed WITHOUT changes.
     output:
       test_files_updated:
         type: array
@@ -644,8 +748,8 @@ agents:
   # ─── 5d. CODER v2 (Swapped: GPT) ─────────────────────────────
   - name: coder_v2
     description: >-
-      Second pass: GPT reviews the implementation and fixes any issues
-      surfaced by the new tests or code review suggestions.
+      Second pass: Fixes only specific issues surfaced by new tests
+      or code review critical issues. Does not rewrite working code.
     model: gpt-5.4
     input:
       - workflow.input.phase
@@ -656,21 +760,31 @@ agents:
       - unit_test_writer_v2.output
       - unit_test_validator_v2.output?
     system_prompt: |
-      You are a Senior Go Engineer performing a second implementation pass.
-      You fix any issues found by new tests and address code review
-      suggestions from the first iteration.
+      You are a Senior Go Engineer performing a targeted second pass.
+      You fix ONLY specific issues identified by code review or failing
+      tests. You do NOT rewrite working code.
 
       Coding standards:
       - All logging via go.uber.org/zap
       - controller-runtime code uses logr.Logger backed by zapr
-      - Errors wrapped with fmt.Errorf("context: %w", err)
+      - Errors wrapped with errors.Wrap/errors.Wrapf from github.com/pkg/errors (not fmt.Errorf with %w)
       - Follow existing codebase patterns
+
+      IMPORTANT: Make minimal, surgical changes. If all tests pass and
+      no critical issues need addressing, report success without changes.
     prompt: |
-      Second implementation pass for **{{ workflow.input.phase }}**.
+      Targeted fixes for **{{ workflow.input.phase }}** (iteration 2).
 
       **Design:** `{{ designer.output.design_path }}`
 
-      **Code review suggestions from iteration 1:**
+      {% if code_reviewer.output.critical_issues %}
+      **Critical issues to fix (from code review):**
+      {% for i in code_reviewer.output.critical_issues %}
+      - {{ i }}
+      {% endfor %}
+      {% endif %}
+
+      **Code review suggestions (address only where they fix correctness):**
       {% for s in code_reviewer.output.suggestions %}
       - {{ s }}
       {% endfor %}
@@ -683,16 +797,23 @@ agents:
       {% if unit_test_validator_v2 is defined and unit_test_validator_v2.output and not unit_test_validator_v2.output.all_pass %}
       **Failing tests to fix:**
       {{ unit_test_validator_v2.output.failure_details }}
+
+      Address ONLY these specific failures. Do NOT rewrite unrelated code.
       {% endif %}
 
       ## Tasks
 
-      1. **Fix any failing tests** from the new test pass
-      2. **Address code review suggestions** where they improve correctness
-      3. **Run `go build ./...`** and **`go test ./... -v -count=1`**
-      4. **Run `go vet ./...`**
+      1. **Run `go test ./... -count=1`** — check current state
+      2. **If all tests pass and no critical issues remain:**
+         - Report success, no changes needed
+      3. **If there are failures or critical issues:**
+         - Fix ONLY the specific failures or critical issues
+         - Do NOT refactor working code
+      4. **Run `go build ./...`** and **`go test ./... -v -count=1`**
+      5. **Run `go vet ./...`**
 
-      Do NOT break existing passing tests.
+      **CRITICAL:** Do NOT break existing passing tests. Make minimal
+      changes. If nothing needs fixing, proceed without modifications.
     output:
       files_modified:
         type: array
@@ -794,7 +915,7 @@ agents:
       Project conventions:
       - All logging via go.uber.org/zap
       - controller-runtime code uses logr.Logger backed by zapr
-      - Errors wrapped with fmt.Errorf("context: %w", err)
+      - Errors wrapped with errors.Wrap/errors.Wrapf from github.com/pkg/errors (not fmt.Errorf with %w)
     prompt: |
       Final code review for **{{ workflow.input.phase }}** (iteration 2).
 

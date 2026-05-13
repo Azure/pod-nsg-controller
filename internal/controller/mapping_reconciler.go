@@ -72,7 +72,7 @@ func (r *MappingReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 		if apierrors.IsNotFound(err) {
 			return ctrl.Result{}, nil
 		}
-		return ctrl.Result{}, errors.Wrap(err, "fetching PodASGMapping")
+		return r.finalizeSystemError(ctx, req, nil, "", nil, "fetch-mapping", err, false, logger)
 	}
 
 	logger = logger.WithValues(
@@ -86,13 +86,13 @@ func (r *MappingReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 	if mapping.DeletionTimestamp != nil {
 		if controllerutil.ContainsFinalizer(&mapping, CleanupFinalizer) {
 			if err := r.reconcileDelete(ctx, &mapping, ownershipKey, logger); err != nil {
-				return ctrl.Result{}, errors.Wrap(err, "reconcile delete")
+				return r.finalizeSystemError(ctx, req, &mapping, ownershipKey, nil, "delete-cleanup", err, false, logger)
 			}
 			// Remove CleanupFinalizer on success.
 			patch := client.MergeFrom(mapping.DeepCopy())
 			controllerutil.RemoveFinalizer(&mapping, CleanupFinalizer)
 			if err := r.Patch(ctx, &mapping, patch); err != nil {
-				return ctrl.Result{}, errors.Wrap(err, "removing cleanup finalizer")
+				return r.finalizeSystemError(ctx, req, &mapping, ownershipKey, nil, "delete-remove-finalizer", err, false, logger)
 			}
 			return ctrl.Result{}, nil
 		}
@@ -102,7 +102,7 @@ func (r *MappingReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 	// Ensure finalizer. If added, return immediately with Requeue: true.
 	added, err := r.ensureFinalizer(ctx, &mapping)
 	if err != nil {
-		return ctrl.Result{}, errors.Wrap(err, "ensuring finalizer")
+		return r.finalizeSystemError(ctx, req, &mapping, ownershipKey, nil, "ensure-finalizer", err, false, logger)
 	}
 	if added {
 		return ctrl.Result{Requeue: true}, nil
@@ -111,7 +111,7 @@ func (r *MappingReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 	// List pods in mapping namespace.
 	var podList corev1.PodList
 	if err := r.List(ctx, &podList, client.InNamespace(mapping.Namespace)); err != nil {
-		return ctrl.Result{}, errors.Wrap(err, "listing pods")
+		return r.finalizeSystemError(ctx, req, &mapping, ownershipKey, nil, "list-pods", err, true, logger)
 	}
 
 	// Compute matched pods per mapping index.
@@ -125,7 +125,7 @@ func (r *MappingReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 		if r.StatusUpdater != nil {
 			statusErr := r.StatusUpdater.UpdateAfterReconcile(ctx, req.NamespacedName, mapping.Generation, ownershipKey, nil, validationErr, validationIssues, matchedPodsByIndex)
 			if statusErr != nil {
-				if statusErr == ErrStatusObjectNotFound || statusErr == ErrStatusStaleGeneration {
+				if errors.Is(statusErr, ErrStatusObjectNotFound) || errors.Is(statusErr, ErrStatusStaleGeneration) {
 					return ctrl.Result{}, nil
 				}
 				logger.Error(statusErr, "failed to update status for validation failure")
@@ -140,7 +140,7 @@ func (r *MappingReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 	// Write pending status before Azure operations.
 	if r.StatusUpdater != nil {
 		if pendingErr := r.StatusUpdater.UpdatePending(ctx, req.NamespacedName, mapping.Generation, ownershipKey, matchedPodsByIndex); pendingErr != nil {
-			if pendingErr == ErrStatusObjectNotFound || pendingErr == ErrStatusStaleGeneration {
+			if errors.Is(pendingErr, ErrStatusObjectNotFound) || errors.Is(pendingErr, ErrStatusStaleGeneration) {
 				return ctrl.Result{}, nil
 			}
 			logger.Error(pendingErr, "failed to update pending status, continuing")
@@ -164,7 +164,7 @@ func (r *MappingReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 	// Load ownership annotation (fail closed on parse error).
 	ownedRefs, err := LoadOwnedASGs(&mapping)
 	if err != nil {
-		return ctrl.Result{}, errors.Wrap(err, "parsing owned ASGs annotation")
+		return r.finalizeSystemError(ctx, req, &mapping, ownershipKey, matchedPodsByIndex, "parse-owned-annotation", err, true, logger)
 	}
 
 	ownedTargets := TargetsFromOwnedASGs(ownedRefs, ownershipKey)
@@ -186,7 +186,7 @@ func (r *MappingReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 	// Fetch actual state from Azure.
 	actual, err := r.listActualForTargets(ctx, allTargets)
 	if err != nil {
-		return ctrl.Result{}, errors.Wrap(err, "listing actual state")
+		return r.finalizeSystemError(ctx, req, &mapping, ownershipKey, matchedPodsByIndex, "list-actual-state", err, true, logger)
 	}
 
 	// Ensure owned-but-no-longer-desired targets appear in actual so the diff
@@ -214,10 +214,10 @@ func (r *MappingReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 	if ownershipAnnotationChanged(ownedRefs, preRefs) {
 		patch := client.MergeFrom(mapping.DeepCopy())
 		if err := StoreOwnedASGs(&mapping, preRefs); err != nil {
-			return ctrl.Result{}, errors.Wrap(err, "storing owned ASGs annotation")
+			return r.finalizeSystemError(ctx, req, &mapping, ownershipKey, matchedPodsByIndex, "store-owned-pre", err, true, logger)
 		}
 		if err := r.Patch(ctx, &mapping, patch); err != nil {
-			return ctrl.Result{}, errors.Wrap(err, "patching ownership annotation")
+			return r.finalizeSystemError(ctx, req, &mapping, ownershipKey, matchedPodsByIndex, "patch-owned-pre", err, true, logger)
 		}
 	}
 
@@ -247,10 +247,10 @@ func (r *MappingReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 		if ownershipAnnotationChanged(preRefs, postRefs) {
 			patch := client.MergeFrom(mapping.DeepCopy())
 			if err := StoreOwnedASGs(&mapping, postRefs); err != nil {
-				return ctrl.Result{}, errors.Wrap(err, "storing post-action owned ASGs")
+				return r.finalizeSystemError(ctx, req, &mapping, ownershipKey, matchedPodsByIndex, "store-owned-post", err, true, logger)
 			}
 			if err := r.Patch(ctx, &mapping, patch); err != nil {
-				return ctrl.Result{}, errors.Wrap(err, "patching post-action ownership annotation")
+				return r.finalizeSystemError(ctx, req, &mapping, ownershipKey, matchedPodsByIndex, "patch-owned-post", err, true, logger)
 			}
 		}
 	}
@@ -260,19 +260,28 @@ func (r *MappingReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 	if r.StatusUpdater != nil {
 		statusErr = r.StatusUpdater.UpdateAfterReconcile(ctx, req.NamespacedName, mapping.Generation, ownershipKey, results, reconcileErr, nil, matchedPodsByIndex)
 		if statusErr != nil {
-			if statusErr == ErrStatusObjectNotFound || statusErr == ErrStatusStaleGeneration {
+			if errors.Is(statusErr, ErrStatusObjectNotFound) || errors.Is(statusErr, ErrStatusStaleGeneration) {
 				return ctrl.Result{}, nil
 			}
-			logger.Error(statusErr, "failed to update final status")
 		}
 	}
 
-	if reconcileErr != nil {
-		return ctrl.Result{}, reconcileErr
+	// Status write errors take precedence over action-failure requeue
+	// decisions so they are never masked (Phase 7 contract).
+	if statusErr != nil {
+		return r.finalizeStatusWriteError(statusErr, logger)
 	}
 
-	if statusErr != nil {
-		return ctrl.Result{}, statusErr
+	// Use policy-driven requeue for action failures.
+	if reconcileErr != nil {
+		summary := ClassifyActionResults(results)
+		policy := DefaultRequeuePolicy(r.ResyncInterval)
+		result := DecideRequeueFromActionSummary(summary, policy)
+		logger.V(0).Info("action failures handled via policy",
+			"decisionSource", "action-summary",
+			"requeueAfter", result.RequeueAfter,
+		)
+		return result, nil
 	}
 
 	// When no targets exist, schedule a short follow-up while pods/IPs or informer

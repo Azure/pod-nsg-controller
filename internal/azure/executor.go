@@ -18,15 +18,15 @@ type ActionResult struct {
 	Err     error
 }
 
-// armVerb returns the ARM HTTP verb for a given action kind.
-func armVerb(kind engine.ActionKind) string {
+// armOperation returns the ARM operation for a given action kind.
+func armOperation(kind engine.ActionKind) ARMOperation {
 	switch kind {
 	case engine.CreatePrefixSet, engine.UpdatePrefixSet:
-		return "PUT"
+		return ARMOperationPutPrefixSet
 	case engine.DeletePrefixSet:
-		return "DELETE"
+		return ARMOperationDeletePrefixSet
 	default:
-		return "UNKNOWN"
+		return ARMOperation("Unknown")
 	}
 }
 
@@ -121,7 +121,7 @@ func (e *Executor) executeWithETagRetry(ctx context.Context, client AddressPrefi
 
 		if attempt == e.maxRetries {
 			e.log.Warn("ETag conflict, retries exhausted",
-				zap.String("operation", armVerb(action.Kind)),
+				zap.String("operation", string(armOperation(action.Kind))),
 				zap.String("actionKind", string(action.Kind)),
 				zap.String("prefixSetName", action.Target.PrefixSetName),
 				zap.Int("attempt", attempt),
@@ -131,7 +131,7 @@ func (e *Executor) executeWithETagRetry(ctx context.Context, client AddressPrefi
 			break
 		}
 		e.log.Warn("ETag conflict, retrying",
-			zap.String("operation", armVerb(action.Kind)),
+			zap.String("operation", string(armOperation(action.Kind))),
 			zap.String("actionKind", string(action.Kind)),
 			zap.String("prefixSetName", action.Target.PrefixSetName),
 			zap.Int("attempt", attempt),
