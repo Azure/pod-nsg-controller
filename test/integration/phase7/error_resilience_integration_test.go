@@ -15,6 +15,7 @@ import (
 	"github.com/Azure/pod-nsg-controller/internal/controller"
 	"github.com/Azure/pod-nsg-controller/internal/engine"
 	"github.com/Azure/pod-nsg-controller/internal/model"
+	"github.com/Azure/pod-nsg-controller/internal/testing/controllertest"
 	"github.com/go-logr/zapr"
 	"github.com/pkg/errors"
 	"go.uber.org/zap/zaptest"
@@ -1302,7 +1303,7 @@ func TestPhase7_T75_Integration_ValidateStatusContract(t *testing.T) {
 		},
 	}
 
-	report := controller.BuildPartialFailureReport(results, v1alpha1.PodASGMappingSpec{
+	report := controllertest.BuildPartialFailureReport(results, v1alpha1.PodASGMappingSpec{
 		Mappings: []v1alpha1.Mapping{{
 			PodSelector: v1alpha1.PodSelector{MatchLabels: map[string]string{"app": "contract-int"}},
 			ApplicationSecurityGroups: []v1alpha1.ASGReference{
@@ -1321,7 +1322,7 @@ func TestPhase7_T75_Integration_ValidateStatusContract(t *testing.T) {
 		t.Errorf("T7.5 integration: FailedTargets = %d, want 2", len(report.FailedTargets))
 	}
 
-	violations := controller.ValidatePhase7StatusContract(
+	violations := controllertest.ValidatePhase7StatusContract(
 		report.StatusSnapshot, results,
 		v1alpha1.PodASGMappingSpec{}, "pod-nsg-controller",
 	)
