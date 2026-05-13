@@ -18,7 +18,7 @@ import (
 )
 
 const (
-	apiVersion2026 = "2026-01-01"
+	apiVersion = "2025-07-01"
 	armEndpoint    = "https://management.azure.com"
 
 	// defaultMaxRetries is the number of retries for transient HTTP failures.
@@ -93,12 +93,12 @@ func NewAddressPrefixSetClient(
 
 func (c *AddressPrefixSetClient) resourceURL(subscriptionID, resourceGroup, asgName, prefixSetName string) string {
 	return fmt.Sprintf("%s/subscriptions/%s/resourceGroups/%s/providers/Microsoft.Network/applicationSecurityGroups/%s/addressPrefixSets/%s?api-version=%s",
-		c.baseURL, url.PathEscape(subscriptionID), url.PathEscape(resourceGroup), url.PathEscape(asgName), url.PathEscape(prefixSetName), apiVersion2026)
+		c.baseURL, url.PathEscape(subscriptionID), url.PathEscape(resourceGroup), url.PathEscape(asgName), url.PathEscape(prefixSetName), apiVersion)
 }
 
 func (c *AddressPrefixSetClient) listURL(subscriptionID, resourceGroup, asgName string) string {
 	return fmt.Sprintf("%s/subscriptions/%s/resourceGroups/%s/providers/Microsoft.Network/applicationSecurityGroups/%s/addressPrefixSets?api-version=%s",
-		c.baseURL, url.PathEscape(subscriptionID), url.PathEscape(resourceGroup), url.PathEscape(asgName), apiVersion2026)
+		c.baseURL, url.PathEscape(subscriptionID), url.PathEscape(resourceGroup), url.PathEscape(asgName), apiVersion)
 }
 
 func (c *AddressPrefixSetClient) acquireToken(ctx context.Context) (string, error) {
