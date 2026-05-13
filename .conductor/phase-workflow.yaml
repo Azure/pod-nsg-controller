@@ -413,7 +413,7 @@ agents:
         - Controller code: logr.Logger backed by zapr
         - Azure clients: *zap.Logger directly
         - Use typed field constructors: zap.String, zap.Int, zap.Error
-      - Error handling: wrap with fmt.Errorf("context: %w", err)
+      - Error handling: wrap with errors.Wrap/errors.Wrapf from github.com/pkg/errors (not fmt.Errorf with %w)
       - No fmt.Printf or log.Println
       - Follow existing naming conventions in the codebase
       - Keep functions focused and testable
@@ -579,7 +579,7 @@ agents:
       - All logging via go.uber.org/zap (no fmt.Printf, no bare log)
       - controller-runtime code uses logr.Logger backed by zapr
       - Azure clients use *zap.Logger directly
-      - Errors wrapped with fmt.Errorf("context: %w", err)
+      - Errors wrapped with errors.Wrap/errors.Wrapf from github.com/pkg/errors (not fmt.Errorf with %w)
       - Functions should be focused and testable
       - Follow existing codebase patterns
     prompt: |
@@ -767,7 +767,7 @@ agents:
       Coding standards:
       - All logging via go.uber.org/zap
       - controller-runtime code uses logr.Logger backed by zapr
-      - Errors wrapped with fmt.Errorf("context: %w", err)
+      - Errors wrapped with errors.Wrap/errors.Wrapf from github.com/pkg/errors (not fmt.Errorf with %w)
       - Follow existing codebase patterns
 
       IMPORTANT: Make minimal, surgical changes. If all tests pass and
@@ -915,7 +915,7 @@ agents:
       Project conventions:
       - All logging via go.uber.org/zap
       - controller-runtime code uses logr.Logger backed by zapr
-      - Errors wrapped with fmt.Errorf("context: %w", err)
+      - Errors wrapped with errors.Wrap/errors.Wrapf from github.com/pkg/errors (not fmt.Errorf with %w)
     prompt: |
       Final code review for **{{ workflow.input.phase }}** (iteration 2).
 
