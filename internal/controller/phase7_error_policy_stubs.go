@@ -12,7 +12,9 @@ import (
 
 // finalizeSystemError centralizes all system-error exits from Reconcile.
 // It derives a policy-driven ctrl.Result and optionally writes a best-effort
-// status update. It always returns (result, nil) — never a raw error.
+// status update. If the status write itself fails with a non-sentinel error,
+// that error takes precedence for the requeue decision so it is not silently
+// masked. It always returns (result, nil) — never a raw error.
 func (r *MappingReconciler) finalizeSystemError(
 	ctx context.Context,
 	req ctrl.Request,
@@ -39,11 +41,12 @@ func (r *MappingReconciler) finalizeSystemError(
 			nil, systemErr, nil, matchedPodsByIndex,
 		)
 		if statusErr != nil {
-			if !errors.Is(statusErr, ErrStatusObjectNotFound) && !errors.Is(statusErr, ErrStatusStaleGeneration) {
-				logger.Error(statusErr, "best-effort status write failed during system error handling",
-					"stage", stage,
-				)
+			if errors.Is(statusErr, ErrStatusObjectNotFound) || errors.Is(statusErr, ErrStatusStaleGeneration) {
+				return ctrl.Result{}, nil
 			}
+			// Status write errors take precedence over the system-error
+			// requeue decision so they are never silently masked.
+			return r.finalizeStatusWriteError(statusErr, logger)
 		}
 	}
 
