@@ -266,6 +266,7 @@ func TestRetry_IsRetriableARM_ServerErrors(t *testing.T) {
 		statusCode int
 		want       bool
 	}{
+		{"408 is retriable", 408, true},
 		{"429 is retriable", 429, true},
 		{"500 is retriable", 500, true},
 		{"502 is retriable", 502, true},

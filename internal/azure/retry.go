@@ -136,7 +136,7 @@ func computeBackoff(retriesUsed int, p RetryPolicy) time.Duration {
 }
 
 func isRetriableStatusCode(statusCode int) bool {
-	return statusCode == 429 || statusCode >= 500
+	return statusCode == 408 || statusCode == 429 || statusCode >= 500
 }
 
 func isNetworkError(err error) bool {
@@ -177,7 +177,7 @@ func ExtractRetryAfterHint(err error) time.Duration {
 	return 0
 }
 
-// IsRetriableARM returns true if the error is retriable (429, 5xx, network).
+// IsRetriableARM returns true if the error is retriable (408, 429, 5xx, network).
 func IsRetriableARM(err error) bool {
 	var armErr *ARMStatusError
 	if errors.As(err, &armErr) {
