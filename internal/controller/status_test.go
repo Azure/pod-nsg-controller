@@ -1469,8 +1469,9 @@ func TestPhase7_T75_StatusContract_ConditionsAndMappingRows(t *testing.T) {
 	}
 
 	// Validate Phase 7 status contract against the partial failure results.
-	// The stub returns nil (no violations), but the contract should find violations
-	// if status doesn't match expectations.
+	// The status passed here is deliberately incomplete (missing Reconciled
+	// condition and per-ASG MappingStatuses), so the validator should detect
+	// violations.
 	violations := ValidatePhase7StatusContract(
 		v1alpha1.PodASGMappingStatus{
 			Conditions: []metav1.Condition{
@@ -1486,8 +1487,7 @@ func TestPhase7_T75_StatusContract_ConditionsAndMappingRows(t *testing.T) {
 		"test-prefix",
 	)
 
-	// T7.5 acceptance: status contract violations should be detected.
-	// The stub returns nil, so this test should fail because we expect violations
+	// T7.5 acceptance: the incomplete status above must trigger violations
 	// for missing Reconciled=False condition and missing per-ASG sync states.
 	if len(violations) == 0 {
 		t.Errorf("T7.5: ValidatePhase7StatusContract returned 0 violations; want > 0 for incomplete status")
