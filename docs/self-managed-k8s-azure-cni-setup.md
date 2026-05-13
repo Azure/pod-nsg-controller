@@ -1,4 +1,4 @@
-# Self-Managed Kubernetes Cluster with Azure CNI — Setup Guide
+il# Self-Managed Kubernetes Cluster with Azure CNI — Setup Guide
 
 This document captures the complete process and steps to create a self-managed Kubernetes cluster with Azure CNI (transparent bridge mode) on Azure VMs, including all issues encountered and their resolutions.
 
