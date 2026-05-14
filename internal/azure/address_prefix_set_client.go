@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/Azure/azure-sdk-for-go/sdk/azcore"
@@ -18,8 +19,12 @@ import (
 )
 
 const (
-	apiVersion = "2025-07-01"
-	armEndpoint    = "https://management.azure.com"
+	apiVersion  = "2025-07-01"
+	armEndpoint = "https://management.azure.com"
+
+	// tokenRefreshMargin is how long before expiry we proactively refresh the
+	// cached token, matching the Azure SDK's default behaviour.
+	tokenRefreshMargin = 5 * time.Minute
 )
 
 // AddressPrefixSet represents an address prefix set child resource of an ASG.
@@ -52,6 +57,11 @@ type AddressPrefixSetClient struct {
 	baseURL     string
 	retryPolicy RetryPolicy
 	rateLimiter SubscriptionRateLimiter
+
+	// Token cache — avoids a metadata-server round trip on every request.
+	tokenMu        sync.Mutex
+	cachedToken    string
+	tokenExpiresOn time.Time
 }
 
 // AddressPrefixSetClientOption configures an AddressPrefixSetClient.
@@ -103,12 +113,24 @@ func (c *AddressPrefixSetClient) acquireToken(ctx context.Context) (string, erro
 	if c.credential == nil {
 		return "", nil
 	}
+
+	c.tokenMu.Lock()
+	defer c.tokenMu.Unlock()
+
+	// Return cached token if still valid (with margin before expiry).
+	if c.cachedToken != "" && time.Now().Before(c.tokenExpiresOn.Add(-tokenRefreshMargin)) {
+		return c.cachedToken, nil
+	}
+
 	token, err := c.credential.GetToken(ctx, policy.TokenRequestOptions{
 		Scopes: []string{"https://management.azure.com/.default"},
 	})
 	if err != nil {
 		return "", errors.Wrap(err, "acquiring token")
 	}
+
+	c.cachedToken = token.Token
+	c.tokenExpiresOn = token.ExpiresOn
 	return token.Token, nil
 }
 

@@ -10,7 +10,10 @@ import (
 	"strings"
 	"sync/atomic"
 	"testing"
+	"time"
 
+	"github.com/Azure/azure-sdk-for-go/sdk/azcore"
+	"github.com/Azure/azure-sdk-for-go/sdk/azcore/policy"
 	"go.uber.org/zap/zaptest"
 )
 
@@ -650,5 +653,87 @@ func TestAddressPrefixSetClient_RetriesExhaustedReturnsLastError(t *testing.T) {
 	// 1 initial + 3 retries = 4 total
 	if got := calls.Load(); got != 4 {
 		t.Errorf("expected 4 total requests, got %d", got)
+	}
+}
+
+// fakeCredential is a test credential that counts GetToken calls.
+type fakeCredential struct {
+	calls     atomic.Int64
+	token     string
+	expiresOn time.Time
+}
+
+func (f *fakeCredential) GetToken(_ context.Context, _ policy.TokenRequestOptions) (azcore.AccessToken, error) {
+	f.calls.Add(1)
+	return azcore.AccessToken{Token: f.token, ExpiresOn: f.expiresOn}, nil
+}
+
+// TestAddressPrefixSetClient_AcquireToken_CachesUntilExpiry verifies that
+// acquireToken caches the token and only calls GetToken again when the
+// cached token is within the refresh margin of expiry.
+func TestAddressPrefixSetClient_AcquireToken_CachesUntilExpiry(t *testing.T) {
+	cred := &fakeCredential{
+		token:     "cached-token",
+		expiresOn: time.Now().Add(time.Hour), // expires far in the future
+	}
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("ETag", `"etag-1"`)
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"id":   "/subscriptions/sub1/resourceGroups/rg1/providers/Microsoft.Network/applicationSecurityGroups/asg1/addressPrefixSets/ps1",
+			"name": "ps1",
+			"properties": map[string]interface{}{
+				"addressPrefixSet": []string{"10.0.0.1/32"},
+			},
+		})
+	}))
+	defer srv.Close()
+
+	log := zaptest.NewLogger(t)
+	client := NewAddressPrefixSetClient(log, cred, srv.Client(), WithARMBaseURL(srv.URL))
+
+	ctx := context.Background()
+
+	// Multiple Get calls should reuse the cached token.
+	for i := 0; i < 5; i++ {
+		_, err := client.Get(ctx, "sub1", "rg1", "asg1", "ps1")
+		if err != nil {
+			t.Fatalf("Get[%d] returned error: %v", i, err)
+		}
+	}
+
+	// GetToken should have been called only once.
+	if got := cred.calls.Load(); got != 1 {
+		t.Errorf("expected 1 GetToken call (cached), got %d", got)
+	}
+}
+
+// TestAddressPrefixSetClient_AcquireToken_RefreshesExpiredToken verifies that
+// acquireToken refreshes the token when it is within the refresh margin.
+func TestAddressPrefixSetClient_AcquireToken_RefreshesExpiredToken(t *testing.T) {
+	cred := &fakeCredential{
+		token:     "refreshed-token",
+		expiresOn: time.Now().Add(time.Hour),
+	}
+
+	log := zaptest.NewLogger(t)
+	client := NewAddressPrefixSetClient(log, cred, nil, WithARMBaseURL("http://unused"))
+
+	// Seed the cache with an about-to-expire token.
+	client.cachedToken = "old-token"
+	client.tokenExpiresOn = time.Now().Add(2 * time.Minute) // within 5-min margin
+
+	ctx := context.Background()
+	token, err := client.acquireToken(ctx)
+	if err != nil {
+		t.Fatalf("acquireToken returned error: %v", err)
+	}
+
+	if token != "refreshed-token" {
+		t.Errorf("expected refreshed token, got %q", token)
+	}
+	if got := cred.calls.Load(); got != 1 {
+		t.Errorf("expected 1 GetToken call for refresh, got %d", got)
 	}
 }
