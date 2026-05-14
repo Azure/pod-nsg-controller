@@ -662,7 +662,7 @@ func TestIntegration_Executor_BoundedConcurrency(t *testing.T) {
 				SubscriptionID: "sub-conc", ResourceGroup: "rg-conc",
 				ASGName: "asg-conc", PrefixSetName: fmt.Sprintf("ps-%d", i),
 			},
-			DesiredIPs: []string{fmt.Sprintf("10.0.0.%d", i)},
+			DesiredIPs: []string{fmt.Sprintf("10.0.0.%d/32", i)},
 		})
 	}
 

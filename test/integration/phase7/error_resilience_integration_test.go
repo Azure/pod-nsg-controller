@@ -316,7 +316,7 @@ func TestExecutor_ErrorClassification_Pipeline(t *testing.T) {
 			}, tc.injectedErr, 1)
 
 			actions := []engine.Action{
-				{Kind: engine.CreatePrefixSet, Target: target, DesiredIPs: []string{"10.0.0.1"}},
+				{Kind: engine.CreatePrefixSet, Target: target, DesiredIPs: []string{"10.0.0.1/32"}},
 			}
 
 			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -393,7 +393,7 @@ func TestExecutor_PartialFailure_Pipeline(t *testing.T) {
 				ASGName:        "asg1",
 				PrefixSetName:  fmt.Sprintf("ps-%d", i),
 			},
-			DesiredIPs: []string{fmt.Sprintf("10.0.0.%d", i+1)},
+			DesiredIPs: []string{fmt.Sprintf("10.0.0.%d/32", i+1)},
 		}
 	}
 
@@ -507,7 +507,7 @@ func TestRetryAfterHint_Propagation_Pipeline(t *testing.T) {
 				ASGName:        "asg1",
 				PrefixSetName:  "ps1",
 			},
-			DesiredIPs: []string{"10.0.0.1"},
+			DesiredIPs: []string{"10.0.0.1/32"},
 		},
 	}
 
@@ -570,7 +570,7 @@ func TestRetryAfterHint_ClampedAt5Minutes(t *testing.T) {
 				ASGName:        "asg1",
 				PrefixSetName:  "ps1",
 			},
-			DesiredIPs: []string{"10.0.0.1"},
+			DesiredIPs: []string{"10.0.0.1/32"},
 		},
 	}
 
@@ -731,7 +731,7 @@ func TestRateLimiter_WithExecutor_NoDrop(t *testing.T) {
 				ASGName:        "asg1",
 				PrefixSetName:  fmt.Sprintf("ps-%d", i),
 			},
-			DesiredIPs: []string{fmt.Sprintf("10.0.0.%d", i+1)},
+			DesiredIPs: []string{fmt.Sprintf("10.0.0.%d/32", i+1)},
 		}
 	}
 
@@ -914,7 +914,7 @@ func TestEnvtest_Reconcile_TransientErrors_EventualConvergence(t *testing.T) {
 	if err != nil {
 		t.Fatalf("expected prefix set to exist: %v", err)
 	}
-	if len(ps.Properties.AddressPrefixes) != 1 || ps.Properties.AddressPrefixes[0] != "10.0.0.1" {
+	if len(ps.Properties.AddressPrefixes) != 1 || ps.Properties.AddressPrefixes[0] != "10.0.0.1/32" {
 		t.Errorf("prefix set IPs = %v, want [10.0.0.1]", ps.Properties.AddressPrefixes)
 	}
 }
@@ -1017,7 +1017,7 @@ func TestEnvtest_Reconcile_PartialFailure_StatusReflectsErrors(t *testing.T) {
 	if err != nil {
 		t.Fatalf("sub1 prefix set should exist: %v", err)
 	}
-	if len(ps.Properties.AddressPrefixes) != 1 || ps.Properties.AddressPrefixes[0] != "10.0.1.1" {
+	if len(ps.Properties.AddressPrefixes) != 1 || ps.Properties.AddressPrefixes[0] != "10.0.1.1/32" {
 		t.Errorf("sub1 prefix set IPs = %v, want [10.0.1.1]", ps.Properties.AddressPrefixes)
 	}
 
@@ -1138,7 +1138,7 @@ func TestExecutor_ConcurrentMixedErrors_Classification(t *testing.T) {
 				ASGName:        "asg1",
 				PrefixSetName:  fmt.Sprintf("ps-%d", i),
 			},
-			DesiredIPs: []string{fmt.Sprintf("10.0.0.%d", i+1)},
+			DesiredIPs: []string{fmt.Sprintf("10.0.0.%d/32", i+1)},
 		}
 	}
 
@@ -1273,7 +1273,7 @@ func TestPhase7_T75_Integration_ValidateStatusContract(t *testing.T) {
 					FullResourceID: fmt.Sprintf("/subscriptions/sub1/resourceGroups/rg1/providers/Microsoft.Network/applicationSecurityGroups/%s", asgOk),
 					PrefixSetName:  "pod-nsg-controller",
 				},
-				DesiredIPs: []string{"10.0.0.1"},
+				DesiredIPs: []string{"10.0.0.1/32"},
 			},
 			Err: nil,
 		},
@@ -1285,7 +1285,7 @@ func TestPhase7_T75_Integration_ValidateStatusContract(t *testing.T) {
 					FullResourceID: fmt.Sprintf("/subscriptions/sub1/resourceGroups/rg1/providers/Microsoft.Network/applicationSecurityGroups/%s", asgFail),
 					PrefixSetName:  "pod-nsg-controller",
 				},
-				DesiredIPs: []string{"10.0.0.2"},
+				DesiredIPs: []string{"10.0.0.2/32"},
 			},
 			Err: &azure.ARMStatusError{StatusCode: 500, ARMCode: "InternalServerError", Message: "transient"},
 		},
@@ -1297,7 +1297,7 @@ func TestPhase7_T75_Integration_ValidateStatusContract(t *testing.T) {
 					FullResourceID: fmt.Sprintf("/subscriptions/sub1/resourceGroups/rg1/providers/Microsoft.Network/applicationSecurityGroups/%s", asgPerm),
 					PrefixSetName:  "pod-nsg-controller",
 				},
-				DesiredIPs: []string{"10.0.0.3"},
+				DesiredIPs: []string{"10.0.0.3/32"},
 			},
 			Err: &azure.ARMStatusError{StatusCode: 403, ARMCode: "AuthorizationFailed", Message: "forbidden"},
 		},

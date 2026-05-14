@@ -468,7 +468,7 @@ func TestStatusUpdater_UpdateAfterReconcile_Success_WritesReconciledTrue(t *test
 	}
 	results := []azure.ActionResult{
 		{
-			Action:  engine.Action{Kind: engine.UpdatePrefixSet, Target: target, DesiredIPs: []string{"10.0.0.1"}},
+			Action:  engine.Action{Kind: engine.UpdatePrefixSet, Target: target, DesiredIPs: []string{"10.0.0.1/32"}},
 			Success: true,
 		},
 	}
@@ -561,7 +561,7 @@ func TestStatusUpdater_UpdateAfterReconcile_ActionFailure_WritesErrorState(t *te
 	}
 	results := []azure.ActionResult{
 		{
-			Action:  engine.Action{Kind: engine.UpdatePrefixSet, Target: target, DesiredIPs: []string{"10.0.0.1"}},
+			Action:  engine.Action{Kind: engine.UpdatePrefixSet, Target: target, DesiredIPs: []string{"10.0.0.1/32"}},
 			Success: false,
 			Err:     fmt.Errorf("ARM throttled"),
 		},
@@ -768,7 +768,7 @@ func TestComputeStatus_CrossModule_FailureAttribution(t *testing.T) {
 
 	failResults := []azure.ActionResult{
 		{
-			Action:  engine.Action{Kind: engine.UpdatePrefixSet, Target: target, DesiredIPs: []string{"10.0.0.1"}},
+			Action:  engine.Action{Kind: engine.UpdatePrefixSet, Target: target, DesiredIPs: []string{"10.0.0.1/32"}},
 			Success: false,
 			Err:     fmt.Errorf("throttled"),
 		},
@@ -837,7 +837,7 @@ func TestComputeStatus_CrossModule_SharedTarget_BothMappingsError(t *testing.T) 
 
 	results := []azure.ActionResult{
 		{
-			Action:  engine.Action{Kind: engine.UpdatePrefixSet, Target: target, DesiredIPs: []string{"10.0.0.1", "10.0.0.2"}},
+			Action:  engine.Action{Kind: engine.UpdatePrefixSet, Target: target, DesiredIPs: []string{"10.0.0.1/32", "10.0.0.2/32"}},
 			Success: false,
 			Err:     fmt.Errorf("conflict"),
 		},
@@ -1160,7 +1160,7 @@ func TestPhase6_FullReconcile_StatusUpdateFlow(t *testing.T) {
 	}
 	found := false
 	for _, ip := range ps.Properties.AddressPrefixes {
-		if ip == "10.0.0.42" {
+		if ip == "10.0.0.42/32" {
 			found = true
 			break
 		}
@@ -1321,7 +1321,7 @@ func TestStatusUpdater_PendingToFinal_TransitionViaEnvtest(t *testing.T) {
 		PrefixSetName:  prefixSetName,
 	}
 	results := []azure.ActionResult{
-		{Action: engine.Action{Kind: engine.UpdatePrefixSet, Target: target, DesiredIPs: []string{"10.0.0.1"}}, Success: true},
+		{Action: engine.Action{Kind: engine.UpdatePrefixSet, Target: target, DesiredIPs: []string{"10.0.0.1/32"}}, Success: true},
 	}
 	if err := updater.UpdateAfterReconcile(ctx, key, mapping.Generation, prefixSetName, results, nil, nil, []int{4}); err != nil {
 		t.Fatalf("UpdateAfterReconcile: %v", err)
@@ -1406,7 +1406,7 @@ func TestStatusUpdater_LastSyncTime_PreservedAcrossReconcileCyclesViaEnvtest(t *
 	}
 
 	successResults := []azure.ActionResult{
-		{Action: engine.Action{Kind: engine.UpdatePrefixSet, Target: target, DesiredIPs: []string{"10.0.0.1"}}, Success: true},
+		{Action: engine.Action{Kind: engine.UpdatePrefixSet, Target: target, DesiredIPs: []string{"10.0.0.1/32"}}, Success: true},
 	}
 	if err := updater.UpdateAfterReconcile(ctx, key, mapping.Generation, prefixSetName, successResults, nil, nil, []int{1}); err != nil {
 		t.Fatalf("cycle 1 UpdateAfterReconcile: %v", err)
@@ -1426,7 +1426,7 @@ func TestStatusUpdater_LastSyncTime_PreservedAcrossReconcileCyclesViaEnvtest(t *
 	updater.Now = func() metav1.Time { return t1 }
 
 	failResults := []azure.ActionResult{
-		{Action: engine.Action{Kind: engine.UpdatePrefixSet, Target: target, DesiredIPs: []string{"10.0.0.1"}}, Success: false, Err: fmt.Errorf("throttled")},
+		{Action: engine.Action{Kind: engine.UpdatePrefixSet, Target: target, DesiredIPs: []string{"10.0.0.1/32"}}, Success: false, Err: fmt.Errorf("throttled")},
 	}
 	if err := updater.UpdateAfterReconcile(ctx, key, mapping.Generation, prefixSetName, failResults, fmt.Errorf("throttled"), nil, []int{1}); err != nil {
 		t.Fatalf("cycle 2 UpdateAfterReconcile: %v", err)
@@ -1757,8 +1757,8 @@ func TestStatusUpdater_SelectorHashPreservation_AcrossReorder_ViaEnvtest(t *test
 
 	// Cycle 1: Both succeed at t0
 	results := []azure.ActionResult{
-		{Action: engine.Action{Kind: engine.UpdatePrefixSet, Target: target1, DesiredIPs: []string{"10.0.0.1"}}, Success: true},
-		{Action: engine.Action{Kind: engine.UpdatePrefixSet, Target: target2, DesiredIPs: []string{"10.0.0.2"}}, Success: true},
+		{Action: engine.Action{Kind: engine.UpdatePrefixSet, Target: target1, DesiredIPs: []string{"10.0.0.1/32"}}, Success: true},
+		{Action: engine.Action{Kind: engine.UpdatePrefixSet, Target: target2, DesiredIPs: []string{"10.0.0.2/32"}}, Success: true},
 	}
 	if err := updater.UpdateAfterReconcile(ctx, key, mapping.Generation, prefixSetName, results, nil, nil, []int{1, 1}); err != nil {
 		t.Fatalf("cycle 1 UpdateAfterReconcile: %v", err)
