@@ -184,3 +184,31 @@ func TestClientFactory_PropagatesRateLimiterToClient(t *testing.T) {
 		t.Error("expected client to have non-nil rateLimiter after factory propagation")
 	}
 }
+
+// TestClientFactory_WithDefaultCredential_WireserverOverride verifies that
+// NewClientFactoryWithDefaultCredential uses wireserverCredential when
+// USE_WIRESERVER_IDENTITY=true, ensuring testops and other eager callers
+// get the same wireserver fallback as the lazy NewClientFactory path.
+func TestClientFactory_WithDefaultCredential_WireserverOverride(t *testing.T) {
+	t.Setenv("USE_WIRESERVER_IDENTITY", "true")
+
+	log := zaptest.NewLogger(t)
+	factory, err := NewClientFactoryWithDefaultCredential(log, nil)
+	if err != nil {
+		t.Fatalf("NewClientFactoryWithDefaultCredential returned error: %v", err)
+	}
+
+	client, err := factory.ForSubscription("sub-ws-test")
+	if err != nil {
+		t.Fatalf("ForSubscription returned error: %v", err)
+	}
+
+	apsClient, ok := client.(*AddressPrefixSetClient)
+	if !ok {
+		t.Fatalf("expected *AddressPrefixSetClient, got %T", client)
+	}
+
+	if _, ok := apsClient.credential.(*wireserverCredential); !ok {
+		t.Errorf("expected wireserverCredential, got %T", apsClient.credential)
+	}
+}

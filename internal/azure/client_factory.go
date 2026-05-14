@@ -156,17 +156,29 @@ func NewClientFactoryWithCredential(log *zap.Logger, credential azcore.TokenCred
 	return f
 }
 
-// NewClientFactoryWithDefaultCredential creates a ClientFactory using DefaultAzureCredential eagerly.
+// NewClientFactoryWithDefaultCredential creates a ClientFactory that eagerly
+// resolves the credential. If USE_WIRESERVER_IDENTITY=true, the wireserver
+// credential is used instead of DefaultAzureCredential.
 func NewClientFactoryWithDefaultCredential(log *zap.Logger, httpClient *http.Client, opts ...ClientFactoryOption) (*ClientFactory, error) {
-	cred, err := azidentity.NewDefaultAzureCredential(nil)
-	if err != nil {
-		return nil, errors.Wrap(err, "creating DefaultAzureCredential")
+	var cred azcore.TokenCredential
+	if os.Getenv("USE_WIRESERVER_IDENTITY") == "true" {
+		log.Info("USE_WIRESERVER_IDENTITY enabled, acquiring tokens directly from wireserver 168.63.129.16")
+		cred = &wireserverCredential{
+			client: &http.Client{Timeout: 30 * time.Second},
+		}
+	} else {
+		defaultCred, err := azidentity.NewDefaultAzureCredential(nil)
+		if err != nil {
+			return nil, errors.Wrap(err, "creating DefaultAzureCredential")
+		}
+		cred = defaultCred
 	}
 	f := &ClientFactory{
-		log:        log,
-		credential: cred,
-		httpClient: httpClient,
-		clients:    make(map[string]AddressPrefixSetAPI),
+		log:          log,
+		credential:   cred,
+		httpClient:   httpClient,
+		credExplicit: true,
+		clients:      make(map[string]AddressPrefixSetAPI),
 	}
 	for _, opt := range opts {
 		opt(f)
