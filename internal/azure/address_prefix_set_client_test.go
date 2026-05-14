@@ -114,6 +114,74 @@ func TestAddressPrefixSetClient_Get_EmptyListEnvelopeReturnsNotFound(t *testing.
 	}
 }
 
+// TestAddressPrefixSetClient_Get_ListEnvelopeWithOneResource verifies that
+// Get correctly extracts an AddressPrefixSet from a list envelope {"value":[...]}
+// containing a single resource, which is the production POC behavior where
+// single-resource GET returns a list envelope instead of a bare object.
+func TestAddressPrefixSetClient_Get_ListEnvelopeWithOneResource(t *testing.T) {
+	expectedID := "/subscriptions/sub1/resourceGroups/rg1/providers/Microsoft.Network/applicationSecurityGroups/asg1/addressPrefixSets/ps1"
+	expectedName := "ps1"
+	expectedETag := `"list-envelope-etag"`
+	expectedIPs := []string{"10.0.0.1/32", "10.0.0.2/32"}
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("ETag", expectedETag)
+		w.Header().Set("Content-Type", "application/json")
+		// ARM returns list envelope for single-resource GET
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"value": []map[string]interface{}{
+				{
+					"id":   expectedID,
+					"name": expectedName,
+					"etag": `"body-etag-ignored"`,
+					"type": "Microsoft.Network/applicationSecurityGroups/addressPrefixSets",
+					"properties": map[string]interface{}{
+						"addressPrefixSet":  expectedIPs,
+						"provisioningState": "Succeeded",
+					},
+				},
+			},
+		})
+	}))
+	defer srv.Close()
+
+	log := zaptest.NewLogger(t)
+	client := NewAddressPrefixSetClient(log, nil, srv.Client(), WithARMBaseURL(srv.URL))
+
+	result, err := client.Get(context.Background(), "sub1", "rg1", "asg1", "ps1")
+	if err != nil {
+		t.Fatalf("Get returned unexpected error: %v", err)
+	}
+
+	if result.ID == nil || *result.ID != expectedID {
+		t.Errorf("expected ID %q, got %v", expectedID, result.ID)
+	}
+	if result.Name == nil || *result.Name != expectedName {
+		t.Errorf("expected Name %q, got %v", expectedName, result.Name)
+	}
+	// Header ETag takes precedence over body etag
+	if result.Etag == nil || *result.Etag != expectedETag {
+		t.Errorf("expected ETag %q, got %v", expectedETag, result.Etag)
+	}
+	if result.Type == nil || *result.Type != "Microsoft.Network/applicationSecurityGroups/addressPrefixSets" {
+		t.Errorf("expected Type field, got %v", result.Type)
+	}
+	if result.Properties == nil {
+		t.Fatal("expected non-nil Properties")
+	}
+	if len(result.Properties.AddressPrefixes) != len(expectedIPs) {
+		t.Fatalf("expected %d address prefixes, got %d", len(expectedIPs), len(result.Properties.AddressPrefixes))
+	}
+	for i, ip := range expectedIPs {
+		if result.Properties.AddressPrefixes[i] != ip {
+			t.Errorf("expected prefix[%d] = %q, got %q", i, ip, result.Properties.AddressPrefixes[i])
+		}
+	}
+	if result.Properties.ProvisioningState == nil || *result.Properties.ProvisioningState != "Succeeded" {
+		t.Errorf("expected ProvisioningState 'Succeeded', got %v", result.Properties.ProvisioningState)
+	}
+}
+
 // TestAddressPrefixSetClient_Put_UsesIfMatchForExisting verifies that
 // Put sends If-Match header with ETag for resources confirmed to exist.
 func TestAddressPrefixSetClient_Put_UsesIfMatchForExisting(t *testing.T) {
