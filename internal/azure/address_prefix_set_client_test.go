@@ -38,7 +38,7 @@ func TestAddressPrefixSetClient_Get_UsesHeaderETagOverBodyETag(t *testing.T) {
 			"name": "ps1",
 			"etag": bodyETag,
 			"properties": map[string]interface{}{
-				"addressPrefixes": []string{"10.0.0.1/32"},
+				"addressPrefixSet": []string{"10.0.0.1/32"},
 			},
 		})
 	}))
@@ -73,7 +73,7 @@ func TestAddressPrefixSetClient_Get_MissingETagReturnsErrMissingETag(t *testing.
 			"id":   "/subscriptions/sub1/resourceGroups/rg1/providers/Microsoft.Network/applicationSecurityGroups/asg1/addressPrefixSets/ps1",
 			"name": "ps1",
 			"properties": map[string]interface{}{
-				"addressPrefixes": []string{"10.0.0.1/32"},
+				"addressPrefixSet": []string{"10.0.0.1/32"},
 			},
 		})
 	}))
@@ -88,6 +88,29 @@ func TestAddressPrefixSetClient_Get_MissingETagReturnsErrMissingETag(t *testing.
 	}
 	if !strings.Contains(err.Error(), "missing etag") {
 		t.Errorf("expected ErrMissingETag, got: %v", err)
+	}
+}
+
+// TestAddressPrefixSetClient_Get_EmptyListEnvelopeReturnsNotFound verifies
+// that Get returns ErrNotFound when the ARM API returns HTTP 200 with a
+// list envelope (e.g. {"value":[]}) instead of a 404 for a missing resource.
+func TestAddressPrefixSetClient_Get_EmptyListEnvelopeReturnsNotFound(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		// ARM returns list envelope instead of 404 for non-existent resource
+		w.Write([]byte(`{"value":[]}`))
+	}))
+	defer srv.Close()
+
+	log := zaptest.NewLogger(t)
+	client := NewAddressPrefixSetClient(log, nil, srv.Client(), WithARMBaseURL(srv.URL))
+
+	_, err := client.Get(context.Background(), "sub1", "rg1", "asg1", "ps1")
+	if err == nil {
+		t.Fatal("expected error, got nil")
+	}
+	if !errors.Is(err, ErrNotFound) {
+		t.Errorf("expected ErrNotFound, got: %v", err)
 	}
 }
 
@@ -114,7 +137,7 @@ func TestAddressPrefixSetClient_Put_UsesIfMatchForExisting(t *testing.T) {
 			"name": "ps1",
 			"etag": `"existing-etag"`,
 			"properties": map[string]interface{}{
-				"addressPrefixes": []string{},
+				"addressPrefixSet": []string{},
 			},
 		})
 	}))
@@ -237,7 +260,7 @@ func TestAddressPrefixSetClient_Put_PollsLROBeforeSuccess(t *testing.T) {
 			"name": "ps1",
 			"etag": `"etag1"`,
 			"properties": map[string]interface{}{
-				"addressPrefixes": []string{"10.0.0.1/32"},
+				"addressPrefixSet": []string{"10.0.0.1/32"},
 			},
 		})
 	}))
@@ -314,7 +337,7 @@ func TestAddressPrefixSetClient_Delete_NotFoundIsSuccess(t *testing.T) {
 }
 
 // TestAddressPrefixSetClient_Put_EmptyIPListSerializesAddressPrefixesEmptyArray verifies
-// T4.10: Put with empty IP list serializes as "addressPrefixes":[] not omitted.
+// T4.10: Put with empty IP list serializes as "addressPrefixSet":[] not omitted.
 func TestAddressPrefixSetClient_Put_EmptyIPListSerializesAddressPrefixesEmptyArray(t *testing.T) {
 	var capturedBody []byte
 
@@ -351,9 +374,9 @@ func TestAddressPrefixSetClient_Put_EmptyIPListSerializesAddressPrefixesEmptyArr
 	}
 
 	bodyStr := string(capturedBody)
-	// The body must contain "addressPrefixes":[] and NOT omit the field
-	if !strings.Contains(bodyStr, `"addressPrefixes":[]`) &&
-		!strings.Contains(bodyStr, `"addressPrefixes": []`) {
+	// The body must contain "addressPrefixSet":[] and NOT omit the field
+	if !strings.Contains(bodyStr, `"addressPrefixSet":[]`) &&
+		!strings.Contains(bodyStr, `"addressPrefixSet": []`) {
 		t.Errorf("expected PUT body to contain addressPrefixes as empty array, got: %s", bodyStr)
 	}
 }
@@ -370,7 +393,7 @@ func TestAddressPrefixSetClient_Get_CopiesResolvedETagOntoResult(t *testing.T) {
 			"id":   "/subscriptions/sub1/resourceGroups/rg1/providers/Microsoft.Network/applicationSecurityGroups/asg1/addressPrefixSets/ps1",
 			"name": "ps1",
 			"properties": map[string]interface{}{
-				"addressPrefixes": []string{"10.0.0.1/32"},
+				"addressPrefixSet": []string{"10.0.0.1/32"},
 			},
 		})
 	}))
@@ -410,7 +433,7 @@ func TestAddressPrefixSetClient_NilCredentialSkipsAuthorizationAndUsesInjectedHT
 			"name": "ps1",
 			"etag": `"etag-1"`,
 			"properties": map[string]interface{}{
-				"addressPrefixes": []string{"10.0.0.1/32"},
+				"addressPrefixSet": []string{"10.0.0.1/32"},
 			},
 		})
 	}))
@@ -505,7 +528,7 @@ func TestAddressPrefixSetClient_RetriesTransientThenSucceeds(t *testing.T) {
 			"id":   "/subscriptions/sub1/resourceGroups/rg1/providers/Microsoft.Network/applicationSecurityGroups/asg1/addressPrefixSets/ps1",
 			"name": "ps1",
 			"properties": map[string]interface{}{
-				"addressPrefixes": []string{"10.0.0.1/32"},
+				"addressPrefixSet": []string{"10.0.0.1/32"},
 			},
 		})
 	}))

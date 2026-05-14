@@ -1,6 +1,9 @@
 package engine
 
 import (
+	"net"
+	"strings"
+
 	v1alpha1 "github.com/Azure/pod-nsg-controller/api/v1alpha1"
 	"github.com/Azure/pod-nsg-controller/internal/model"
 	corev1 "k8s.io/api/core/v1"
@@ -47,7 +50,7 @@ func ComputeDesiredState(
 					continue
 				}
 				if pod.Status.PodIP != "" {
-					matchedIPs = append(matchedIPs, pod.Status.PodIP)
+					matchedIPs = append(matchedIPs, toCIDR(pod.Status.PodIP))
 				}
 			}
 
@@ -86,4 +89,16 @@ func ComputeDesiredState(
 		result[entry.target] = DesiredPrefixSet{IPs: entry.ips}
 	}
 	return result
+}
+
+// toCIDR converts a bare IP address to CIDR notation (/32 for IPv4, /128 for IPv6).
+// If the IP already contains a slash (CIDR), it is returned as-is.
+func toCIDR(ip string) string {
+	if strings.Contains(ip, "/") {
+		return ip
+	}
+	if parsed := net.ParseIP(ip); parsed != nil && parsed.To4() == nil {
+		return ip + "/128"
+	}
+	return ip + "/32"
 }

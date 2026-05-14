@@ -33,7 +33,7 @@ type AddressPrefixSet struct {
 
 // AddressPrefixSetProperties contains the properties of an address prefix set.
 type AddressPrefixSetProperties struct {
-	AddressPrefixes   []string `json:"addressPrefixes"` // no omitempty (T4.10)
+	AddressPrefixes   []string `json:"addressPrefixSet"` // NRP internal property name (differs from swagger "addressPrefixes")
 	ProvisioningState *string  `json:"provisioningState,omitempty"`
 }
 
@@ -44,7 +44,7 @@ type AddressPrefixSetListResult struct {
 }
 
 // AddressPrefixSetClient manages AddressPrefixSet operations using direct REST calls
-// against the 2026-01-01 API version. It implements AddressPrefixSetAPI.
+// against the 2025-07-01 API version. It implements AddressPrefixSetAPI.
 type AddressPrefixSetClient struct {
 	log         *zap.Logger
 	credential  azcore.TokenCredential // nil allowed for tests
@@ -265,8 +265,25 @@ func (c *AddressPrefixSetClient) Get(ctx context.Context, subscriptionID, resour
 	}
 
 	var result AddressPrefixSet
-	if err := json.Unmarshal(body, &result); err != nil {
-		return nil, errors.Wrap(err, "decoding response")
+
+	// The ARM API returns a list envelope {"value":[...]} for both single-resource
+	// GET and list operations. Try to extract the resource from the list first.
+	var listResult AddressPrefixSetListResult
+	if err := json.Unmarshal(body, &listResult); err == nil && listResult.Value != nil {
+		if len(listResult.Value) == 0 {
+			return nil, errors.Wrapf(ErrNotFound, "GET AddressPrefixSet %s returned empty list", prefixSetName)
+		}
+		result = listResult.Value[0]
+	} else {
+		// Fallback: try direct unmarshal (future API versions may return a single object)
+		if err := json.Unmarshal(body, &result); err != nil {
+			return nil, errors.Wrap(err, "decoding response")
+		}
+	}
+
+	// If the response still has no identity fields, treat as not found.
+	if result.ID == nil && result.Name == nil {
+		return nil, errors.Wrapf(ErrNotFound, "GET AddressPrefixSet %s returned empty resource", prefixSetName)
 	}
 
 	// Resolve ETag: header takes precedence over body
