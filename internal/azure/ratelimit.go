@@ -67,14 +67,15 @@ func WithMaxSubscriptions(n int) ARMRateLimiterOption {
 
 // ARMRateLimiter provides per-subscription token-bucket rate limiting.
 type ARMRateLimiter struct {
-	log      *zap.Logger
-	rps      float64
-	burst    int
-	clock    RateLimitClock
-	maxSubs  int
-	reserve  func(*rate.Limiter, time.Time, int) rateReservation
-	mu       sync.Mutex
-	limiters map[string]*rate.Limiter
+	log               *zap.Logger
+	rps               float64
+	burst             int
+	clock             RateLimitClock
+	maxSubs           int
+	reserve           func(*rate.Limiter, time.Time, int) rateReservation
+	rateLimitObserver armRateLimitObserver
+	mu                sync.Mutex
+	limiters          map[string]*rate.Limiter
 }
 
 type rateReservation interface {
@@ -184,6 +185,11 @@ func (l *ARMRateLimiter) Wait(ctx context.Context, subscriptionID string) error 
 
 	if delay <= 0 {
 		return nil
+	}
+
+	// Emit rate limit delay metric for positive delays only
+	if l.rateLimitObserver != nil {
+		l.rateLimitObserver.ObserveRateLimitDelay(subscriptionID, delay)
 	}
 
 	l.log.Debug("rate limiter throttling request",

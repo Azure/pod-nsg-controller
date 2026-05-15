@@ -25,6 +25,10 @@ type MappingStatusUpdater struct {
 	Logger      logr.Logger
 	Now         func() metav1.Time
 	MaxAttempts int
+
+	// convergenceCommitter is invoked after a successful status write or
+	// semantic no-op to commit convergence metrics. Set via SetConvergenceCommitter.
+	convergenceCommitter ConvergenceCommitter
 }
 
 // NewMappingStatusUpdater creates a MappingStatusUpdater with sensible defaults.
@@ -129,6 +133,9 @@ func (u *MappingStatusUpdater) UpdateAfterReconcile(
 		})
 
 		if statusSemanticEqual(mapping.Status, newStatus) {
+			if u.convergenceCommitter != nil {
+				u.convergenceCommitter(key, observedGeneration, results)
+			}
 			return nil
 		}
 
@@ -143,6 +150,9 @@ func (u *MappingStatusUpdater) UpdateAfterReconcile(
 				continue
 			}
 			return errors.Wrap(err, "updating final status")
+		}
+		if u.convergenceCommitter != nil {
+			u.convergenceCommitter(key, observedGeneration, results)
 		}
 		return nil
 	}

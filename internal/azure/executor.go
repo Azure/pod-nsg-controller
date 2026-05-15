@@ -32,23 +32,28 @@ func armOperation(kind engine.ActionKind) ARMOperation {
 
 // Executor runs engine actions against Azure with bounded concurrency and ETag retry.
 type Executor struct {
-	log         *zap.Logger
-	factory     AddressPrefixSetClientFactory
-	maxParallel int
-	maxRetries  int
+	log           *zap.Logger
+	factory       AddressPrefixSetClientFactory
+	maxParallel   int
+	maxRetries    int
+	retryObserver armRetryObserver
 }
 
 // NewExecutor creates an Executor with the given concurrency bound.
-func NewExecutor(log *zap.Logger, factory AddressPrefixSetClientFactory, maxParallel int) *Executor {
+func NewExecutor(log *zap.Logger, factory AddressPrefixSetClientFactory, maxParallel int, opts ...ExecutorOption) *Executor {
 	if maxParallel < 1 {
 		maxParallel = 1
 	}
-	return &Executor{
+	e := &Executor{
 		log:         log,
 		factory:     factory,
 		maxParallel: maxParallel,
 		maxRetries:  3,
 	}
+	for _, opt := range opts {
+		opt(e)
+	}
+	return e
 }
 
 // Execute runs all actions with bounded parallelism and returns results in input order.
@@ -117,6 +122,11 @@ func (e *Executor) executeWithETagRetry(ctx context.Context, client AddressPrefi
 		}
 		if !IsPreconditionFailed(err) {
 			return err
+		}
+
+		// Emit etag-conflict retry metric
+		if e.retryObserver != nil {
+			e.retryObserver.ObserveRetry(action.Target.SubscriptionID, string(armOperation(action.Kind)), "etag-conflict")
 		}
 
 		if attempt == e.maxRetries {

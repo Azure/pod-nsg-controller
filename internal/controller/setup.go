@@ -5,9 +5,11 @@ import (
 	"sync/atomic"
 
 	v1alpha1 "github.com/Azure/pod-nsg-controller/api/v1alpha1"
+	"github.com/Azure/pod-nsg-controller/internal/metrics"
 	corev1 "k8s.io/api/core/v1"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/builder"
+	ctrlcontroller "sigs.k8s.io/controller-runtime/pkg/controller"
 )
 
 // controllerSeq provides unique controller names to avoid prometheus metrics
@@ -24,9 +26,17 @@ func (r *MappingReconciler) SetupWithManager(mgr ctrl.Manager) error {
 
 	name := fmt.Sprintf("podasgmapping-%d", atomic.AddInt64(&controllerSeq, 1))
 
-	return ctrl.NewControllerManagedBy(mgr).
+	b := ctrl.NewControllerManagedBy(mgr).
 		Named(name).
 		For(&v1alpha1.PodASGMapping{}, builder.WithPredicates(MappingPredicate())).
-		Watches(&corev1.Pod{}, podHandler, builder.WithPredicates(PodPredicate())).
-		Complete(r)
+		Watches(&corev1.Pod{}, podHandler, builder.WithPredicates(PodPredicate()))
+
+	// Wire instrumented queue factory if metrics are available.
+	if r.MetricsRecorder != nil {
+		b = b.WithOptions(ctrlcontroller.Options{
+			NewQueue: metrics.NewInstrumentedQueueFactory(r.MetricsRecorder.Reconcile),
+		})
+	}
+
+	return b.Complete(r)
 }

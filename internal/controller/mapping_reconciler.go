@@ -21,6 +21,7 @@ import (
 	v1alpha1 "github.com/Azure/pod-nsg-controller/api/v1alpha1"
 	"github.com/Azure/pod-nsg-controller/internal/azure"
 	"github.com/Azure/pod-nsg-controller/internal/engine"
+	"github.com/Azure/pod-nsg-controller/internal/metrics"
 	"github.com/Azure/pod-nsg-controller/internal/model"
 )
 
@@ -48,6 +49,12 @@ type MappingReconciler struct {
 	PrefixSetFactory azure.AddressPrefixSetClientFactory
 	Executor         Executor
 	StatusUpdater    StatusUpdater
+
+	// Metrics instrumentation (all optional; nil disables the metric path).
+	MetricsRecorder      *metrics.Recorder
+	PodChurnTracker      *metrics.PodChurnTracker
+	ConvergenceTracker   *metrics.ConvergenceTracker
+	InitialTracker       *metrics.InitialReconcileTracker
 }
 
 const (
@@ -62,6 +69,7 @@ const (
 
 // Reconcile is the main reconcile loop for PodASGMapping objects.
 func (r *MappingReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
+	reconcileStart := time.Now()
 	logger := log.FromContext(ctx).WithValues(
 		"mapping", req.Name,
 		"namespace", req.Namespace,
@@ -70,9 +78,14 @@ func (r *MappingReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 	var mapping v1alpha1.PodASGMapping
 	if err := r.Get(ctx, req.NamespacedName, &mapping); err != nil {
 		if apierrors.IsNotFound(err) {
+			r.markInitialTerminal(req.NamespacedName, true)
+			r.cleanupPerMappingMetricState(req.NamespacedName)
+			r.observeReconcile(req, ReconcileStageMappingNotFound, reconcileStart, 0)
 			return ctrl.Result{}, nil
 		}
-		return r.finalizeSystemError(ctx, req, nil, "", nil, "fetch-mapping", err, false, logger)
+		result, retErr := r.finalizeSystemError(ctx, req, nil, "", nil, "fetch-mapping", err, false, logger)
+		r.observeReconcile(req, ReconcileStageSystemError, reconcileStart, 0)
+		return result, retErr
 	}
 
 	logger = logger.WithValues(
@@ -86,32 +99,47 @@ func (r *MappingReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 	if mapping.DeletionTimestamp != nil {
 		if controllerutil.ContainsFinalizer(&mapping, CleanupFinalizer) {
 			if err := r.reconcileDelete(ctx, &mapping, ownershipKey, logger); err != nil {
-				return r.finalizeSystemError(ctx, req, &mapping, ownershipKey, nil, "delete-cleanup", err, false, logger)
+				result, retErr := r.finalizeSystemError(ctx, req, &mapping, ownershipKey, nil, "delete-cleanup", err, false, logger)
+				r.observeReconcile(req, ReconcileStageSystemError, reconcileStart, 0)
+				return result, retErr
 			}
 			// Remove CleanupFinalizer on success.
 			patch := client.MergeFrom(mapping.DeepCopy())
 			controllerutil.RemoveFinalizer(&mapping, CleanupFinalizer)
 			if err := r.Patch(ctx, &mapping, patch); err != nil {
-				return r.finalizeSystemError(ctx, req, &mapping, ownershipKey, nil, "delete-remove-finalizer", err, false, logger)
+				result, retErr := r.finalizeSystemError(ctx, req, &mapping, ownershipKey, nil, "delete-remove-finalizer", err, false, logger)
+				r.observeReconcile(req, ReconcileStageSystemError, reconcileStart, 0)
+				return result, retErr
 			}
+			r.markInitialTerminal(req.NamespacedName, true)
+			r.cleanupPerMappingMetricState(req.NamespacedName)
+			r.observeReconcile(req, ReconcileStageDeleteComplete, reconcileStart, 0)
 			return ctrl.Result{}, nil
 		}
+		r.markInitialTerminal(req.NamespacedName, true)
+		r.cleanupPerMappingMetricState(req.NamespacedName)
+		r.observeReconcile(req, ReconcileStageDeleteComplete, reconcileStart, 0)
 		return ctrl.Result{}, nil
 	}
 
 	// Ensure finalizer. If added, return immediately with Requeue: true.
 	added, err := r.ensureFinalizer(ctx, &mapping)
 	if err != nil {
-		return r.finalizeSystemError(ctx, req, &mapping, ownershipKey, nil, "ensure-finalizer", err, false, logger)
+		result, retErr := r.finalizeSystemError(ctx, req, &mapping, ownershipKey, nil, "ensure-finalizer", err, false, logger)
+		r.observeReconcile(req, ReconcileStageSystemError, reconcileStart, 0)
+		return result, retErr
 	}
 	if added {
+		r.observeReconcile(req, ReconcileStageFinalizerAddEarlyReturn, reconcileStart, 0)
 		return ctrl.Result{Requeue: true}, nil
 	}
 
 	// List pods in mapping namespace.
 	var podList corev1.PodList
 	if err := r.List(ctx, &podList, client.InNamespace(mapping.Namespace)); err != nil {
-		return r.finalizeSystemError(ctx, req, &mapping, ownershipKey, nil, "list-pods", err, true, logger)
+		result, retErr := r.finalizeSystemError(ctx, req, &mapping, ownershipKey, nil, "list-pods", err, true, logger)
+		r.observeReconcile(req, ReconcileStageSystemError, reconcileStart, 0)
+		return result, retErr
 	}
 
 	// Compute matched pods per mapping index.
@@ -126,14 +154,15 @@ func (r *MappingReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 			statusErr := r.StatusUpdater.UpdateAfterReconcile(ctx, req.NamespacedName, mapping.Generation, ownershipKey, nil, validationErr, validationIssues, matchedPodsByIndex)
 			if statusErr != nil {
 				if errors.Is(statusErr, ErrStatusObjectNotFound) || errors.Is(statusErr, ErrStatusStaleGeneration) {
+					r.markInitialTerminal(req.NamespacedName, true)
+					r.observeReconcile(req, ReconcileStageStatusSentinelTerminal, reconcileStart, 0)
 					return ctrl.Result{}, nil
 				}
 				logger.Error(statusErr, "failed to update status for validation failure")
 			}
 		}
-		// Return nil error: validation failures are deterministic and retrying
-		// won't help. Status has been updated; a watch event will trigger
-		// reconciliation when the user fixes the spec.
+		r.markInitialTerminal(req.NamespacedName, true)
+		r.observeReconcile(req, ReconcileStageValidationTerminal, reconcileStart, 0)
 		return ctrl.Result{}, nil
 	}
 
@@ -141,6 +170,8 @@ func (r *MappingReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 	if r.StatusUpdater != nil {
 		if pendingErr := r.StatusUpdater.UpdatePending(ctx, req.NamespacedName, mapping.Generation, ownershipKey, matchedPodsByIndex); pendingErr != nil {
 			if errors.Is(pendingErr, ErrStatusObjectNotFound) || errors.Is(pendingErr, ErrStatusStaleGeneration) {
+				r.markInitialTerminal(req.NamespacedName, true)
+				r.observeReconcile(req, ReconcileStageStatusSentinelTerminal, reconcileStart, 0)
 				return ctrl.Result{}, nil
 			}
 			logger.Error(pendingErr, "failed to update pending status, continuing")
@@ -148,7 +179,11 @@ func (r *MappingReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 	}
 
 	// Compute desired state for this mapping.
+	crdResolutionStart := time.Now()
 	desired := engine.ComputeDesiredState(r.ClusterName, []v1alpha1.PodASGMapping{mapping}, podList.Items)
+
+	// Observe pod churn.
+	r.observePodChurn(req.NamespacedName, mapping, podList.Items)
 
 	// Filter out targets with no desired IPs to avoid creating empty prefix sets
 	// (e.g., when pods haven't received IPs yet). Owned-but-empty targets are
@@ -164,7 +199,9 @@ func (r *MappingReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 	// Load ownership annotation (fail closed on parse error).
 	ownedRefs, err := LoadOwnedASGs(&mapping)
 	if err != nil {
-		return r.finalizeSystemError(ctx, req, &mapping, ownershipKey, matchedPodsByIndex, "parse-owned-annotation", err, true, logger)
+		result, retErr := r.finalizeSystemError(ctx, req, &mapping, ownershipKey, matchedPodsByIndex, "parse-owned-annotation", err, true, logger)
+		r.observeReconcile(req, ReconcileStageSystemError, reconcileStart, 0)
+		return result, retErr
 	}
 
 	ownedTargets := TargetsFromOwnedASGs(ownedRefs, ownershipKey)
@@ -186,7 +223,9 @@ func (r *MappingReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 	// Fetch actual state from Azure.
 	actual, err := r.listActualForTargets(ctx, allTargets)
 	if err != nil {
-		return r.finalizeSystemError(ctx, req, &mapping, ownershipKey, matchedPodsByIndex, "list-actual-state", err, true, logger)
+		result, retErr := r.finalizeSystemError(ctx, req, &mapping, ownershipKey, matchedPodsByIndex, "list-actual-state", err, true, logger)
+		r.observeReconcile(req, ReconcileStageSystemError, reconcileStart, 0)
+		return result, retErr
 	}
 
 	// Ensure owned-but-no-longer-desired targets appear in actual so the diff
@@ -203,8 +242,21 @@ func (r *MappingReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 
 	// Compute diff and execute.
 	actions := engine.ComputeDiff(desired, actual)
+	crdResolutionDuration := time.Since(crdResolutionStart)
+
+	// Record CRD resolution metric.
+	if r.MetricsRecorder != nil {
+		op := ClassifyCRDResolutionOperation(actions)
+		r.MetricsRecorder.Reconcile.ObserveCRDResolution(req.Namespace, req.Name, op, crdResolutionDuration)
+	}
 
 	logger.V(1).Info("computed diff", "actionCount", len(actions))
+
+	// Detect drift: actual state has IPs not in desired state.
+	r.detectAndRecordDrift(desired, actual)
+
+	// Start convergence tracking for targets with changes.
+	r.startConvergenceTracking(req.NamespacedName, actions, desired, actual)
 
 	// Pre-update ownership annotation before executing Azure actions. This
 	// ensures the resourceVersion bump (from adding newly-desired targets)
@@ -214,10 +266,14 @@ func (r *MappingReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 	if ownershipAnnotationChanged(ownedRefs, preRefs) {
 		patch := client.MergeFrom(mapping.DeepCopy())
 		if err := StoreOwnedASGs(&mapping, preRefs); err != nil {
-			return r.finalizeSystemError(ctx, req, &mapping, ownershipKey, matchedPodsByIndex, "store-owned-pre", err, true, logger)
+			result, retErr := r.finalizeSystemError(ctx, req, &mapping, ownershipKey, matchedPodsByIndex, "store-owned-pre", err, true, logger)
+			r.observeReconcile(req, ReconcileStageSystemError, reconcileStart, 0)
+			return result, retErr
 		}
 		if err := r.Patch(ctx, &mapping, patch); err != nil {
-			return r.finalizeSystemError(ctx, req, &mapping, ownershipKey, matchedPodsByIndex, "patch-owned-pre", err, true, logger)
+			result, retErr := r.finalizeSystemError(ctx, req, &mapping, ownershipKey, matchedPodsByIndex, "patch-owned-pre", err, true, logger)
+			r.observeReconcile(req, ReconcileStageSystemError, reconcileStart, 0)
+			return result, retErr
 		}
 	}
 
@@ -225,6 +281,25 @@ func (r *MappingReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 	if len(actions) > 0 {
 		results = r.Executor.Execute(ctx, actions)
 	}
+
+	// Record actions-per-cycle and per-action outcomes.
+	if r.MetricsRecorder != nil {
+		r.MetricsRecorder.Reconcile.ObserveActionsPerCycle(req.Namespace, req.Name, len(actions))
+		for _, res := range results {
+			resultLabel := "success"
+			if !res.Success {
+				resultLabel = "failure"
+			}
+			r.MetricsRecorder.Convergence.RecordPrefixSetAction(actionKindToOperationLabel(res.Action.Kind), resultLabel)
+		}
+	}
+
+	// Stage convergence for successful ARM actions.
+	r.stageConvergenceResults(req.NamespacedName, results)
+
+	// Commit convergence immediately after ARM success — the duration measures
+	// detection→ARM-PUT-success, independent of status-write outcome.
+	r.commitConvergence(req.NamespacedName, results)
 
 	// Aggregate failures.
 	reconcileErr := aggregateActionFailures(results)
@@ -247,10 +322,14 @@ func (r *MappingReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 		if ownershipAnnotationChanged(preRefs, postRefs) {
 			patch := client.MergeFrom(mapping.DeepCopy())
 			if err := StoreOwnedASGs(&mapping, postRefs); err != nil {
-				return r.finalizeSystemError(ctx, req, &mapping, ownershipKey, matchedPodsByIndex, "store-owned-post", err, true, logger)
+				result, retErr := r.finalizeSystemError(ctx, req, &mapping, ownershipKey, matchedPodsByIndex, "store-owned-post", err, true, logger)
+				r.observeReconcile(req, ReconcileStageSystemError, reconcileStart, 0)
+				return result, retErr
 			}
 			if err := r.Patch(ctx, &mapping, patch); err != nil {
-				return r.finalizeSystemError(ctx, req, &mapping, ownershipKey, matchedPodsByIndex, "patch-owned-post", err, true, logger)
+				result, retErr := r.finalizeSystemError(ctx, req, &mapping, ownershipKey, matchedPodsByIndex, "patch-owned-post", err, true, logger)
+				r.observeReconcile(req, ReconcileStageSystemError, reconcileStart, 0)
+				return result, retErr
 			}
 		}
 	}
@@ -261,6 +340,8 @@ func (r *MappingReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 		statusErr = r.StatusUpdater.UpdateAfterReconcile(ctx, req.NamespacedName, mapping.Generation, ownershipKey, results, reconcileErr, nil, matchedPodsByIndex)
 		if statusErr != nil {
 			if errors.Is(statusErr, ErrStatusObjectNotFound) || errors.Is(statusErr, ErrStatusStaleGeneration) {
+				r.markInitialTerminal(req.NamespacedName, true)
+				r.observeReconcile(req, ReconcileStageStatusSentinelTerminal, reconcileStart, 0)
 				return ctrl.Result{}, nil
 			}
 		}
@@ -269,7 +350,9 @@ func (r *MappingReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 	// Status write errors take precedence over action-failure requeue
 	// decisions so they are never masked (Phase 7 contract).
 	if statusErr != nil {
-		return r.finalizeStatusWriteError(statusErr, logger)
+		result, retErr := r.finalizeStatusWriteError(statusErr, logger)
+		r.observeReconcile(req, ReconcileStageStatusWriteError, reconcileStart, len(actions))
+		return result, retErr
 	}
 
 	// Use policy-driven requeue for action failures.
@@ -281,8 +364,16 @@ func (r *MappingReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 			"decisionSource", "action-summary",
 			"requeueAfter", result.RequeueAfter,
 		)
+		stage := ReconcileStageActionMixedFailure
+		if summary.NonRetriableCount+summary.RetriableCount == len(results) {
+			stage = ReconcileStageActionAllFailure
+		}
+		r.observeReconcile(req, stage, reconcileStart, len(actions))
 		return result, nil
 	}
+
+	// Mark initial-reconcile terminal on steady-state success.
+	r.markInitialTerminal(req.NamespacedName, true)
 
 	// When no targets exist, schedule a short follow-up while pods/IPs or informer
 	// state settle instead of immediately requeueing in a tight loop.
@@ -292,17 +383,201 @@ func (r *MappingReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 		// Pods matched selectors but have no IPs → IP assignment event will trigger.
 		if hasPendingIPPods(mapping.Spec.Mappings, podList.Items) &&
 			withinPromptFollowUpWindow(mapping.CreationTimestamp.Time, promptWindow) {
+			r.observeReconcile(req, ReconcileStageSteadyStateSuccess, reconcileStart, len(actions))
 			return ctrl.Result{RequeueAfter: promptRequeueAfter(r.ResyncInterval)}, nil
 		}
-		// Mapping was recently created and cache may not have synced pods yet.
-		// Use a short follow-up delay to give informer state time to catch up
-		// without creating immediate reconcile churn.
 		if withinPromptFollowUpWindow(mapping.CreationTimestamp.Time, promptWindow) {
+			r.observeReconcile(req, ReconcileStageSteadyStateSuccess, reconcileStart, len(actions))
 			return ctrl.Result{RequeueAfter: promptRequeueAfter(r.ResyncInterval)}, nil
 		}
 	}
 
+	r.observeReconcile(req, ReconcileStageSteadyStateSuccess, reconcileStart, len(actions))
 	return ctrl.Result{RequeueAfter: r.ResyncInterval}, nil
+}
+
+// observeReconcile emits reconcile duration and total counter metrics.
+func (r *MappingReconciler) observeReconcile(req ctrl.Request, stage ReconcileMetricStage, startTime time.Time, actionCount int) {
+	if r.MetricsRecorder == nil {
+		return
+	}
+	result := ClassifyReconcileMetricResult(stage)
+	duration := time.Since(startTime)
+	r.MetricsRecorder.Reconcile.ObserveReconcile(req.Namespace, req.Name, result, duration)
+}
+
+// markInitialTerminal marks a key as terminal in the initial-reconcile tracker.
+// If the tracker was never initialized (e.g. startup listing failed), it
+// performs a lazy fallback initialization using the K8s client so that
+// reconcile-path MarkTerminal calls are not permanently ignored.
+func (r *MappingReconciler) markInitialTerminal(key types.NamespacedName, terminal bool) {
+	if r.InitialTracker == nil || r.MetricsRecorder == nil {
+		return
+	}
+	if !r.InitialTracker.IsInitialized() {
+		r.ensureInitialTrackerFallback()
+	}
+	r.InitialTracker.MarkTerminal(r.MetricsRecorder.Reconcile, key, terminal)
+}
+
+// ensureInitialTrackerFallback lazily initializes the initial-reconcile tracker
+// from the reconcile goroutine when the startup Runnable failed.
+func (r *MappingReconciler) ensureInitialTrackerFallback() {
+	listFn := func(ctx context.Context) ([]types.NamespacedName, error) {
+		var mappingList v1alpha1.PodASGMappingList
+		if err := r.List(ctx, &mappingList); err != nil {
+			return nil, err
+		}
+		keys := make([]types.NamespacedName, len(mappingList.Items))
+		for i, m := range mappingList.Items {
+			keys[i] = types.NamespacedName{Namespace: m.Namespace, Name: m.Name}
+		}
+		return keys, nil
+	}
+	// Best-effort: ignore error — will retry on next reconcile.
+	_ = r.InitialTracker.EnsureInitialized(context.Background(), listFn)
+}
+
+// cleanupPerMappingMetricState removes all per-mapping metric state on terminal cleanup.
+func (r *MappingReconciler) cleanupPerMappingMetricState(key types.NamespacedName) {
+	if r.ConvergenceTracker != nil {
+		r.ConvergenceTracker.Forget(key)
+	}
+	if r.PodChurnTracker != nil && r.MetricsRecorder != nil {
+		r.PodChurnTracker.ForgetWithDelete(r.MetricsRecorder.PodChurn, key)
+	}
+}
+
+// observePodChurn records pod churn metrics for the current reconcile.
+func (r *MappingReconciler) observePodChurn(key types.NamespacedName, mapping v1alpha1.PodASGMapping, pods []corev1.Pod) {
+	if r.MetricsRecorder == nil || r.PodChurnTracker == nil {
+		return
+	}
+	snapshot := metrics.MappingPodSnapshot{
+		Pods: make(map[metrics.PodIdentity]metrics.PodMembership),
+	}
+	for _, rule := range mapping.Spec.Mappings {
+		selector, err := model.CompileSelector(rule.PodSelector)
+		if err != nil {
+			continue
+		}
+		for i := range pods {
+			if selector.Matches(labels.Set(pods[i].Labels)) && pods[i].Status.PodIP != "" {
+				id := metrics.PodIdentity{
+					Namespace: pods[i].Namespace,
+					Name:      pods[i].Name,
+					UID:       string(pods[i].UID),
+				}
+				snapshot.Pods[id] = metrics.PodMembership{PodIP: pods[i].Status.PodIP}
+			}
+		}
+	}
+	r.PodChurnTracker.ObserveSnapshot(r.MetricsRecorder.PodChurn, key, snapshot, time.Now())
+}
+
+// startConvergenceTracking starts tracking convergence for targets that have changes.
+func (r *MappingReconciler) startConvergenceTracking(key types.NamespacedName, actions []engine.Action, desired map[engine.ASGTarget]engine.DesiredPrefixSet, actual map[engine.ASGTarget]engine.ActualPrefixSet) {
+	if r.ConvergenceTracker == nil {
+		return
+	}
+	now := time.Now()
+	for _, action := range actions {
+		delta := metrics.TargetDelta{}
+		if d, ok := desired[action.Target]; ok {
+			for ip := range d.IPs {
+				if a, aOK := actual[action.Target]; !aOK || !containsIP(a.IPs, ip) {
+					if delta.AddedIPs == nil {
+						delta.AddedIPs = make(map[string]struct{})
+					}
+					delta.AddedIPs[ip] = struct{}{}
+				}
+			}
+		}
+		if a, ok := actual[action.Target]; ok {
+			for ip := range a.IPs {
+				if d, dOK := desired[action.Target]; !dOK || !containsIP(d.IPs, ip) {
+					if delta.RemovedIPs == nil {
+						delta.RemovedIPs = make(map[string]struct{})
+					}
+					delta.RemovedIPs[ip] = struct{}{}
+				}
+			}
+		}
+		if op, hasOp := metrics.ClassifyConvergenceOperation(delta); hasOp {
+			r.ConvergenceTracker.StartOrKeep(key, action.Target, op, now)
+		}
+	}
+}
+
+func containsIP(ips map[string]struct{}, ip string) bool {
+	_, ok := ips[ip]
+	return ok
+}
+
+// actionKindToOperationLabel maps engine.ActionKind to spec-mandated lowercase
+// operation labels for prefix_set_actions_total: "create", "update", "delete".
+func actionKindToOperationLabel(kind engine.ActionKind) string {
+	switch kind {
+	case engine.CreatePrefixSet:
+		return "create"
+	case engine.UpdatePrefixSet:
+		return "update"
+	case engine.DeletePrefixSet:
+		return "delete"
+	default:
+		return "unknown"
+	}
+}
+
+// stageConvergenceResults stages successful ARM actions for convergence measurement.
+func (r *MappingReconciler) stageConvergenceResults(key types.NamespacedName, results []azure.ActionResult) {
+	if r.ConvergenceTracker == nil {
+		return
+	}
+	now := time.Now()
+	for _, res := range results {
+		if res.Success {
+			op := metrics.ConvergenceOpUpdate
+			switch res.Action.Kind {
+			case engine.CreatePrefixSet:
+				op = metrics.ConvergenceOpAdd
+			case engine.DeletePrefixSet:
+				op = metrics.ConvergenceOpDelete
+			}
+			r.ConvergenceTracker.StageSuccessfulAction(key, res.Action.Target, op, now)
+		}
+	}
+}
+
+// commitConvergence commits convergence metrics after ARM actions complete.
+func (r *MappingReconciler) commitConvergence(key types.NamespacedName, results []azure.ActionResult) {
+	if r.ConvergenceTracker == nil || r.MetricsRecorder == nil {
+		return
+	}
+	for _, res := range results {
+		if res.Success {
+			r.ConvergenceTracker.CommitConvergence(r.MetricsRecorder.Convergence, key, res.Action.Target)
+		}
+	}
+}
+
+// detectAndRecordDrift increments prefix_set_drift_corrections_total for each
+// target where actual contains IPs not present in desired (stale state that
+// the diff engine will remove via an Update or Delete action).
+func (r *MappingReconciler) detectAndRecordDrift(desired map[engine.ASGTarget]engine.DesiredPrefixSet, actual map[engine.ASGTarget]engine.ActualPrefixSet) {
+	if r.MetricsRecorder == nil {
+		return
+	}
+	for target, actualPS := range actual {
+		desiredPS, inDesired := desired[target]
+		for ip := range actualPS.IPs {
+			if !inDesired || !containsIP(desiredPS.IPs, ip) {
+				// This target has at least one stale IP → drift.
+				r.MetricsRecorder.Convergence.IncrementDriftCorrections(target)
+				break
+			}
+		}
+	}
 }
 
 // ensureFinalizer adds the cleanup finalizer if not present.

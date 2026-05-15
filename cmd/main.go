@@ -4,6 +4,7 @@ import (
 	"flag"
 	"fmt"
 	"os"
+	"time"
 
 	"github.com/go-logr/zapr"
 	"go.uber.org/zap"
@@ -14,12 +15,14 @@ import (
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/healthz"
+	ctrlmetrics "sigs.k8s.io/controller-runtime/pkg/metrics"
 	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
 
 	"github.com/Azure/pod-nsg-controller/api/v1alpha1"
 	"github.com/Azure/pod-nsg-controller/internal/azure"
 	"github.com/Azure/pod-nsg-controller/internal/config"
 	"github.com/Azure/pod-nsg-controller/internal/controller"
+	"github.com/Azure/pod-nsg-controller/internal/metrics"
 )
 
 var scheme = runtime.NewScheme()
@@ -60,6 +63,13 @@ func main() {
 		os.Exit(1)
 	}
 
+	// Register metrics with the controller-runtime Prometheus registry.
+	rec, err := metrics.RegisterWith(ctrlmetrics.Registry)
+	if err != nil {
+		setupLog.Error(err, "unable to register metrics")
+		os.Exit(1)
+	}
+
 	mgr, err := ctrl.NewManager(ctrl.GetConfigOrDie(), ctrl.Options{
 		Scheme:                 scheme,
 		Metrics:                metricsserver.Options{BindAddress: metricsAddr},
@@ -72,18 +82,32 @@ func main() {
 		os.Exit(1)
 	}
 
+	rateLimiter := azure.NewARMRateLimiter(
+		zapLog.With(zap.String("component", "azure-rate-limiter")),
+		cfg.ARMRateLimitRPS,
+		azure.WithRateLimitMetrics(rec.ARM),
+	)
+
 	prefixSetFactory := azure.NewClientFactory(
 		zapLog.With(zap.String("component", "azure-client-factory")),
 		azure.WithFactoryRetryPolicy(azure.DefaultRetryPolicy()),
-		azure.WithFactorySubscriptionRateLimiter(
-			azure.NewARMRateLimiter(
-				zapLog.With(zap.String("component", "azure-rate-limiter")),
-				cfg.ARMRateLimitRPS,
-			),
-		),
+		azure.WithFactorySubscriptionRateLimiter(rateLimiter),
+		azure.WithFactoryARMMetrics(rec.ARM, rec.ARM),
 	)
-	executor := azure.NewExecutor(zapLog.With(zap.String("component", "azure-executor")), prefixSetFactory, cfg.MaxConcurrentActions)
+
+	executor := azure.NewExecutor(
+		zapLog.With(zap.String("component", "azure-executor")),
+		prefixSetFactory,
+		cfg.MaxConcurrentActions,
+		azure.WithExecutorRetryMetrics(rec.ARM),
+	)
+
 	statusUpdater := controller.NewMappingStatusUpdater(mgr.GetClient(), ctrl.Log.WithName("status-updater"))
+
+	controllerStart := time.Now()
+	initialTracker := metrics.NewInitialReconcileTracker(controllerStart)
+	podChurnTracker := metrics.NewPodChurnTracker()
+	convergenceTracker := metrics.NewConvergenceTracker()
 
 	reconciler := &controller.MappingReconciler{
 		Client:               mgr.GetClient(),
@@ -95,10 +119,26 @@ func main() {
 		PrefixSetFactory:     prefixSetFactory,
 		Executor:             executor,
 		StatusUpdater:        statusUpdater,
+		MetricsRecorder:      rec,
+		PodChurnTracker:      podChurnTracker,
+		ConvergenceTracker:   convergenceTracker,
+		InitialTracker:       initialTracker,
 	}
 
 	if err := reconciler.SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "unable to create controller", "controller", "MappingReconciler")
+		os.Exit(1)
+	}
+
+	// Register the initial-reconcile initializer as a manager Runnable.
+	initializer := controller.NewInitialReconcileInitializer(
+		mgr.GetAPIReader(),
+		initialTracker,
+		rec.Reconcile,
+		ctrl.Log.WithName("initial-reconcile"),
+	)
+	if err := mgr.Add(initializer); err != nil {
+		setupLog.Error(err, "unable to add initial reconcile initializer")
 		os.Exit(1)
 	}
 
