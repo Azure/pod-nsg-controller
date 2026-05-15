@@ -62,7 +62,7 @@ func TestPhase7_T77_Integration_ETagConflictMetrics(t *testing.T) {
 				FullResourceID: "/subscriptions/sub1/resourceGroups/rg1/providers/Microsoft.Network/applicationSecurityGroups/asg-etag",
 				PrefixSetName:  "pod-nsg-controller",
 			},
-			DesiredIPs: []string{"10.0.0.1"},
+			DesiredIPs: []string{"10.0.0.1/32"},
 		},
 	}
 
@@ -114,7 +114,7 @@ func TestExecutor_ETagConflict_RecomputeSuccess(t *testing.T) {
 
 	// Pre-populate the resource so the executor's re-GET after 412 finds it
 	ctx := context.Background()
-	if err := fakeAz.Put(ctx, "sub1", "rg1", "asg1", "test-cluster-ns-map", []string{"10.0.0.99"}); err != nil {
+	if err := fakeAz.Put(ctx, "sub1", "rg1", "asg1", "test-cluster-ns-map", []string{"10.0.0.99/32"}); err != nil {
 		t.Fatalf("pre-populate failed: %v", err)
 	}
 
@@ -125,7 +125,7 @@ func TestExecutor_ETagConflict_RecomputeSuccess(t *testing.T) {
 		{
 			Kind:       engine.UpdatePrefixSet,
 			Target:     target,
-			DesiredIPs: []string{"10.0.0.1", "10.0.0.2"},
+			DesiredIPs: []string{"10.0.0.1/32", "10.0.0.2/32"},
 		},
 	}
 
@@ -178,7 +178,7 @@ func TestExecutor_ETagConflict_Exhausted(t *testing.T) {
 
 	// Pre-populate
 	ctx := context.Background()
-	if err := fakeAz.Put(ctx, "sub1", "rg1", "asg1", "test-cluster-ns-map", []string{"10.0.0.99"}); err != nil {
+	if err := fakeAz.Put(ctx, "sub1", "rg1", "asg1", "test-cluster-ns-map", []string{"10.0.0.99/32"}); err != nil {
 		t.Fatalf("pre-populate failed: %v", err)
 	}
 
@@ -186,7 +186,7 @@ func TestExecutor_ETagConflict_Exhausted(t *testing.T) {
 	fakeAz.Fail412Count = 10
 
 	actions := []engine.Action{
-		{Kind: engine.UpdatePrefixSet, Target: target, DesiredIPs: []string{"10.0.0.1"}},
+		{Kind: engine.UpdatePrefixSet, Target: target, DesiredIPs: []string{"10.0.0.1/32"}},
 	}
 
 	results := executor.Execute(ctx, actions)
@@ -657,7 +657,7 @@ func TestRateLimiter_Executor_ErrorClassification_FullChain(t *testing.T) {
 				ASGName:        "asg1",
 				PrefixSetName:  fmt.Sprintf("ps-%d", i),
 			},
-			DesiredIPs: []string{fmt.Sprintf("10.0.0.%d", i+1)},
+			DesiredIPs: []string{fmt.Sprintf("10.0.0.%d/32", i+1)},
 		}
 	}
 

@@ -526,7 +526,7 @@ func TestPhase7_T77_ETagConflict_ReGETRecomputeSuccess(t *testing.T) {
 	fakeAzClient := fake.NewClient()
 
 	// Pre-populate with existing state.
-	_ = fakeAzClient.Put(ctx, "sub1", "rg1", "asg1", "test-prefix", []string{"10.0.0.1"})
+	_ = fakeAzClient.Put(ctx, "sub1", "rg1", "asg1", "test-prefix", []string{"10.0.0.1/32"})
 
 	// First PUT returns 412 (ETag mismatch), second PUT succeeds.
 	fakeAzClient.Fail412Count = 1
@@ -547,7 +547,7 @@ func TestPhase7_T77_ETagConflict_ReGETRecomputeSuccess(t *testing.T) {
 				FullResourceID: asgResourceID("sub1", "rg1", "asg1"),
 				PrefixSetName:  "test-prefix",
 			},
-			DesiredIPs: []string{"10.0.0.2"},
+			DesiredIPs: []string{"10.0.0.2/32"},
 		},
 	}
 

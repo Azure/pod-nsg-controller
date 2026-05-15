@@ -298,7 +298,7 @@ func TestPhase5_PodCreateDeleteAndLabelChange_TriggerReconcile(t *testing.T) {
 			return true
 		}
 		for _, ip := range ps.Properties.AddressPrefixes {
-			if ip == "10.0.0.1" {
+			if ip == "10.0.0.1/32" {
 				return false // IP still present
 			}
 		}
@@ -368,7 +368,7 @@ func TestPhase5_PodIPChange_UpdatesPrefixSet(t *testing.T) {
 			return false
 		}
 		for _, ip := range ps.Properties.AddressPrefixes {
-			if ip == "10.0.0.1" {
+			if ip == "10.0.0.1/32" {
 				return true
 			}
 		}
@@ -390,10 +390,10 @@ func TestPhase5_PodIPChange_UpdatesPrefixSet(t *testing.T) {
 		hasNew := false
 		hasOld := false
 		for _, ip := range ps.Properties.AddressPrefixes {
-			if ip == "10.0.0.99" {
+			if ip == "10.0.0.99/32" {
 				hasNew = true
 			}
-			if ip == "10.0.0.1" {
+			if ip == "10.0.0.1/32" {
 				hasOld = true
 			}
 		}
@@ -458,7 +458,7 @@ func TestPhase5_PodLabelChangeAway_RemovesIPFromPrefixSet(t *testing.T) {
 			return false
 		}
 		for _, ip := range ps.Properties.AddressPrefixes {
-			if ip == "10.0.0.1" {
+			if ip == "10.0.0.1/32" {
 				return true
 			}
 		}
@@ -483,7 +483,7 @@ func TestPhase5_PodLabelChangeAway_RemovesIPFromPrefixSet(t *testing.T) {
 			return false
 		}
 		for _, ip := range ps.Properties.AddressPrefixes {
-			if ip == "10.0.0.1" {
+			if ip == "10.0.0.1/32" {
 				return false
 			}
 		}
@@ -728,7 +728,7 @@ func TestPhase5_PeriodicResync_CorrectsDrift(t *testing.T) {
 		hasCorrectIP := false
 		hasDriftIP := false
 		for _, ip := range ps.Properties.AddressPrefixes {
-			if ip == "10.0.0.1" {
+			if ip == "10.0.0.1/32" {
 				hasCorrectIP = true
 			}
 			if ip == "99.99.99.99" {
@@ -904,7 +904,7 @@ func TestPhase5_MultipleMappings_OnlyMatchingMappingAffected(t *testing.T) {
 			return false
 		}
 		for _, ip := range ps.Properties.AddressPrefixes {
-			if ip == "10.0.0.1" {
+			if ip == "10.0.0.1/32" {
 				return true
 			}
 		}
@@ -916,7 +916,7 @@ func TestPhase5_MultipleMappings_OnlyMatchingMappingAffected(t *testing.T) {
 	ps, err := te.fakeClient.Get(ctx, "sub1", "rg1", "asg-db", dbOwnerKey)
 	if err == nil && ps.Properties != nil {
 		for _, ip := range ps.Properties.AddressPrefixes {
-			if ip == "10.0.0.1" {
+			if ip == "10.0.0.1/32" {
 				t.Error("T5.10: web pod IP should NOT appear in asg-db prefix set")
 			}
 		}

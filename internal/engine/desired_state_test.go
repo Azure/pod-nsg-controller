@@ -84,7 +84,7 @@ func TestPhase3_T31_SingleMappingThreePodsOneASG(t *testing.T) {
 			t.Errorf("T3.1: ASGName = %q, want %q", target.ASGName, "asg-web")
 		}
 		ips := ipsFromDesired(prefixSet)
-		wantIPs := []string{"10.0.0.1", "10.0.0.2", "10.0.0.3"}
+		wantIPs := []string{"10.0.0.1/32", "10.0.0.2/32", "10.0.0.3/32"}
 		if len(ips) != 3 {
 			t.Fatalf("T3.1: got %d IPs, want 3", len(ips))
 		}
@@ -124,8 +124,8 @@ func TestPhase3_T32_PodWithoutIPExcluded(t *testing.T) {
 		if len(ips) != 1 {
 			t.Fatalf("T3.2: got %d IPs, want 1 (pod without IP should be excluded)", len(ips))
 		}
-		if ips[0] != "10.0.0.1" {
-			t.Errorf("T3.2: IP = %q, want %q", ips[0], "10.0.0.1")
+		if ips[0] != "10.0.0.1/32" {
+			t.Errorf("T3.2: IP = %q, want %q", ips[0], "10.0.0.1/32")
 		}
 	}
 }
@@ -178,8 +178,8 @@ func TestPhase3_T33_TwoMappingsOverlappingSelectorsDifferentASGs(t *testing.T) {
 	}
 
 	wantIPsByASG := map[string][]string{
-		"asg-web":      {"10.0.0.1", "10.0.0.2"},
-		"asg-frontend": {"10.0.0.1", "10.0.0.3"},
+		"asg-web":      {"10.0.0.1/32", "10.0.0.2/32"},
+		"asg-frontend": {"10.0.0.1/32", "10.0.0.3/32"},
 	}
 	for asgName, wantIPs := range wantIPsByASG {
 		gotIPs, exists := gotIPsByASG[asgName]
@@ -242,8 +242,8 @@ func TestPhase3_DesiredState_SameASGAcrossDifferentMappingsRemainSeparateOwnedTa
 	}
 
 	wantIPsByPrefixSet := map[string][]string{
-		"test-cluster-default-mapping-a": {"10.0.0.1"},
-		"test-cluster-default-mapping-b": {"10.0.0.2"},
+		"test-cluster-default-mapping-a": {"10.0.0.1/32"},
+		"test-cluster-default-mapping-b": {"10.0.0.2/32"},
 	}
 	for prefixSetName, wantIPs := range wantIPsByPrefixSet {
 		gotIPs, exists := gotIPsByPrefixSet[prefixSetName]
@@ -393,7 +393,7 @@ func TestPhase3_DesiredState_BoundaryConditions(t *testing.T) {
 		}
 		for _, prefixSet := range result {
 			gotIPs := ipsFromDesired(prefixSet)
-			wantIPs := []string{"10.0.0.1", "10.0.0.2"}
+			wantIPs := []string{"10.0.0.1/32", "10.0.0.2/32"}
 			if len(gotIPs) != len(wantIPs) {
 				t.Fatalf("empty selector: got %d IPs, want %d", len(gotIPs), len(wantIPs))
 			}
@@ -452,8 +452,8 @@ func TestPhase3_DesiredState_NamespaceOwnershipSeparatesTargets(t *testing.T) {
 	}
 
 	wantIPsByPrefixSet := map[string][]string{
-		"test-cluster-team-a-shared-mapping": {"10.0.0.1"},
-		"test-cluster-team-b-shared-mapping": {"10.0.0.2"},
+		"test-cluster-team-a-shared-mapping": {"10.0.0.1/32"},
+		"test-cluster-team-b-shared-mapping": {"10.0.0.2/32"},
 	}
 	for prefixSetName, wantIPs := range wantIPsByPrefixSet {
 		gotIPs, exists := gotIPsByPrefixSet[prefixSetName]
@@ -518,8 +518,8 @@ func TestPhase3_DesiredState_NamespaceIsolation(t *testing.T) {
 		if len(ips) != 1 {
 			t.Errorf("NamespaceIsolation: target %q got %d IPs, want 1 (only team-a pod)", target.ASGName, len(ips))
 		}
-		if len(ips) == 1 && ips[0] != "10.0.0.1" {
-			t.Errorf("NamespaceIsolation: IP = %q, want %q", ips[0], "10.0.0.1")
+		if len(ips) == 1 && ips[0] != "10.0.0.1/32" {
+			t.Errorf("NamespaceIsolation: IP = %q, want %q", ips[0], "10.0.0.1/32")
 		}
 	}
 }
@@ -605,7 +605,7 @@ func TestPhase3_T34_SameASGReferencedByTwoRulesInSameMappingUnionsIPs(t *testing
 		}
 
 		gotIPs := ipsFromDesired(prefixSet)
-		wantIPs := []string{"10.0.0.1", "10.0.0.2"}
+		wantIPs := []string{"10.0.0.1/32", "10.0.0.2/32"}
 		if len(gotIPs) != len(wantIPs) {
 			t.Fatalf("T3.4: got %d IPs, want %d", len(gotIPs), len(wantIPs))
 		}
@@ -681,8 +681,8 @@ func TestPhase3_DesiredState_CaseInsensitiveASGIdentityDeduplicatesTargets(t *te
 		if len(ips) != 1 {
 			t.Fatalf("got %d IPs, want 1", len(ips))
 		}
-		if ips[0] != "10.0.0.1" {
-			t.Errorf("IP = %q, want %q", ips[0], "10.0.0.1")
+		if ips[0] != "10.0.0.1/32" {
+			t.Errorf("IP = %q, want %q", ips[0], "10.0.0.1/32")
 		}
 	}
 }

@@ -230,7 +230,7 @@ func TestIntegration_ModelIndex_Agrees_WithDesiredState(t *testing.T) {
 			found := false
 			for target, ps := range desired {
 				if strings.EqualFold(target.FullResourceID, parsed.FullResourceID) {
-					if _, hasIP := ps.IPs[pod.Status.PodIP]; hasIP {
+					if _, hasIP := ps.IPs[pod.Status.PodIP+"/32"]; hasIP {
 						found = true
 						break
 					}
@@ -246,7 +246,7 @@ func TestIntegration_ModelIndex_Agrees_WithDesiredState(t *testing.T) {
 	// Also verify unmatched pod's IP is absent from all desired sets.
 	noMatchPod := &pods[3]
 	for target, ps := range desired {
-		if _, hasIP := ps.IPs[noMatchPod.Status.PodIP]; hasIP {
+		if _, hasIP := ps.IPs[noMatchPod.Status.PodIP+"/32"]; hasIP {
 			t.Errorf("unmatched pod %s IP %s should not appear in target %s",
 				noMatchPod.Name, noMatchPod.Status.PodIP, target.ASGName)
 		}
@@ -416,7 +416,7 @@ func TestIntegration_MultiNamespace_FullPipeline(t *testing.T) {
 			if len(ips) != 1 {
 				t.Errorf("asg-team-b: got %d IPs, want 1", len(ips))
 			}
-			if len(ips) == 1 && ips[0] != "10.0.1.1" {
+			if len(ips) == 1 && ips[0] != "10.0.1.1/32" {
 				t.Errorf("asg-team-b: got IP %s, want 10.0.1.1", ips[0])
 			}
 		default:
@@ -758,7 +758,7 @@ func TestIntegration_ReconciliationLifecycle(t *testing.T) {
 	if len(actions) != 1 || actions[0].Kind != engine.UpdatePrefixSet {
 		t.Fatalf("step 4: expected 1 update (selector change), got %v", actions)
 	}
-	if len(actions[0].DesiredIPs) != 1 || actions[0].DesiredIPs[0] != "10.0.0.4" {
+	if len(actions[0].DesiredIPs) != 1 || actions[0].DesiredIPs[0] != "10.0.0.4/32" {
 		t.Errorf("step 4: expected [10.0.0.4], got %v", actions[0].DesiredIPs)
 	}
 	actual = desiredToActual(desired)
@@ -878,7 +878,7 @@ func TestIntegration_EmptyDesiredPrefixSet_CreateAction(t *testing.T) {
 
 	// Diff against actual with IPs → UpdatePrefixSet (actual has IPs, desired is empty).
 	actualWithIPs := map[engine.ASGTarget]engine.ActualPrefixSet{
-		actions[0].Target: {IPs: ipSet("10.0.0.99")},
+		actions[0].Target: {IPs: ipSet("10.0.0.99/32")},
 	}
 	actions = engine.ComputeDiff(desired, actualWithIPs)
 	if len(actions) != 1 {
@@ -930,7 +930,7 @@ func TestIntegration_MultipleRules_SharedASG_UnionThroughDiff(t *testing.T) {
 
 	for _, ps := range desired {
 		ips := sortedIPsFromDesired(ps)
-		want := []string{"10.0.0.1", "10.0.0.2", "10.0.1.1"}
+		want := []string{"10.0.0.1/32", "10.0.0.2/32", "10.0.1.1/32"}
 		if len(ips) != 3 {
 			t.Fatalf("expected 3 unioned IPs, got %d: %v", len(ips), ips)
 		}
@@ -947,7 +947,7 @@ func TestIntegration_MultipleRules_SharedASG_UnionThroughDiff(t *testing.T) {
 		target = t
 	}
 	partialActual := map[engine.ASGTarget]engine.ActualPrefixSet{
-		target: {IPs: ipSet("10.0.0.1", "10.0.0.2")},
+		target: {IPs: ipSet("10.0.0.1/32", "10.0.0.2/32")},
 	}
 
 	actions := engine.ComputeDiff(desired, partialActual)
@@ -1006,7 +1006,7 @@ func TestIntegration_PodWithoutIP_ExcludedByBothIndexAndEngine(t *testing.T) {
 		if len(ps.IPs) != 1 {
 			t.Errorf("expected 1 IP (only pod with IP), got %d", len(ps.IPs))
 		}
-		if _, ok := ps.IPs["10.0.0.1"]; !ok {
+		if _, ok := ps.IPs["10.0.0.1/32"]; !ok {
 			t.Errorf("expected IP 10.0.0.1 in desired set")
 		}
 		if _, ok := ps.IPs[""]; ok {
@@ -1060,7 +1060,7 @@ func TestIntegration_WildcardSelector_MatchesAllNamespacePods(t *testing.T) {
 	for _, ps := range desired {
 		ips := sortedIPsFromDesired(ps)
 		// Should include all 3 default-namespace pods, but NOT the other-ns pod.
-		want := []string{"10.0.0.1", "10.0.0.2", "10.0.0.3"}
+		want := []string{"10.0.0.1/32", "10.0.0.2/32", "10.0.0.3/32"}
 		if len(ips) != 3 {
 			t.Fatalf("expected 3 IPs (all default ns), got %d: %v", len(ips), ips)
 		}

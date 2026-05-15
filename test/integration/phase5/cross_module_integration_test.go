@@ -89,7 +89,7 @@ func TestPhase5_MultiplePods_AggregateIPsInPrefixSet(t *testing.T) {
 		for _, ip := range ps.Properties.AddressPrefixes {
 			ips[ip] = true
 		}
-		return ips["10.0.0.1"] && ips["10.0.0.2"] && ips["10.0.0.3"]
+		return ips["10.0.0.1/32"] && ips["10.0.0.2/32"] && ips["10.0.0.3/32"]
 	}, "expected all 3 pod IPs to be aggregated in the prefix set")
 }
 
@@ -157,7 +157,7 @@ func TestPhase5_CrossSubscription_RoutesToCorrectClient(t *testing.T) {
 			return false
 		}
 		for _, ip := range ps.Properties.AddressPrefixes {
-			if ip == "10.0.0.1" {
+			if ip == "10.0.0.1/32" {
 				return true
 			}
 		}
@@ -171,7 +171,7 @@ func TestPhase5_CrossSubscription_RoutesToCorrectClient(t *testing.T) {
 			return false
 		}
 		for _, ip := range ps.Properties.AddressPrefixes {
-			if ip == "10.0.0.1" {
+			if ip == "10.0.0.1/32" {
 				return true
 			}
 		}
@@ -245,7 +245,7 @@ func TestPhase5_ExecutorETagRetry_EventualSuccess(t *testing.T) {
 			return false
 		}
 		for _, ip := range ps.Properties.AddressPrefixes {
-			if ip == "10.0.0.1" {
+			if ip == "10.0.0.1/32" {
 				return true
 			}
 		}
@@ -492,7 +492,7 @@ func TestPhase5_PodWithoutIP_ExcludedFromPrefixSet(t *testing.T) {
 		if len(ps.Properties.AddressPrefixes) != 1 {
 			return false
 		}
-		return ps.Properties.AddressPrefixes[0] == "10.0.0.1"
+		return ps.Properties.AddressPrefixes[0] == "10.0.0.1/32"
 	}, "expected only pod with IP to appear in prefix set (pod without IP excluded)")
 
 	// Now assign IP to the previously IP-less pod → should be picked up
@@ -515,7 +515,7 @@ func TestPhase5_PodWithoutIP_ExcludedFromPrefixSet(t *testing.T) {
 		for _, ip := range ps.Properties.AddressPrefixes {
 			ips[ip] = true
 		}
-		return ips["10.0.0.1"] && ips["10.0.0.2"] && len(ps.Properties.AddressPrefixes) == 2
+		return ips["10.0.0.1/32"] && ips["10.0.0.2/32"] && len(ps.Properties.AddressPrefixes) == 2
 	}, "expected both IPs in prefix set after delayed IP assignment")
 }
 
@@ -606,7 +606,7 @@ func TestPhase5_MultipleSelectorRules_AggregateToSameASG(t *testing.T) {
 		for _, ip := range ps.Properties.AddressPrefixes {
 			ips[ip] = true
 		}
-		return ips["10.0.1.1"] && ips["10.0.2.1"]
+		return ips["10.0.1.1/32"] && ips["10.0.2.1/32"]
 	}, "expected IPs from both selectors aggregated in single prefix set")
 }
 

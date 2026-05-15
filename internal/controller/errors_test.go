@@ -468,6 +468,6 @@ func makeTestAction(asgName string, kind engine.ActionKind) engine.Action {
 			FullResourceID: fmt.Sprintf("/subscriptions/test-sub/resourceGroups/test-rg/providers/Microsoft.Network/applicationSecurityGroups/%s", asgName),
 			PrefixSetName:  "test-prefix",
 		},
-		DesiredIPs: []string{"10.0.0.1"},
+		DesiredIPs: []string{"10.0.0.1/32"},
 	}
 }

@@ -195,7 +195,7 @@ func main() {
 	// Print results
 	fmt.Println("\n========================================")
 	fmt.Println("  REST Operations Test Results")
-	fmt.Println("  API Version: 2026-01-01 (AddressPrefixSets)")
+	fmt.Println("  API Version: 2025-07-01 (AddressPrefixSets)")
 	fmt.Println("========================================")
 	passed, failed := 0, 0
 	for _, r := range results {

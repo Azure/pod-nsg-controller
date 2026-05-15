@@ -1,15 +1,88 @@
 package azure
 
 import (
+	"context"
+	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
+	"os"
 	"sync"
+	"time"
 
 	"github.com/Azure/azure-sdk-for-go/sdk/azcore"
+	"github.com/Azure/azure-sdk-for-go/sdk/azcore/policy"
 	"github.com/Azure/azure-sdk-for-go/sdk/azidentity"
 	"github.com/pkg/errors"
 	"go.uber.org/zap"
 )
+
+// wireserverCredential acquires tokens directly from the Azure wireserver
+// (168.63.129.16) when the IMDS identity endpoint (169.254.169.254) is broken.
+type wireserverCredential struct {
+	client *http.Client
+}
+
+type wireserverTokenResponse struct {
+	AccessToken  string `json:"access_token"`
+	ExpiresOn    string `json:"expires_on"`
+	Resource     string `json:"resource"`
+	TokenType    string `json:"token_type"`
+	ExpiresIn    string `json:"expires_in"`
+	NotBefore    string `json:"not_before"`
+	ExtExpiresIn string `json:"ext_expires_in"`
+}
+
+func (w *wireserverCredential) GetToken(ctx context.Context, opts policy.TokenRequestOptions) (azcore.AccessToken, error) {
+	if len(opts.Scopes) == 0 {
+		return azcore.AccessToken{}, fmt.Errorf("wireserverCredential: at least one scope is required")
+	}
+	// Convert scope to resource (remove /.default suffix)
+	resource := opts.Scopes[0]
+	if len(resource) > 9 && resource[len(resource)-9:] == "/.default" {
+		resource = resource[:len(resource)-9]
+	}
+
+	url := fmt.Sprintf("http://168.63.129.16/metadata/identity/oauth2/token?api-version=2018-02-01&resource=%s", resource)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		return azcore.AccessToken{}, errors.Wrap(err, "wireserverCredential: creating request")
+	}
+	req.Header.Set("Metadata", "true")
+
+	resp, err := w.client.Do(req)
+	if err != nil {
+		return azcore.AccessToken{}, errors.Wrap(err, "wireserverCredential: requesting token from wireserver")
+	}
+	defer resp.Body.Close()
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return azcore.AccessToken{}, errors.Wrap(err, "wireserverCredential: reading response")
+	}
+	if resp.StatusCode != http.StatusOK {
+		return azcore.AccessToken{}, fmt.Errorf("wireserverCredential: wireserver returned %d: %s", resp.StatusCode, string(body))
+	}
+
+	var tokenResp wireserverTokenResponse
+	if err := json.Unmarshal(body, &tokenResp); err != nil {
+		return azcore.AccessToken{}, errors.Wrap(err, "wireserverCredential: parsing token response")
+	}
+
+	// Parse expires_on (Unix timestamp)
+	var expiresOn time.Time
+	var ts int64
+	if _, err := fmt.Sscanf(tokenResp.ExpiresOn, "%d", &ts); err == nil {
+		expiresOn = time.Unix(ts, 0)
+	} else {
+		expiresOn = time.Now().Add(time.Hour)
+	}
+
+	return azcore.AccessToken{
+		Token:     tokenResp.AccessToken,
+		ExpiresOn: expiresOn,
+	}, nil
+}
 
 // ClientFactoryOption configures a ClientFactory.
 type ClientFactoryOption func(*ClientFactory)
@@ -83,17 +156,29 @@ func NewClientFactoryWithCredential(log *zap.Logger, credential azcore.TokenCred
 	return f
 }
 
-// NewClientFactoryWithDefaultCredential creates a ClientFactory using DefaultAzureCredential eagerly.
+// NewClientFactoryWithDefaultCredential creates a ClientFactory that eagerly
+// resolves the credential. If USE_WIRESERVER_IDENTITY=true, the wireserver
+// credential is used instead of DefaultAzureCredential.
 func NewClientFactoryWithDefaultCredential(log *zap.Logger, httpClient *http.Client, opts ...ClientFactoryOption) (*ClientFactory, error) {
-	cred, err := azidentity.NewDefaultAzureCredential(nil)
-	if err != nil {
-		return nil, errors.Wrap(err, "creating DefaultAzureCredential")
+	var cred azcore.TokenCredential
+	if os.Getenv("USE_WIRESERVER_IDENTITY") == "true" {
+		log.Info("USE_WIRESERVER_IDENTITY enabled, acquiring tokens directly from wireserver 168.63.129.16")
+		cred = &wireserverCredential{
+			client: &http.Client{Timeout: 30 * time.Second},
+		}
+	} else {
+		defaultCred, err := azidentity.NewDefaultAzureCredential(nil)
+		if err != nil {
+			return nil, errors.Wrap(err, "creating DefaultAzureCredential")
+		}
+		cred = defaultCred
 	}
 	f := &ClientFactory{
-		log:        log,
-		credential: cred,
-		httpClient: httpClient,
-		clients:    make(map[string]AddressPrefixSetAPI),
+		log:          log,
+		credential:   cred,
+		httpClient:   httpClient,
+		credExplicit: true,
+		clients:      make(map[string]AddressPrefixSetAPI),
 	}
 	for _, opt := range opts {
 		opt(f)
@@ -101,14 +186,23 @@ func NewClientFactoryWithDefaultCredential(log *zap.Logger, httpClient *http.Cli
 	return f, nil
 }
 
-// resolveCredential lazily resolves the DefaultAzureCredential (thread-safe).
+// resolveCredential lazily resolves the credential (thread-safe).
 // If the credential was explicitly provided (even as nil), resolution is skipped.
+// When USE_WIRESERVER_IDENTITY=true, redirects IMDS traffic to the Azure wireserver
+// to work around broken IMDS identity endpoints (410 Gone).
 func (f *ClientFactory) resolveCredential() error {
 	if f.credExplicit {
 		return nil
 	}
 	f.credOnce.Do(func() {
 		if f.credential != nil {
+			return
+		}
+		if os.Getenv("USE_WIRESERVER_IDENTITY") == "true" {
+			f.log.Info("USE_WIRESERVER_IDENTITY enabled, acquiring tokens directly from wireserver 168.63.129.16")
+			f.credential = &wireserverCredential{
+				client: &http.Client{Timeout: 30 * time.Second},
+			}
 			return
 		}
 		cred, err := azidentity.NewDefaultAzureCredential(nil)

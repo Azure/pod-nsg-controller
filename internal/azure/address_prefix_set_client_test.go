@@ -10,7 +10,10 @@ import (
 	"strings"
 	"sync/atomic"
 	"testing"
+	"time"
 
+	"github.com/Azure/azure-sdk-for-go/sdk/azcore"
+	"github.com/Azure/azure-sdk-for-go/sdk/azcore/policy"
 	"go.uber.org/zap/zaptest"
 )
 
@@ -38,7 +41,7 @@ func TestAddressPrefixSetClient_Get_UsesHeaderETagOverBodyETag(t *testing.T) {
 			"name": "ps1",
 			"etag": bodyETag,
 			"properties": map[string]interface{}{
-				"addressPrefixes": []string{"10.0.0.1/32"},
+				"addressPrefixSet": []string{"10.0.0.1/32"},
 			},
 		})
 	}))
@@ -73,7 +76,7 @@ func TestAddressPrefixSetClient_Get_MissingETagReturnsErrMissingETag(t *testing.
 			"id":   "/subscriptions/sub1/resourceGroups/rg1/providers/Microsoft.Network/applicationSecurityGroups/asg1/addressPrefixSets/ps1",
 			"name": "ps1",
 			"properties": map[string]interface{}{
-				"addressPrefixes": []string{"10.0.0.1/32"},
+				"addressPrefixSet": []string{"10.0.0.1/32"},
 			},
 		})
 	}))
@@ -88,6 +91,97 @@ func TestAddressPrefixSetClient_Get_MissingETagReturnsErrMissingETag(t *testing.
 	}
 	if !strings.Contains(err.Error(), "missing etag") {
 		t.Errorf("expected ErrMissingETag, got: %v", err)
+	}
+}
+
+// TestAddressPrefixSetClient_Get_EmptyListEnvelopeReturnsNotFound verifies
+// that Get returns ErrNotFound when the ARM API returns HTTP 200 with a
+// list envelope (e.g. {"value":[]}) instead of a 404 for a missing resource.
+func TestAddressPrefixSetClient_Get_EmptyListEnvelopeReturnsNotFound(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		// ARM returns list envelope instead of 404 for non-existent resource
+		w.Write([]byte(`{"value":[]}`))
+	}))
+	defer srv.Close()
+
+	log := zaptest.NewLogger(t)
+	client := NewAddressPrefixSetClient(log, nil, srv.Client(), WithARMBaseURL(srv.URL))
+
+	_, err := client.Get(context.Background(), "sub1", "rg1", "asg1", "ps1")
+	if err == nil {
+		t.Fatal("expected error, got nil")
+	}
+	if !errors.Is(err, ErrNotFound) {
+		t.Errorf("expected ErrNotFound, got: %v", err)
+	}
+}
+
+// TestAddressPrefixSetClient_Get_ListEnvelopeWithOneResource verifies that
+// Get correctly extracts an AddressPrefixSet from a list envelope {"value":[...]}
+// containing a single resource, which is the production POC behavior where
+// single-resource GET returns a list envelope instead of a bare object.
+func TestAddressPrefixSetClient_Get_ListEnvelopeWithOneResource(t *testing.T) {
+	expectedID := "/subscriptions/sub1/resourceGroups/rg1/providers/Microsoft.Network/applicationSecurityGroups/asg1/addressPrefixSets/ps1"
+	expectedName := "ps1"
+	expectedETag := `"list-envelope-etag"`
+	expectedIPs := []string{"10.0.0.1/32", "10.0.0.2/32"}
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("ETag", expectedETag)
+		w.Header().Set("Content-Type", "application/json")
+		// ARM returns list envelope for single-resource GET
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"value": []map[string]interface{}{
+				{
+					"id":   expectedID,
+					"name": expectedName,
+					"etag": `"body-etag-ignored"`,
+					"type": "Microsoft.Network/applicationSecurityGroups/addressPrefixSets",
+					"properties": map[string]interface{}{
+						"addressPrefixSet":  expectedIPs,
+						"provisioningState": "Succeeded",
+					},
+				},
+			},
+		})
+	}))
+	defer srv.Close()
+
+	log := zaptest.NewLogger(t)
+	client := NewAddressPrefixSetClient(log, nil, srv.Client(), WithARMBaseURL(srv.URL))
+
+	result, err := client.Get(context.Background(), "sub1", "rg1", "asg1", "ps1")
+	if err != nil {
+		t.Fatalf("Get returned unexpected error: %v", err)
+	}
+
+	if result.ID == nil || *result.ID != expectedID {
+		t.Errorf("expected ID %q, got %v", expectedID, result.ID)
+	}
+	if result.Name == nil || *result.Name != expectedName {
+		t.Errorf("expected Name %q, got %v", expectedName, result.Name)
+	}
+	// Header ETag takes precedence over body etag
+	if result.Etag == nil || *result.Etag != expectedETag {
+		t.Errorf("expected ETag %q, got %v", expectedETag, result.Etag)
+	}
+	if result.Type == nil || *result.Type != "Microsoft.Network/applicationSecurityGroups/addressPrefixSets" {
+		t.Errorf("expected Type field, got %v", result.Type)
+	}
+	if result.Properties == nil {
+		t.Fatal("expected non-nil Properties")
+	}
+	if len(result.Properties.AddressPrefixes) != len(expectedIPs) {
+		t.Fatalf("expected %d address prefixes, got %d", len(expectedIPs), len(result.Properties.AddressPrefixes))
+	}
+	for i, ip := range expectedIPs {
+		if result.Properties.AddressPrefixes[i] != ip {
+			t.Errorf("expected prefix[%d] = %q, got %q", i, ip, result.Properties.AddressPrefixes[i])
+		}
+	}
+	if result.Properties.ProvisioningState == nil || *result.Properties.ProvisioningState != "Succeeded" {
+		t.Errorf("expected ProvisioningState 'Succeeded', got %v", result.Properties.ProvisioningState)
 	}
 }
 
@@ -114,7 +208,7 @@ func TestAddressPrefixSetClient_Put_UsesIfMatchForExisting(t *testing.T) {
 			"name": "ps1",
 			"etag": `"existing-etag"`,
 			"properties": map[string]interface{}{
-				"addressPrefixes": []string{},
+				"addressPrefixSet": []string{},
 			},
 		})
 	}))
@@ -237,7 +331,7 @@ func TestAddressPrefixSetClient_Put_PollsLROBeforeSuccess(t *testing.T) {
 			"name": "ps1",
 			"etag": `"etag1"`,
 			"properties": map[string]interface{}{
-				"addressPrefixes": []string{"10.0.0.1/32"},
+				"addressPrefixSet": []string{"10.0.0.1/32"},
 			},
 		})
 	}))
@@ -314,7 +408,7 @@ func TestAddressPrefixSetClient_Delete_NotFoundIsSuccess(t *testing.T) {
 }
 
 // TestAddressPrefixSetClient_Put_EmptyIPListSerializesAddressPrefixesEmptyArray verifies
-// T4.10: Put with empty IP list serializes as "addressPrefixes":[] not omitted.
+// T4.10: Put with empty IP list serializes as "addressPrefixSet":[] not omitted.
 func TestAddressPrefixSetClient_Put_EmptyIPListSerializesAddressPrefixesEmptyArray(t *testing.T) {
 	var capturedBody []byte
 
@@ -351,9 +445,9 @@ func TestAddressPrefixSetClient_Put_EmptyIPListSerializesAddressPrefixesEmptyArr
 	}
 
 	bodyStr := string(capturedBody)
-	// The body must contain "addressPrefixes":[] and NOT omit the field
-	if !strings.Contains(bodyStr, `"addressPrefixes":[]`) &&
-		!strings.Contains(bodyStr, `"addressPrefixes": []`) {
+	// The body must contain "addressPrefixSet":[] and NOT omit the field
+	if !strings.Contains(bodyStr, `"addressPrefixSet":[]`) &&
+		!strings.Contains(bodyStr, `"addressPrefixSet": []`) {
 		t.Errorf("expected PUT body to contain addressPrefixes as empty array, got: %s", bodyStr)
 	}
 }
@@ -370,7 +464,7 @@ func TestAddressPrefixSetClient_Get_CopiesResolvedETagOntoResult(t *testing.T) {
 			"id":   "/subscriptions/sub1/resourceGroups/rg1/providers/Microsoft.Network/applicationSecurityGroups/asg1/addressPrefixSets/ps1",
 			"name": "ps1",
 			"properties": map[string]interface{}{
-				"addressPrefixes": []string{"10.0.0.1/32"},
+				"addressPrefixSet": []string{"10.0.0.1/32"},
 			},
 		})
 	}))
@@ -410,7 +504,7 @@ func TestAddressPrefixSetClient_NilCredentialSkipsAuthorizationAndUsesInjectedHT
 			"name": "ps1",
 			"etag": `"etag-1"`,
 			"properties": map[string]interface{}{
-				"addressPrefixes": []string{"10.0.0.1/32"},
+				"addressPrefixSet": []string{"10.0.0.1/32"},
 			},
 		})
 	}))
@@ -505,7 +599,7 @@ func TestAddressPrefixSetClient_RetriesTransientThenSucceeds(t *testing.T) {
 			"id":   "/subscriptions/sub1/resourceGroups/rg1/providers/Microsoft.Network/applicationSecurityGroups/asg1/addressPrefixSets/ps1",
 			"name": "ps1",
 			"properties": map[string]interface{}{
-				"addressPrefixes": []string{"10.0.0.1/32"},
+				"addressPrefixSet": []string{"10.0.0.1/32"},
 			},
 		})
 	}))
@@ -559,5 +653,87 @@ func TestAddressPrefixSetClient_RetriesExhaustedReturnsLastError(t *testing.T) {
 	// 1 initial + 3 retries = 4 total
 	if got := calls.Load(); got != 4 {
 		t.Errorf("expected 4 total requests, got %d", got)
+	}
+}
+
+// fakeCredential is a test credential that counts GetToken calls.
+type fakeCredential struct {
+	calls     atomic.Int64
+	token     string
+	expiresOn time.Time
+}
+
+func (f *fakeCredential) GetToken(_ context.Context, _ policy.TokenRequestOptions) (azcore.AccessToken, error) {
+	f.calls.Add(1)
+	return azcore.AccessToken{Token: f.token, ExpiresOn: f.expiresOn}, nil
+}
+
+// TestAddressPrefixSetClient_AcquireToken_CachesUntilExpiry verifies that
+// acquireToken caches the token and only calls GetToken again when the
+// cached token is within the refresh margin of expiry.
+func TestAddressPrefixSetClient_AcquireToken_CachesUntilExpiry(t *testing.T) {
+	cred := &fakeCredential{
+		token:     "cached-token",
+		expiresOn: time.Now().Add(time.Hour), // expires far in the future
+	}
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("ETag", `"etag-1"`)
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"id":   "/subscriptions/sub1/resourceGroups/rg1/providers/Microsoft.Network/applicationSecurityGroups/asg1/addressPrefixSets/ps1",
+			"name": "ps1",
+			"properties": map[string]interface{}{
+				"addressPrefixSet": []string{"10.0.0.1/32"},
+			},
+		})
+	}))
+	defer srv.Close()
+
+	log := zaptest.NewLogger(t)
+	client := NewAddressPrefixSetClient(log, cred, srv.Client(), WithARMBaseURL(srv.URL))
+
+	ctx := context.Background()
+
+	// Multiple Get calls should reuse the cached token.
+	for i := 0; i < 5; i++ {
+		_, err := client.Get(ctx, "sub1", "rg1", "asg1", "ps1")
+		if err != nil {
+			t.Fatalf("Get[%d] returned error: %v", i, err)
+		}
+	}
+
+	// GetToken should have been called only once.
+	if got := cred.calls.Load(); got != 1 {
+		t.Errorf("expected 1 GetToken call (cached), got %d", got)
+	}
+}
+
+// TestAddressPrefixSetClient_AcquireToken_RefreshesExpiredToken verifies that
+// acquireToken refreshes the token when it is within the refresh margin.
+func TestAddressPrefixSetClient_AcquireToken_RefreshesExpiredToken(t *testing.T) {
+	cred := &fakeCredential{
+		token:     "refreshed-token",
+		expiresOn: time.Now().Add(time.Hour),
+	}
+
+	log := zaptest.NewLogger(t)
+	client := NewAddressPrefixSetClient(log, cred, nil, WithARMBaseURL("http://unused"))
+
+	// Seed the cache with an about-to-expire token.
+	client.cachedToken = "old-token"
+	client.tokenExpiresOn = time.Now().Add(2 * time.Minute) // within 5-min margin
+
+	ctx := context.Background()
+	token, err := client.acquireToken(ctx)
+	if err != nil {
+		t.Fatalf("acquireToken returned error: %v", err)
+	}
+
+	if token != "refreshed-token" {
+		t.Errorf("expected refreshed token, got %q", token)
+	}
+	if got := cred.calls.Load(); got != 1 {
+		t.Errorf("expected 1 GetToken call for refresh, got %d", got)
 	}
 }

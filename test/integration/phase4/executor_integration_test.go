@@ -119,7 +119,7 @@ func TestIntegration_FullPipeline_DesiredState_Diff_Execute(t *testing.T) {
 		t.Fatalf("Get from fake failed: %v", err)
 	}
 	gotIPs := sortedStrings(got.Properties.AddressPrefixes)
-	wantIPs := []string{"10.0.0.1", "10.0.0.2"}
+	wantIPs := []string{"10.0.0.1/32", "10.0.0.2/32"}
 	if fmt.Sprintf("%v", gotIPs) != fmt.Sprintf("%v", wantIPs) {
 		t.Errorf("IPs mismatch: got %v, want %v", gotIPs, wantIPs)
 	}
@@ -168,7 +168,7 @@ func TestIntegration_FullPipeline_CreateThenUpdate(t *testing.T) {
 
 	// Verify round 1
 	got1, _ := fakeClient.Get(ctx, sub, rg, asgName, prefixSetName)
-	if len(got1.Properties.AddressPrefixes) != 1 || got1.Properties.AddressPrefixes[0] != "10.1.0.1" {
+	if len(got1.Properties.AddressPrefixes) != 1 || got1.Properties.AddressPrefixes[0] != "10.1.0.1/32" {
 		t.Fatalf("round 1: unexpected IPs %v", got1.Properties.AddressPrefixes)
 	}
 
@@ -222,7 +222,7 @@ func TestIntegration_FullPipeline_CreateThenUpdate(t *testing.T) {
 	// Verify round 2
 	got2, _ := fakeClient.Get(ctx, sub, rg, asgName, prefixSetName)
 	gotIPs := sortedStrings(got2.Properties.AddressPrefixes)
-	wantIPs := []string{"10.1.0.1", "10.1.0.2"}
+	wantIPs := []string{"10.1.0.1/32", "10.1.0.2/32"}
 	if fmt.Sprintf("%v", gotIPs) != fmt.Sprintf("%v", wantIPs) {
 		t.Errorf("round 2 IPs: got %v, want %v", gotIPs, wantIPs)
 	}
@@ -363,7 +363,7 @@ func TestIntegration_Executor_CrossSubscriptionRouting(t *testing.T) {
 			t.Errorf("sub=%s: Get failed: %v", tc.sub, err)
 			continue
 		}
-		if len(got.Properties.AddressPrefixes) != 1 || got.Properties.AddressPrefixes[0] != "10.0.0.1" {
+		if len(got.Properties.AddressPrefixes) != 1 || got.Properties.AddressPrefixes[0] != "10.0.0.1/32" {
 			t.Errorf("sub=%s: IPs mismatch: got %v", tc.sub, got.Properties.AddressPrefixes)
 		}
 	}
@@ -406,7 +406,7 @@ func TestIntegration_Executor_ETagRetryWithFakeClient(t *testing.T) {
 			ASGName:        asgName,
 			PrefixSetName:  prefixSetName,
 		},
-		DesiredIPs: []string{"10.0.0.1"},
+		DesiredIPs: []string{"10.0.0.1/32"},
 	}
 
 	results := executor.Execute(ctx, []engine.Action{action})
@@ -422,7 +422,7 @@ func TestIntegration_Executor_ETagRetryWithFakeClient(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Get after retry: %v", err)
 	}
-	if len(got.Properties.AddressPrefixes) != 1 || got.Properties.AddressPrefixes[0] != "10.0.0.1" {
+	if len(got.Properties.AddressPrefixes) != 1 || got.Properties.AddressPrefixes[0] != "10.0.0.1/32" {
 		t.Errorf("IPs mismatch after retry: got %v", got.Properties.AddressPrefixes)
 	}
 }
@@ -464,7 +464,7 @@ func TestIntegration_Executor_ETagRetryExhausted(t *testing.T) {
 			ASGName:        asgName,
 			PrefixSetName:  prefixSetName,
 		},
-		DesiredIPs: []string{"10.0.0.1"},
+		DesiredIPs: []string{"10.0.0.1/32"},
 	}
 
 	results := executor.Execute(ctx, []engine.Action{action})
@@ -509,7 +509,7 @@ func TestIntegration_Executor_ErrorIsolation(t *testing.T) {
 				SubscriptionID: sub, ResourceGroup: rg,
 				ASGName: "asg-iso", PrefixSetName: "ps-ok",
 			},
-			DesiredIPs: []string{"10.0.0.1"},
+			DesiredIPs: []string{"10.0.0.1/32"},
 		},
 		{
 			Kind: engine.CreatePrefixSet,
@@ -517,7 +517,7 @@ func TestIntegration_Executor_ErrorIsolation(t *testing.T) {
 				SubscriptionID: sub, ResourceGroup: rg,
 				ASGName: "asg-iso", PrefixSetName: "ps-fail",
 			},
-			DesiredIPs: []string{"10.0.0.2"},
+			DesiredIPs: []string{"10.0.0.2/32"},
 		},
 	}
 
@@ -542,7 +542,7 @@ func TestIntegration_Executor_ErrorIsolation(t *testing.T) {
 	got, err := fakeClient.Get(ctx, sub, rg, "asg-iso", "ps-ok")
 	if err != nil {
 		t.Errorf("ps-ok should exist: %v", err)
-	} else if got.Properties.AddressPrefixes[0] != "10.0.0.1" {
+	} else if got.Properties.AddressPrefixes[0] != "10.0.0.1/32" {
 		t.Errorf("ps-ok IPs wrong: %v", got.Properties.AddressPrefixes)
 	}
 }
@@ -615,7 +615,7 @@ func TestIntegration_Executor_ContextCancellation(t *testing.T) {
 				SubscriptionID: sub, ResourceGroup: rg,
 				ASGName: "asg", PrefixSetName: "ps",
 			},
-			DesiredIPs: []string{"10.0.0.1"},
+			DesiredIPs: []string{"10.0.0.1/32"},
 		},
 	}
 
@@ -662,7 +662,7 @@ func TestIntegration_Executor_BoundedConcurrency(t *testing.T) {
 				SubscriptionID: "sub-conc", ResourceGroup: "rg-conc",
 				ASGName: "asg-conc", PrefixSetName: fmt.Sprintf("ps-%d", i),
 			},
-			DesiredIPs: []string{fmt.Sprintf("10.0.0.%d", i)},
+			DesiredIPs: []string{fmt.Sprintf("10.0.0.%d/32", i)},
 		})
 	}
 
@@ -763,7 +763,7 @@ func TestIntegration_ClientFactory_HttpTestServer(t *testing.T) {
 				Name: &psName,
 				Etag: &etag,
 				Properties: &azure.AddressPrefixSetProperties{
-					AddressPrefixes: []string{"10.0.0.1"},
+					AddressPrefixes: []string{"10.0.0.1/32"},
 				},
 			})
 		case r.Method == http.MethodPut && strings.Contains(path, "/addressPrefixSets/"+psName):
@@ -777,7 +777,7 @@ func TestIntegration_ClientFactory_HttpTestServer(t *testing.T) {
 						Name: &psName,
 						Etag: &etag,
 						Properties: &azure.AddressPrefixSetProperties{
-							AddressPrefixes: []string{"10.0.0.1"},
+							AddressPrefixes: []string{"10.0.0.1/32"},
 						},
 					},
 				},
@@ -824,7 +824,7 @@ func TestIntegration_ClientFactory_HttpTestServer(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Get via cached client failed: %v", err)
 	}
-	if got2.Properties.AddressPrefixes[0] != "10.0.0.1" {
+	if got2.Properties.AddressPrefixes[0] != "10.0.0.1/32" {
 		t.Errorf("cached client returned wrong data: %v", got2.Properties.AddressPrefixes)
 	}
 }
@@ -903,7 +903,7 @@ func TestIntegration_Executor_WithRealClientFactory_HttpTest(t *testing.T) {
 			SubscriptionID: sub, ResourceGroup: rg,
 			ASGName: asgName, PrefixSetName: psName,
 		},
-		DesiredIPs: []string{"10.0.0.1", "10.0.0.2"},
+		DesiredIPs: []string{"10.0.0.1/32", "10.0.0.2/32"},
 	}
 
 	results := executor.Execute(ctx, []engine.Action{action})
@@ -916,7 +916,7 @@ func TestIntegration_Executor_WithRealClientFactory_HttpTest(t *testing.T) {
 	gotIPs := sortedStrings(storedIPs)
 	mu.Unlock()
 
-	wantIPs := []string{"10.0.0.1", "10.0.0.2"}
+	wantIPs := []string{"10.0.0.1/32", "10.0.0.2/32"}
 	if fmt.Sprintf("%v", gotIPs) != fmt.Sprintf("%v", wantIPs) {
 		t.Errorf("server IPs: got %v, want %v", gotIPs, wantIPs)
 	}
@@ -940,7 +940,7 @@ func TestIntegration_Executor_FactoryError_Propagation(t *testing.T) {
 			SubscriptionID: "unknown-sub", ResourceGroup: "rg",
 			ASGName: "asg", PrefixSetName: "ps",
 		},
-		DesiredIPs: []string{"10.0.0.1"},
+		DesiredIPs: []string{"10.0.0.1/32"},
 	}
 
 	results := executor.Execute(ctx, []engine.Action{action})
@@ -1029,7 +1029,7 @@ func TestIntegration_FullPipeline_MultipleMappingsSameASG(t *testing.T) {
 		t.Fatalf("Get ps2 failed: %v", err)
 	}
 	gotIPs2 := sortedStrings(got2.Properties.AddressPrefixes)
-	wantIPs2 := []string{"10.0.1.1", "10.0.1.2"}
+	wantIPs2 := []string{"10.0.1.1/32", "10.0.1.2/32"}
 	if fmt.Sprintf("%v", gotIPs2) != fmt.Sprintf("%v", wantIPs2) {
 		t.Errorf("ps2 IPs: got %v, want %v", gotIPs2, wantIPs2)
 	}

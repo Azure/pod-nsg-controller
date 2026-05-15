@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/Azure/azure-sdk-for-go/sdk/azcore"
@@ -18,8 +19,12 @@ import (
 )
 
 const (
-	apiVersion = "2025-07-01"
-	armEndpoint    = "https://management.azure.com"
+	apiVersion  = "2025-07-01"
+	armEndpoint = "https://management.azure.com"
+
+	// tokenRefreshMargin is how long before expiry we proactively refresh the
+	// cached token, matching the Azure SDK's default behaviour.
+	tokenRefreshMargin = 5 * time.Minute
 )
 
 // AddressPrefixSet represents an address prefix set child resource of an ASG.
@@ -33,7 +38,7 @@ type AddressPrefixSet struct {
 
 // AddressPrefixSetProperties contains the properties of an address prefix set.
 type AddressPrefixSetProperties struct {
-	AddressPrefixes   []string `json:"addressPrefixes"` // no omitempty (T4.10)
+	AddressPrefixes   []string `json:"addressPrefixSet"` // NRP internal property name (differs from swagger "addressPrefixes")
 	ProvisioningState *string  `json:"provisioningState,omitempty"`
 }
 
@@ -44,7 +49,7 @@ type AddressPrefixSetListResult struct {
 }
 
 // AddressPrefixSetClient manages AddressPrefixSet operations using direct REST calls
-// against the 2026-01-01 API version. It implements AddressPrefixSetAPI.
+// against the 2025-07-01 API version. It implements AddressPrefixSetAPI.
 type AddressPrefixSetClient struct {
 	log         *zap.Logger
 	credential  azcore.TokenCredential // nil allowed for tests
@@ -52,6 +57,11 @@ type AddressPrefixSetClient struct {
 	baseURL     string
 	retryPolicy RetryPolicy
 	rateLimiter SubscriptionRateLimiter
+
+	// Token cache — avoids a metadata-server round trip on every request.
+	tokenMu        sync.Mutex
+	cachedToken    string
+	tokenExpiresOn time.Time
 }
 
 // AddressPrefixSetClientOption configures an AddressPrefixSetClient.
@@ -103,12 +113,24 @@ func (c *AddressPrefixSetClient) acquireToken(ctx context.Context) (string, erro
 	if c.credential == nil {
 		return "", nil
 	}
+
+	c.tokenMu.Lock()
+	defer c.tokenMu.Unlock()
+
+	// Return cached token if still valid (with margin before expiry).
+	if c.cachedToken != "" && time.Now().Before(c.tokenExpiresOn.Add(-tokenRefreshMargin)) {
+		return c.cachedToken, nil
+	}
+
 	token, err := c.credential.GetToken(ctx, policy.TokenRequestOptions{
 		Scopes: []string{"https://management.azure.com/.default"},
 	})
 	if err != nil {
 		return "", errors.Wrap(err, "acquiring token")
 	}
+
+	c.cachedToken = token.Token
+	c.tokenExpiresOn = token.ExpiresOn
 	return token.Token, nil
 }
 
@@ -265,8 +287,25 @@ func (c *AddressPrefixSetClient) Get(ctx context.Context, subscriptionID, resour
 	}
 
 	var result AddressPrefixSet
-	if err := json.Unmarshal(body, &result); err != nil {
-		return nil, errors.Wrap(err, "decoding response")
+
+	// The ARM API returns a list envelope {"value":[...]} for both single-resource
+	// GET and list operations. Try to extract the resource from the list first.
+	var listResult AddressPrefixSetListResult
+	if err := json.Unmarshal(body, &listResult); err == nil && listResult.Value != nil {
+		if len(listResult.Value) == 0 {
+			return nil, errors.Wrapf(ErrNotFound, "GET AddressPrefixSet %s returned empty list", prefixSetName)
+		}
+		result = listResult.Value[0]
+	} else {
+		// Fallback: try direct unmarshal (future API versions may return a single object)
+		if err := json.Unmarshal(body, &result); err != nil {
+			return nil, errors.Wrap(err, "decoding response")
+		}
+	}
+
+	// If the response still has no identity fields, treat as not found.
+	if result.ID == nil && result.Name == nil {
+		return nil, errors.Wrapf(ErrNotFound, "GET AddressPrefixSet %s returned empty resource", prefixSetName)
 	}
 
 	// Resolve ETag: header takes precedence over body

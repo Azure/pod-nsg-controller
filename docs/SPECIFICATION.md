@@ -37,7 +37,7 @@ detailed gap analysis.
 | Pod Reconciler | `internal/controller/pod_controller.go` | Watches Pods, reads ASG names from labels/annotations, resolves ASGs by name in a single resource group. NIC resolution and ASG update logic are TODO stubs. |
 | ASG Client | `internal/azure/asg_client.go` | CRUD operations on ASGs (the parent resource). Uses `armnetwork.ApplicationSecurityGroupsClient`. Single subscription/RG. |
 | NIC Client | `internal/azure/nic_client.go` | Basic NIC Get/Update/List. Single subscription/RG. Not used by the reconciler yet. |
-| AddressPrefixSet Client | `internal/azure/address_prefix_set_client.go` | Direct REST client for `addressPrefixSets` child resources (GET/PUT/DELETE/List) against API version `2026-01-01`. Single subscription/RG. |
+| AddressPrefixSet Client | `internal/azure/address_prefix_set_client.go` | Direct REST client for `addressPrefixSets` child resources (GET/PUT/DELETE/List) against API version `2025-07-01`. Single subscription/RG. |
 | Config | `internal/config/config.go` | Reads `AZURE_SUBSCRIPTION_ID`, `AZURE_RESOURCE_GROUP`, `AZURE_NSG_NAME` from env vars. |
 | Main | `cmd/main.go` | Bootstraps controller-runtime manager, registers `PodReconciler`. No CRD scheme registration. |
 | Makefile | `Makefile` | Build/test/deploy targets. `generate` and `manifests` are stubs. |

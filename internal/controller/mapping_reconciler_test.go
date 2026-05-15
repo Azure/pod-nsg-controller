@@ -414,8 +414,8 @@ func TestReconcile_DeletePath_CleansOwnedPrefixSetsAndRemovesFinalizer(t *testin
 
 	// Pre-populate fake Azure with prefix sets to be cleaned up
 	ownershipKey := "test-cluster-test-ns-my-mapping"
-	_ = fakeAzClient.Put(ctx, "sub1", "rg1", "asg1", ownershipKey, []string{"10.0.0.1"})
-	_ = fakeAzClient.Put(ctx, "sub1", "rg1", "asg2", ownershipKey, []string{"10.0.0.2"})
+	_ = fakeAzClient.Put(ctx, "sub1", "rg1", "asg1", ownershipKey, []string{"10.0.0.1/32"})
+	_ = fakeAzClient.Put(ctx, "sub1", "rg1", "asg2", ownershipKey, []string{"10.0.0.2/32"})
 
 	exec := &stubExecutor{}
 
@@ -715,7 +715,7 @@ func TestReconcile_DeletePath_DeleteError_RetainsFinalizerAndReturnsError(t *tes
 	fakeFactory.RegisterClient("sub1", fakeAzClient)
 
 	// Pre-populate a prefix set to trigger delete
-	_ = fakeAzClient.Put(ctx, "sub1", "rg1", "asg1", ownershipKey, []string{"10.0.0.1"})
+	_ = fakeAzClient.Put(ctx, "sub1", "rg1", "asg1", ownershipKey, []string{"10.0.0.1/32"})
 
 	// Inject a Delete error
 	deleteErr := fmt.Errorf("simulated delete failure")
@@ -807,8 +807,8 @@ func TestReconcile_DeletePath_MultipleCleanupErrors_AggregatesAndRetainsFinalize
 	fakeFactory.RegisterClient("sub1", fakeAzClient)
 
 	// Pre-populate prefix sets
-	_ = fakeAzClient.Put(ctx, "sub1", "rg1", "asg1", ownershipKey, []string{"10.0.0.1"})
-	_ = fakeAzClient.Put(ctx, "sub1", "rg1", "asg2", ownershipKey, []string{"10.0.0.2"})
+	_ = fakeAzClient.Put(ctx, "sub1", "rg1", "asg1", ownershipKey, []string{"10.0.0.1/32"})
+	_ = fakeAzClient.Put(ctx, "sub1", "rg1", "asg2", ownershipKey, []string{"10.0.0.2/32"})
 
 	// Inject Delete errors for both ASGs
 	_ = fakeAzClient.InjectError(fake.InjectKey{
@@ -964,7 +964,7 @@ func TestReconcile_DeletePath_AbsentOwnedAnnotation_FallsBackToSpecCandidates(t 
 	fakeFactory.RegisterClient("sub1", fakeAzClient)
 
 	// Pre-populate Azure with a prefix set to be cleaned up via spec fallback
-	_ = fakeAzClient.Put(ctx, "sub1", "rg1", "asg1", ownershipKey, []string{"10.0.0.1"})
+	_ = fakeAzClient.Put(ctx, "sub1", "rg1", "asg1", ownershipKey, []string{"10.0.0.1/32"})
 
 	exec := &stubExecutor{}
 	r := &MappingReconciler{
@@ -1046,7 +1046,7 @@ func TestReconcile_DeletePath_RemovesOnlyCleanupFinalizer(t *testing.T) {
 	fakeAzClient := fake.NewClient()
 	fakeFactory.RegisterClient("sub1", fakeAzClient)
 
-	_ = fakeAzClient.Put(ctx, "sub1", "rg1", "asg1", ownershipKey, []string{"10.0.0.1"})
+	_ = fakeAzClient.Put(ctx, "sub1", "rg1", "asg1", ownershipKey, []string{"10.0.0.1/32"})
 
 	exec := &stubExecutor{}
 	r := &MappingReconciler{
@@ -1379,7 +1379,7 @@ func TestReconcile_DeletePath_Azure404IsNonFatal(t *testing.T) {
 	fakeFactory.RegisterClient("sub1", fakeAzClient)
 
 	// Pre-populate so list returns an entry, then inject 404 on delete
-	_ = fakeAzClient.Put(ctx, "sub1", "rg1", "asg1", ownershipKey, []string{"10.0.0.1"})
+	_ = fakeAzClient.Put(ctx, "sub1", "rg1", "asg1", ownershipKey, []string{"10.0.0.1/32"})
 	// Delete the entry so that the actual delete call returns 404
 	_ = fakeAzClient.Delete(ctx, "sub1", "rg1", "asg1", ownershipKey)
 
