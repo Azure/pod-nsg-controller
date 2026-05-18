@@ -339,9 +339,7 @@ func (c *AddressPrefixSetClient) Get(ctx context.Context, subscriptionID, resour
 	// per-resource ETag from the body. For single-resource responses (direct
 	// object or list with one item), the header ETag is authoritative.
 	headerETag := resp.Header.Get("ETag")
-	if headerETag != "" && !multipleResults {
-		result.Etag = &headerETag
-	} else if (result.Etag == nil || *result.Etag == "") && headerETag != "" {
+	if !multipleResults && headerETag != "" {
 		result.Etag = &headerETag
 	}
 
