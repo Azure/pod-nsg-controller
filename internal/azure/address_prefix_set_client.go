@@ -287,6 +287,7 @@ func (c *AddressPrefixSetClient) Get(ctx context.Context, subscriptionID, resour
 	}
 
 	var result AddressPrefixSet
+	var multipleResults bool
 
 	// The ARM API returns a list envelope {"value":[...]} for both single-resource
 	// GET and list operations. Try to extract the resource from the list first.
@@ -295,7 +296,32 @@ func (c *AddressPrefixSetClient) Get(ctx context.Context, subscriptionID, resour
 		if len(listResult.Value) == 0 {
 			return nil, errors.Wrapf(ErrNotFound, "GET AddressPrefixSet %s returned empty list", prefixSetName)
 		}
-		result = listResult.Value[0]
+		// Find the matching prefix set by name — the list may contain multiple
+		// prefix sets belonging to the same ASG (e.g., from different clusters).
+		// Taking Value[0] without checking the name would return the wrong ETag
+		// when multiple prefix sets exist, causing 412 PreconditionFailed on PUT.
+		multipleResults = len(listResult.Value) > 1
+		found := false
+		for i := range listResult.Value {
+			itemName := ""
+			if listResult.Value[i].Name != nil {
+				itemName = *listResult.Value[i].Name
+			} else if listResult.Value[i].ID != nil {
+				// Extract name from resource ID (last segment)
+				parts := strings.Split(*listResult.Value[i].ID, "/")
+				if len(parts) > 0 {
+					itemName = parts[len(parts)-1]
+				}
+			}
+			if strings.EqualFold(itemName, prefixSetName) {
+				result = listResult.Value[i]
+				found = true
+				break
+			}
+		}
+		if !found {
+			return nil, errors.Wrapf(ErrNotFound, "GET AddressPrefixSet %s not found in list of %d items", prefixSetName, len(listResult.Value))
+		}
 	} else {
 		// Fallback: try direct unmarshal (future API versions may return a single object)
 		if err := json.Unmarshal(body, &result); err != nil {
@@ -308,9 +334,12 @@ func (c *AddressPrefixSetClient) Get(ctx context.Context, subscriptionID, resour
 		return nil, errors.Wrapf(ErrNotFound, "GET AddressPrefixSet %s returned empty resource", prefixSetName)
 	}
 
-	// Resolve ETag: header takes precedence over body
+	// Resolve ETag: when the response is a list with multiple items, the HTTP
+	// header ETag refers to the list, not an individual resource — use the
+	// per-resource ETag from the body. For single-resource responses (direct
+	// object or list with one item), the header ETag is authoritative.
 	headerETag := resp.Header.Get("ETag")
-	if headerETag != "" {
+	if !multipleResults && headerETag != "" {
 		result.Etag = &headerETag
 	}
 

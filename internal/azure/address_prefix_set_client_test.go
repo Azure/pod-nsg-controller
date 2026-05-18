@@ -185,6 +185,143 @@ func TestAddressPrefixSetClient_Get_ListEnvelopeWithOneResource(t *testing.T) {
 	}
 }
 
+// TestAddressPrefixSetClient_Get_ListEnvelopeWithMultipleResources verifies that
+// Get correctly finds the matching prefix set by name when the ARM API returns
+// a list containing multiple address prefix sets (e.g., from different clusters
+// sharing the same ASG).
+func TestAddressPrefixSetClient_Get_ListEnvelopeWithMultipleResources(t *testing.T) {
+	targetName := "eastus2euap-test-apps-backend"
+	otherName := "centraluseuap-default-backend"
+	targetETag := `"target-etag-abc"`
+	otherETag := `"other-etag-xyz"`
+	listHeaderETag := `"list-level-etag-should-not-be-used"`
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("ETag", listHeaderETag)
+		w.Header().Set("Content-Type", "application/json")
+		// ARM returns list envelope with multiple prefix sets
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"value": []map[string]interface{}{
+				{
+					"id":   "/subscriptions/sub1/resourceGroups/rg1/providers/Microsoft.Network/applicationSecurityGroups/asg1/addressPrefixSets/" + otherName,
+					"name": otherName,
+					"etag": otherETag,
+					"type": "Microsoft.Network/applicationSecurityGroups/addressPrefixSets",
+					"properties": map[string]interface{}{
+						"addressPrefixSet":  []string{"10.4.1.61/32", "10.4.1.78/32"},
+						"provisioningState": "Succeeded",
+					},
+				},
+				{
+					"id":   "/subscriptions/sub1/resourceGroups/rg1/providers/Microsoft.Network/applicationSecurityGroups/asg1/addressPrefixSets/" + targetName,
+					"name": targetName,
+					"etag": targetETag,
+					"type": "Microsoft.Network/applicationSecurityGroups/addressPrefixSets",
+					"properties": map[string]interface{}{
+						"addressPrefixSet":  []string{"10.3.1.21/32", "10.3.1.27/32"},
+						"provisioningState": "Succeeded",
+					},
+				},
+			},
+		})
+	}))
+	defer srv.Close()
+
+	log := zaptest.NewLogger(t)
+	client := NewAddressPrefixSetClient(log, nil, srv.Client(), WithARMBaseURL(srv.URL))
+
+	result, err := client.Get(context.Background(), "sub1", "rg1", "asg1", targetName)
+	if err != nil {
+		t.Fatalf("Get returned unexpected error: %v", err)
+	}
+
+	// Must return the target prefix set, not the first one in the list
+	if result.Name == nil || *result.Name != targetName {
+		t.Errorf("expected Name %q, got %v", targetName, result.Name)
+	}
+	// Must use the per-resource body ETag, not the list-level header ETag
+	if result.Etag == nil || *result.Etag != targetETag {
+		got := "<nil>"
+		if result.Etag != nil {
+			got = *result.Etag
+		}
+		t.Errorf("expected per-resource ETag %q, got %q (list header ETag %q should NOT be used)", targetETag, got, listHeaderETag)
+	}
+	if result.Properties == nil || len(result.Properties.AddressPrefixes) != 2 {
+		t.Fatalf("expected 2 address prefixes for target")
+	}
+	if result.Properties.AddressPrefixes[0] != "10.3.1.21/32" {
+		t.Errorf("expected first prefix 10.3.1.21/32, got %s", result.Properties.AddressPrefixes[0])
+	}
+}
+
+// TestAddressPrefixSetClient_Get_ListEnvelopeMultipleResourcesNotFound verifies
+// that Get returns ErrNotFound when the list contains prefix sets but none match
+// the requested name.
+func TestAddressPrefixSetClient_Get_ListEnvelopeMultipleResourcesNotFound(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("ETag", `"list-etag"`)
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"value": []map[string]interface{}{
+				{
+					"id":   "/subscriptions/sub1/resourceGroups/rg1/providers/Microsoft.Network/applicationSecurityGroups/asg1/addressPrefixSets/other-cluster-mapping",
+					"name": "other-cluster-mapping",
+					"etag": `"other-etag"`,
+					"properties": map[string]interface{}{
+						"addressPrefixSet": []string{"10.4.1.1/32"},
+					},
+				},
+			},
+		})
+	}))
+	defer srv.Close()
+
+	log := zaptest.NewLogger(t)
+	client := NewAddressPrefixSetClient(log, nil, srv.Client(), WithARMBaseURL(srv.URL))
+
+	_, err := client.Get(context.Background(), "sub1", "rg1", "asg1", "my-missing-prefix-set")
+	if err == nil {
+		t.Fatal("expected ErrNotFound, got nil error")
+	}
+	if !IsNotFound(err) {
+		t.Errorf("expected ErrNotFound, got: %v", err)
+	}
+}
+
+// TestAddressPrefixSetClient_Get_ListEnvelopeMatchesCaseInsensitive verifies
+// that name matching is case-insensitive to handle ARM normalization.
+func TestAddressPrefixSetClient_Get_ListEnvelopeMatchesCaseInsensitive(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"value": []map[string]interface{}{
+				{
+					"id":   "/subscriptions/sub1/resourceGroups/rg1/providers/Microsoft.Network/applicationSecurityGroups/asg1/addressPrefixSets/MyPrefixSet",
+					"name": "MyPrefixSet",
+					"etag": `"case-etag"`,
+					"properties": map[string]interface{}{
+						"addressPrefixSet": []string{"10.0.0.1/32"},
+					},
+				},
+			},
+		})
+	}))
+	defer srv.Close()
+
+	log := zaptest.NewLogger(t)
+	client := NewAddressPrefixSetClient(log, nil, srv.Client(), WithARMBaseURL(srv.URL))
+
+	// Request with different case than what ARM returns
+	result, err := client.Get(context.Background(), "sub1", "rg1", "asg1", "myprefixset")
+	if err != nil {
+		t.Fatalf("Get returned unexpected error: %v", err)
+	}
+	if result.Name == nil || *result.Name != "MyPrefixSet" {
+		t.Errorf("expected Name 'MyPrefixSet', got %v", result.Name)
+	}
+}
+
 // TestAddressPrefixSetClient_Put_UsesIfMatchForExisting verifies that
 // Put sends If-Match header with ETag for resources confirmed to exist.
 func TestAddressPrefixSetClient_Put_UsesIfMatchForExisting(t *testing.T) {
