@@ -86,13 +86,13 @@ func TestPhase8_T87_ConvergenceAddRecordedFromDetectionToPUTSuccess(t *testing.T
 	completedAt := detectedAt.Add(2 * time.Second)
 
 	// Start convergence tracking
-	tracker.StartOrKeep(key, target, ConvergenceOpAdd, detectedAt)
+	tracker.StartOrKeep(key, target, 1, ConvergenceOpAdd, detectedAt)
 
 	// Stage successful ARM action
-	tracker.StageSuccessfulAction(key, target, ConvergenceOpAdd, completedAt)
+	tracker.StageSuccessfulAction(key, target, 1, ConvergenceOpAdd, completedAt)
 
 	// Commit after status write
-	tracker.CommitConvergence(rec, key, target)
+	tracker.CommitConvergence(rec, key, target, 1)
 
 	// Verify histogram observation
 	count := getConvergenceHistogramCount(t, rec, "sub-123", "rg-prod", "asg-web", "add")
@@ -170,16 +170,16 @@ func TestPhase8_ConvergenceRetryPreservesOriginalStartTime(t *testing.T) {
 
 	originalStart := time.Now()
 	// First attempt starts tracking
-	tracker.StartOrKeep(key, target, ConvergenceOpAdd, originalStart)
+	tracker.StartOrKeep(key, target, 1, ConvergenceOpAdd, originalStart)
 
 	// Retry after 5s - StartOrKeep should NOT reset the start time
 	retryTime := originalStart.Add(5 * time.Second)
-	tracker.StartOrKeep(key, target, ConvergenceOpAdd, retryTime)
+	tracker.StartOrKeep(key, target, 1, ConvergenceOpAdd, retryTime)
 
 	// Final success at 10s from original start
 	completedAt := originalStart.Add(10 * time.Second)
-	tracker.StageSuccessfulAction(key, target, ConvergenceOpAdd, completedAt)
-	tracker.CommitConvergence(rec, key, target)
+	tracker.StageSuccessfulAction(key, target, 1, ConvergenceOpAdd, completedAt)
+	tracker.CommitConvergence(rec, key, target, 1)
 
 	// Duration should be 10s (from original start), not 5s (from retry)
 	sum := getConvergenceHistogramSum(t, rec, "sub-retry", "rg-retry", "asg-retry", "add")
@@ -236,5 +236,40 @@ func TestPhase8_T810_PrefixSetActionsTotalTracksSuccessAndFailure(t *testing.T) 
 	failureCreate := getPrefixSetActionCount(t, rec, "create", "failure")
 	if failureCreate != 1 {
 		t.Errorf("prefix_set_actions_total{operation=create,result=failure} = %v, want 1", failureCreate)
+	}
+}
+
+func TestPhase8_ConvergenceTracker_ForgetGeneration_PrunesStaleTokens(t *testing.T) {
+	tracker := NewConvergenceTracker()
+	key := types.NamespacedName{Namespace: "ns", Name: "mapping"}
+	target := engine.ASGTarget{SubscriptionID: "sub", ResourceGroup: "rg", ASGName: "asg"}
+	now := time.Now()
+
+	// Start tokens for generations 1, 2, and 3.
+	tracker.StartOrKeep(key, target, 1, ConvergenceOpAdd, now)
+	tracker.StartOrKeep(key, target, 2, ConvergenceOpUpdate, now.Add(time.Second))
+	tracker.StartOrKeep(key, target, 3, ConvergenceOpDelete, now.Add(2*time.Second))
+
+	// Stage gen 2 so it has a completedAt.
+	tracker.StageSuccessfulAction(key, target, 2, ConvergenceOpUpdate, now.Add(3*time.Second))
+
+	// Prune generation 2 (simulating stale-generation exit).
+	tracker.ForgetGeneration(key, 2)
+
+	// Verify gen 2 is gone.
+	tracker.mu.Lock()
+	remaining := len(tracker.pending)
+	tracker.mu.Unlock()
+	if remaining != 2 {
+		t.Fatalf("expected 2 remaining tokens after pruning gen 2, got %d", remaining)
+	}
+
+	// Verify gen 1 and 3 still present.
+	rec := newConvergenceRecorder()
+	tracker.CommitConvergence(rec, key, target, 2)
+	// Should not record anything since gen 2 was pruned.
+	count := getConvergenceHistogramCount(t, rec, "sub", "rg", "asg", "update")
+	if count != 0 {
+		t.Errorf("expected 0 observations after pruning gen 2, got %d", count)
 	}
 }

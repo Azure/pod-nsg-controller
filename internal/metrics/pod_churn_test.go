@@ -139,7 +139,7 @@ func TestPhase8_T813_PodChurnRateGaugeReflectsSlidingWindow(t *testing.T) {
 	emptySnapshot := MappingPodSnapshot{Pods: map[PodIdentity]PodMembership{}}
 	tracker.ObserveSnapshot(rec, key, emptySnapshot, t0)
 
-	// Second snapshot: 10 pods added after 5 seconds = 10/5 = 2.0 changes/sec
+	// Second snapshot: 10 pods added after 5 seconds
 	fivePodsSnapshot := MappingPodSnapshot{
 		Pods: map[PodIdentity]PodMembership{
 			{Namespace: "default", Name: "p1", UID: "u1"}: {PodIP: "10.0.0.1"},
@@ -158,8 +158,10 @@ func TestPhase8_T813_PodChurnRateGaugeReflectsSlidingWindow(t *testing.T) {
 	tracker.ObserveSnapshot(rec, key, fivePodsSnapshot, t1)
 
 	rate := getGaugeValue(t, rec, "default", "rate-mapping")
-	// Expected: 10 changes / 5 seconds = 2.0
-	if rate < 1.9 || rate > 2.1 {
-		t.Errorf("pod_churn_rate = %v, want ~2.0 (10 changes in 5s)", rate)
+	// Windowed rate: 10 changes in interval [t0,t1]=5s, fully within 60s window.
+	// Weighted contribution: 10 * (5/5) = 10. Rate = 10/60 ≈ 0.1667
+	expectedRate := 10.0 / 60.0
+	if rate < expectedRate*0.9 || rate > expectedRate*1.1 {
+		t.Errorf("pod_churn_rate = %v, want ~%v (10 changes in 5s, 60s window)", rate, expectedRate)
 	}
 }

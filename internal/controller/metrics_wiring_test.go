@@ -4,8 +4,8 @@ import (
 	"testing"
 	"time"
 
-	dto "github.com/prometheus/client_model/go"
 	"github.com/prometheus/client_golang/prometheus"
+	dto "github.com/prometheus/client_model/go"
 	"k8s.io/apimachinery/pkg/types"
 
 	"github.com/Azure/pod-nsg-controller/internal/engine"
@@ -108,11 +108,69 @@ func TestPhase8_T813_ReconcilePath_PodChurnRateGaugeReflectsObservedRate(t *test
 	if delta.Added != 5 {
 		t.Errorf("delta.Added = %d, want 5", delta.Added)
 	}
-	// pod_churn_rate = 5 changes / 1 second = 5.0
+	// Windowed rate: 5 changes in 1s interval, fully within 60s window.
+	// Weighted contribution: 5 * (1/1) = 5. Rate = 5/60 ≈ 0.0833
 	rate := getPodChurnRateGauge(t, rec.PodChurn, "default", "mapping-churn")
-	if rate != 5.0 {
-		t.Errorf("pod_churn_rate = %v, want 5.0", rate)
+	expectedRate := 5.0 / 60.0
+	if rate < expectedRate*0.99 || rate > expectedRate*1.01 {
+		t.Errorf("pod_churn_rate = %v, want ~%v", rate, expectedRate)
 	}
+}
+
+// TestPhase8_ReconcilePath_PodChurnSnapshotBridge_PreservesDeltaSemantics verifies
+// that the reconciler's engine snapshot bridge preserves pod identity and IP
+// changes when recording churn metrics.
+func TestPhase8_ReconcilePath_PodChurnSnapshotBridge_PreservesDeltaSemantics(t *testing.T) {
+	metrics.ResetForTesting()
+	defer metrics.ResetForTesting()
+	rec, _ := metrics.Register()
+
+	key := types.NamespacedName{Namespace: "default", Name: "snapshot-bridge"}
+	reconciler := &MappingReconciler{
+		MetricsRecorder: rec,
+		PodChurnTracker: metrics.NewPodChurnTracker(),
+	}
+
+	initial := engine.PodSnapshot{
+		Pods: map[engine.PodIdentity]engine.PodMembership{
+			{Namespace: "default", Name: "pod-a", UID: "uid-a"}: {PodIP: "10.0.0.1"},
+			{Namespace: "default", Name: "pod-b", UID: "uid-b"}: {PodIP: "10.0.0.2"},
+		},
+	}
+	updated := engine.PodSnapshot{
+		Pods: map[engine.PodIdentity]engine.PodMembership{
+			{Namespace: "default", Name: "pod-a", UID: "uid-a"}: {PodIP: "10.0.0.10"},
+			{Namespace: "default", Name: "pod-c", UID: "uid-c"}: {PodIP: "10.0.0.3"},
+		},
+	}
+
+	t.Run("initial snapshot counts adds once per engine pod", func(t *testing.T) {
+		reconciler.observePodChurnFromSnapshot(key, initial)
+
+		adds := getPodIPChangesTotal(t, rec.PodChurn, key.Namespace, key.Name, "add")
+		if adds != 2 {
+			t.Errorf("pod_ip_changes_total{operation=add} = %v, want 2", adds)
+		}
+	})
+
+	t.Run("follow-up snapshot preserves update delete and add semantics", func(t *testing.T) {
+		reconciler.observePodChurnFromSnapshot(key, updated)
+
+		adds := getPodIPChangesTotal(t, rec.PodChurn, key.Namespace, key.Name, "add")
+		if adds != 3 {
+			t.Errorf("pod_ip_changes_total{operation=add} = %v, want 3", adds)
+		}
+
+		deletes := getPodIPChangesTotal(t, rec.PodChurn, key.Namespace, key.Name, "delete")
+		if deletes != 1 {
+			t.Errorf("pod_ip_changes_total{operation=delete} = %v, want 1", deletes)
+		}
+
+		updates := getPodIPChangesTotal(t, rec.PodChurn, key.Namespace, key.Name, "update")
+		if updates != 1 {
+			t.Errorf("pod_ip_changes_total{operation=update} = %v, want 1", updates)
+		}
+	})
 }
 
 // TestPhase8_T81_ReconcilePath_ThreePodsAddedIncrementsCounter
@@ -202,9 +260,9 @@ func TestPhase8_T87_ReconcilePath_ConvergenceObservation(t *testing.T) {
 	}
 
 	t0 := time.Now()
-	tracker.StartOrKeep(key, target, metrics.ConvergenceOpAdd, t0)
-	tracker.StageSuccessfulAction(key, target, metrics.ConvergenceOpAdd, t0.Add(200*time.Millisecond))
-	tracker.CommitConvergence(rec.Convergence, key, target)
+	tracker.StartOrKeep(key, target, 1, metrics.ConvergenceOpAdd, t0)
+	tracker.StageSuccessfulAction(key, target, 1, metrics.ConvergenceOpAdd, t0.Add(200*time.Millisecond))
+	tracker.CommitConvergence(rec.Convergence, key, target, 1)
 
 	val := getConvergenceHistogramCount(t, rec.Convergence, "sub-1", "rg-1", "asg-1", "add")
 	if val != 1 {

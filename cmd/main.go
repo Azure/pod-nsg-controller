@@ -2,7 +2,6 @@ package main
 
 import (
 	"flag"
-	"fmt"
 	"os"
 	"time"
 
@@ -11,6 +10,7 @@ import (
 	"go.uber.org/zap/zapcore"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/types"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
 	ctrl "sigs.k8s.io/controller-runtime"
@@ -48,7 +48,7 @@ func main() {
 	zapCfg.EncoderConfig.EncodeTime = zapcore.ISO8601TimeEncoder
 	zapLog, err := zapCfg.Build()
 	if err != nil {
-		_, _ = fmt.Fprintf(os.Stderr, "failed to initialize zap logger: %v\n", err)
+		_, _ = os.Stderr.WriteString("failed to initialize zap logger: " + err.Error() + "\n")
 		os.Exit(1)
 	}
 	defer func() { _ = zapLog.Sync() }()
@@ -108,6 +108,33 @@ func main() {
 	initialTracker := metrics.NewInitialReconcileTracker(controllerStart)
 	podChurnTracker := metrics.NewPodChurnTracker()
 	convergenceTracker := metrics.NewConvergenceTracker()
+
+	// Wire convergence committer: the status updater invokes this callback after
+	// each status resolution (written, noop, or error). The callback commits
+	// staged convergence measurements for all outcomes because the ARM action
+	// already succeeded—the convergence duration spans detection to ARM PUT
+	// success, not to status write. Only not-found/stale-generation sentinels
+	// suppress notification (handled inside the status updater itself).
+	statusUpdater.SetConvergenceCommitter(func(
+		key types.NamespacedName,
+		observedGeneration int64,
+		results []azure.ActionResult,
+		outcome controller.StatusWriteOutcome,
+		_ error,
+	) {
+		_ = outcome // commit on all outcomes: written, noop, and error
+		for _, res := range results {
+			if res.Success {
+				if res.NoOp {
+					// No ARM mutation occurred; forget the stale token so its
+					// detectedAt does not inflate a future real convergence.
+					convergenceTracker.ForgetTarget(key, res.Action.Target, observedGeneration)
+				} else {
+					convergenceTracker.CommitConvergence(rec.Convergence, key, res.Action.Target, observedGeneration)
+				}
+			}
+		}
+	})
 
 	reconciler := &controller.MappingReconciler{
 		Client:               mgr.GetClient(),

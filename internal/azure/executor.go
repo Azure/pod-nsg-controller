@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"sync"
+	"time"
 
 	"github.com/Azure/pod-nsg-controller/internal/engine"
 	pkgerrors "github.com/pkg/errors"
@@ -13,9 +14,20 @@ import (
 
 // ActionResult holds the outcome of executing a single action.
 type ActionResult struct {
-	Action  engine.Action
-	Success bool
-	Err     error
+	Action          engine.Action
+	Success         bool
+	Err             error
+	CompletedAt     time.Time         // Timestamp when the ARM operation finished
+	NoOp            bool              // True when a 412-retry recompute determined no ARM mutation was needed
+	FinalActionKind engine.ActionKind // The terminal action kind after any recompute (may differ from Action.Kind)
+}
+
+// executionOutcome is the internal result of executeWithETagRetry, carrying
+// richer semantics than a bare error so Execute() can populate ActionResult fields.
+type executionOutcome struct {
+	err             error
+	noOp            bool              // 412 recompute found target already converged
+	finalActionKind engine.ActionKind // the action kind that was actually applied (or original if no recompute)
 }
 
 // armOperation returns the ARM operation for a given action kind.
@@ -83,11 +95,14 @@ func (e *Executor) Execute(ctx context.Context, actions []engine.Action) []Actio
 				return
 			}
 
-			err = e.executeWithETagRetry(ctx, client, act)
+			outcome := e.executeWithETagRetry(ctx, client, act)
 			results[idx] = ActionResult{
-				Action:  act,
-				Success: err == nil,
-				Err:     err,
+				Action:          act,
+				Success:         outcome.err == nil,
+				Err:             outcome.err,
+				CompletedAt:     time.Now(),
+				NoOp:            outcome.noOp,
+				FinalActionKind: outcome.finalActionKind,
 			}
 		}(i, action)
 	}
@@ -108,20 +123,21 @@ func (e *Executor) executeAction(ctx context.Context, client AddressPrefixSetAPI
 	}
 }
 
-func (e *Executor) executeWithETagRetry(ctx context.Context, client AddressPrefixSetAPI, action engine.Action) error {
+func (e *Executor) executeWithETagRetry(ctx context.Context, client AddressPrefixSetAPI, action engine.Action) executionOutcome {
+	finalKind := action.Kind
 	var err error
 	for attempt := 1; attempt <= e.maxRetries; attempt++ {
 		// Check context before each attempt
 		if ctx.Err() != nil {
-			return ctx.Err()
+			return executionOutcome{err: ctx.Err(), finalActionKind: finalKind}
 		}
 
 		err = e.executeAction(ctx, client, action)
 		if err == nil {
-			return nil
+			return executionOutcome{finalActionKind: finalKind}
 		}
 		if !IsPreconditionFailed(err) {
-			return err
+			return executionOutcome{err: err, finalActionKind: finalKind}
 		}
 
 		// Emit etag-conflict retry metric
@@ -151,7 +167,7 @@ func (e *Executor) executeWithETagRetry(ctx context.Context, client AddressPrefi
 
 		// Check context before recompute
 		if ctx.Err() != nil {
-			return ctx.Err()
+			return executionOutcome{err: ctx.Err(), finalActionKind: finalKind}
 		}
 
 		t := action.Target
@@ -163,16 +179,18 @@ func (e *Executor) executeWithETagRetry(ctx context.Context, client AddressPrefi
 		current, getErr := client.Get(ctx, t.SubscriptionID, t.ResourceGroup, t.ASGName, t.PrefixSetName)
 		next, done, recomputeErr := recomputeSingleTargetActionViaDiff(action, current, getErr)
 		if recomputeErr != nil {
-			return pkgerrors.Wrap(recomputeErr, "recompute after 412")
+			return executionOutcome{err: pkgerrors.Wrap(recomputeErr, "recompute after 412"), finalActionKind: finalKind}
 		}
 		if done {
-			return nil
+			// Target is already converged — no ARM mutation was applied.
+			return executionOutcome{noOp: true, finalActionKind: finalKind}
 		}
 		if next != nil {
 			action = *next
+			finalKind = action.Kind
 		}
 	}
-	return err
+	return executionOutcome{err: err, finalActionKind: finalKind}
 }
 
 // recomputeSingleTargetActionViaDiff re-GETs the resource and recomputes the diff

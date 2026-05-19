@@ -84,8 +84,9 @@ func (r *ConvergenceRecorder) RecordPrefixSetAction(operation, result string) {
 
 // convergenceToken tracks a pending convergence measurement.
 type convergenceToken struct {
-	op         ConvergenceOperation
-	detectedAt time.Time
+	op          ConvergenceOperation
+	target      engine.ASGTarget
+	detectedAt  time.Time
 	completedAt *time.Time
 }
 
@@ -96,8 +97,9 @@ type ConvergenceTracker struct {
 }
 
 type convergenceKey struct {
-	mappingKey types.NamespacedName
-	targetKey  string
+	mappingKey         types.NamespacedName
+	targetKey          string
+	observedGeneration int64
 }
 
 // NewConvergenceTracker creates a new ConvergenceTracker.
@@ -108,20 +110,21 @@ func NewConvergenceTracker() *ConvergenceTracker {
 }
 
 // StartOrKeep starts tracking convergence for a target, or keeps the existing start time.
-func (t *ConvergenceTracker) StartOrKeep(key types.NamespacedName, target engine.ASGTarget, op ConvergenceOperation, detectedAt time.Time) {
+// The observedGeneration scopes the tracking to a specific resource generation.
+func (t *ConvergenceTracker) StartOrKeep(key types.NamespacedName, target engine.ASGTarget, observedGeneration int64, op ConvergenceOperation, detectedAt time.Time) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
-	ck := convergenceKey{mappingKey: key, targetKey: target.FullResourceID}
+	ck := convergenceKey{mappingKey: key, targetKey: engine.TargetKey(target), observedGeneration: observedGeneration}
 	if _, exists := t.pending[ck]; !exists {
-		t.pending[ck] = convergenceToken{op: op, detectedAt: detectedAt}
+		t.pending[ck] = convergenceToken{op: op, target: target, detectedAt: detectedAt}
 	}
 }
 
 // StageSuccessfulAction stages a successful ARM action time for later commit.
-func (t *ConvergenceTracker) StageSuccessfulAction(key types.NamespacedName, target engine.ASGTarget, op ConvergenceOperation, completedAt time.Time) {
+func (t *ConvergenceTracker) StageSuccessfulAction(key types.NamespacedName, target engine.ASGTarget, observedGeneration int64, op ConvergenceOperation, completedAt time.Time) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
-	ck := convergenceKey{mappingKey: key, targetKey: target.FullResourceID}
+	ck := convergenceKey{mappingKey: key, targetKey: engine.TargetKey(target), observedGeneration: observedGeneration}
 	if token, exists := t.pending[ck]; exists {
 		token.completedAt = &completedAt
 		t.pending[ck] = token
@@ -131,10 +134,10 @@ func (t *ConvergenceTracker) StageSuccessfulAction(key types.NamespacedName, tar
 // CommitConvergence commits convergence measurements to the histogram.
 // The recorded duration spans from change detection to ARM PUT success
 // (captured by StageSuccessfulAction), not from the status write.
-func (t *ConvergenceTracker) CommitConvergence(rec *ConvergenceRecorder, key types.NamespacedName, target engine.ASGTarget) {
+func (t *ConvergenceTracker) CommitConvergence(rec *ConvergenceRecorder, key types.NamespacedName, target engine.ASGTarget, observedGeneration int64) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
-	ck := convergenceKey{mappingKey: key, targetKey: target.FullResourceID}
+	ck := convergenceKey{mappingKey: key, targetKey: engine.TargetKey(target), observedGeneration: observedGeneration}
 	if token, exists := t.pending[ck]; exists && token.completedAt != nil {
 		duration := token.completedAt.Sub(token.detectedAt)
 		rec.ObserveConvergence(target, token.op, duration)
@@ -142,7 +145,7 @@ func (t *ConvergenceTracker) CommitConvergence(rec *ConvergenceRecorder, key typ
 	}
 }
 
-// Forget removes all pending tokens for a mapping key.
+// Forget removes all pending tokens for a mapping key (across all generations).
 func (t *ConvergenceTracker) Forget(key types.NamespacedName) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
@@ -151,6 +154,44 @@ func (t *ConvergenceTracker) Forget(key types.NamespacedName) {
 			delete(t.pending, ck)
 		}
 	}
+}
+
+// ForgetGeneration removes all pending tokens for a specific mapping key and
+// generation. This is called on stale-generation exits to prune convergence
+// state that will never be committed.
+func (t *ConvergenceTracker) ForgetGeneration(key types.NamespacedName, generation int64) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	for ck := range t.pending {
+		if ck.mappingKey == key && ck.observedGeneration == generation {
+			delete(t.pending, ck)
+		}
+	}
+}
+
+// PruneStaleGenerations removes all pending tokens for a mapping key whose
+// observedGeneration is strictly less than the current generation. This is
+// called at the start of each reconcile to reclaim tokens abandoned by older
+// generations that will never be committed (e.g. due to spec churn).
+func (t *ConvergenceTracker) PruneStaleGenerations(key types.NamespacedName, currentGeneration int64) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	for ck := range t.pending {
+		if ck.mappingKey == key && ck.observedGeneration < currentGeneration {
+			delete(t.pending, ck)
+		}
+	}
+}
+
+// ForgetTarget removes the pending token for a specific mapping key, target,
+// and generation. This is used to clean up stale tokens when an ARM action
+// completes as a no-op (e.g. 412-retry recompute found target already converged)
+// so the detectedAt timestamp does not leak into a future real change.
+func (t *ConvergenceTracker) ForgetTarget(key types.NamespacedName, target engine.ASGTarget, generation int64) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	ck := convergenceKey{mappingKey: key, targetKey: engine.TargetKey(target), observedGeneration: generation}
+	delete(t.pending, ck)
 }
 
 // ClassifyConvergenceOperation classifies a target delta into a convergence operation.

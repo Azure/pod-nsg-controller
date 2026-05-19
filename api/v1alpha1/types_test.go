@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/go-logr/zapr"
+	"go.uber.org/zap"
 	"go.uber.org/zap/zaptest"
 
 	corev1 "k8s.io/api/core/v1"
@@ -50,10 +51,12 @@ func TestMain(m *testing.M) {
 	repoRoot, err := repoRootFromCWD()
 	if err != nil {
 		envtestSkipReason = fmt.Sprintf("failed to resolve repo root for envtest setup: %v", err)
-		fmt.Fprintf(os.Stderr, "warning: %s; continuing so non-envtest tests can run\n", envtestSkipReason)
+		warnLog, _ := zap.NewProduction()
+		warnLog.Warn("envtest setup issue; continuing so non-envtest tests can run", zap.String("reason", envtestSkipReason))
 	} else if err := configureEnvtestAssets(repoRoot); err != nil {
 		envtestSkipReason = fmt.Sprintf("failed to configure envtest assets: %v", err)
-		fmt.Fprintf(os.Stderr, "warning: %s; continuing so non-envtest tests can run\n", envtestSkipReason)
+		warnLog, _ := zap.NewProduction()
+		warnLog.Warn("envtest setup issue; continuing so non-envtest tests can run", zap.String("reason", envtestSkipReason))
 	} else {
 		envtestAssetsConfigured = true
 	}

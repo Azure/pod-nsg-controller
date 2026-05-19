@@ -1,0 +1,983 @@
+# Conductor Bugfix, Improvement & Iterative Refinement Workflow
+#
+# A streamlined single-iteration workflow for bug fixes, small improvements,
+# and iterative refinement phases in the pod-nsg-controller repo. Based on
+# phase-workflow.yaml but simplified:
+#   - Adds a code_explorer before the designer to scope changes
+#   - Single iteration (no v2 pass)
+#   - Encourages modifying existing modules over creating new ones
+#   - Works for bug fixes, feature improvements, and iterative refinements
+#
+# Prerequisites:
+#   1. Install Conductor:
+#      curl -sSfL https://aka.ms/conductor/install.sh | sh
+#
+#   2. Ensure GitHub Copilot CLI is available (for the copilot provider):
+#      gh extension install github/gh-copilot
+#
+#   3. Bug fix:
+#      conductor run .conductor/bugfix-workflow.yaml \
+#        --input description="Fix nil pointer dereference in reconciler when pod has no IP" \
+#        --input spec_path="docs/SPECIFICATION.md"
+#
+#   4. Iterative improvement:
+#      conductor run .conductor/bugfix-workflow.yaml \
+#        --input description="Add exponential backoff to ARM API retry logic" \
+#        --input spec_path="docs/SPECIFICATION.md"
+#
+#   5. Spec phase refinement:
+#      conductor run .conductor/bugfix-workflow.yaml \
+#        --input description="Improve error handling for AddressPrefixSet reconciliation" \
+#        --input spec_path="docs/SPECIFICATION.md" \
+#        --input phase="Phase 7: Error Handling, Resilience"
+#
+#   6. With a pre-existing design (skips explorer, design + review):
+#      conductor run .conductor/bugfix-workflow.yaml \
+#        --input description="Add retry on 429 throttling from ARM API" \
+#        --input spec_path="docs/SPECIFICATION.md" \
+#        --input design_path=".conductor/designs/fix-429-throttling.design.md"
+#
+#   7. With web dashboard:
+#      conductor run .conductor/bugfix-workflow.yaml --web \
+#        --input description="Improve convergence metric accuracy for multi-NSG setups" \
+#        --input spec_path="docs/SPECIFICATION.md"
+#
+# Flow:
+#   code_explorer → designer → design_reviewer ──(approved)──→ unit_test_writer
+#                                  ↑  (revise)  ←──(rejected)──┘
+#   code_explorer → designer ──(pre-existing design_path)──→ unit_test_writer [skip review]
+#   unit_test_writer → coder → unit_test_validator
+#                        ↑  ←──(tests fail)──┘
+#   unit_test_validator ──(pass)──→ code_reviewer
+#                                      ↓
+#                              (approved) → qa_validator → $end
+#                              (rejected) → coder
+#                                              ↑
+#                              qa_validator ──(rejected)──┘
+
+workflow:
+  name: bugfix-and-improvement
+  description: >-
+    Streamlined single-iteration TDD workflow for bug fixes, small
+    improvements, and iterative refinement phases. Starts with codebase
+    exploration to scope changes, then follows
+    design → test → implement → review → QA.
+  version: "1.0.0"
+  entry_point: code_explorer
+
+  runtime:
+    provider: copilot
+    default_model: claude-sonnet-4.6
+
+  input:
+    description:
+      type: string
+      required: true
+      description: >-
+        A clear description of the bug fix, improvement, or iterative
+        refinement to implement (e.g., "Fix nil pointer dereference in
+        reconciler when pod has no IP" or "Add exponential backoff to
+        ARM API retry logic")
+    spec_path:
+      type: string
+      required: true
+      description: >-
+        Path to the SPECIFICATION.md file (e.g., "docs/SPECIFICATION.md")
+    phase:
+      type: string
+      required: false
+      description: >-
+        Optional spec phase to scope the change against (e.g.,
+        "Phase 7: Error Handling, Resilience"). When provided, agents
+        focus on the deliverables and acceptance criteria for that phase.
+    design_path:
+      type: string
+      required: false
+      description: >-
+        Path to a pre-existing design document. When provided, the designer
+        loads this file and skips directly to test writing (bypassing
+        code exploration, design review, and approval gate).
+
+  context:
+    mode: accumulate
+
+  limits:
+    max_iterations: 40
+
+# ═══════════════════════════════════════════════════════════════════
+# AGENTS
+# ═══════════════════════════════════════════════════════════════════
+
+agents:
+
+  # ─── 1. CODE EXPLORER AGENT ──────────────────────────────────
+  - name: code_explorer
+    description: >-
+      Explores the codebase to understand the current structure,
+      identify relevant modules, and scope where the fix, improvement,
+      or refinement should land. Recommends modifying existing
+      modules and only suggests new files when absolutely necessary.
+    model: gpt-5.3-codex
+    input:
+      - workflow.input.description
+      - workflow.input.spec_path
+      - workflow.input.phase?
+    system_prompt: |
+      You are a Senior Codebase Analyst specializing in Go, Kubernetes
+      controllers, and Azure networking. Your job is to deeply explore
+      a codebase and produce a scoping report that tells a designer
+      exactly where changes should go.
+
+      Project context:
+      - Repository: pod-nsg-controller (Go, controller-runtime)
+      - Logging: go.uber.org/zap (uber-go/zap)
+      - Controller-runtime code uses logr backed by zapr
+      - Azure clients use *zap.Logger directly
+      - Error wrapping: github.com/pkg/errors (errors.Wrap/Wrapf)
+
+      Your guiding principle: **prefer modifying existing modules** over
+      creating new ones. Only recommend new files if there is no suitable
+      existing location for the change.
+    prompt: |
+      Explore the codebase to scope the following change:
+
+      **Description:** {{ workflow.input.description }}
+      **Specification:** Read `{{ workflow.input.spec_path }}`
+      {% if workflow.input.phase is defined and workflow.input.phase %}
+      **Spec Phase:** {{ workflow.input.phase }} — focus your exploration on
+      the deliverables and code paths related to this phase.
+      {% endif %}
+
+      ## Tasks
+
+      1. **Understand the repo structure:**
+         - Run `find . -type f -name '*.go' | head -80` to map Go files
+         - Read `go.mod` for dependencies
+         - Identify the package layout (cmd/, internal/, api/, test/)
+
+      2. **Locate the relevant code:**
+         - Search for types, functions, and patterns related to the
+           bug description
+         - Trace the code path that is affected
+         - Identify the root cause location (file + function)
+
+      3. **Analyze the surrounding context:**
+         - What interfaces or contracts does the affected code implement?
+         - What callers depend on the affected code?
+         - Are there existing tests for the affected code path?
+         - What logging and error handling patterns are used nearby?
+
+      4. **Identify existing modules that should be modified:**
+         - Which existing files need changes?
+         - Are there existing test files that should be extended?
+         - Is there an existing pattern for this kind of fix?
+
+      5. **Assess whether new files are needed:**
+         - Can the fix be made entirely within existing files?
+         - If a new file is truly needed, explain why no existing
+           module is suitable
+
+      6. **Write a scoping report** summarizing:
+         - Root cause analysis
+         - Affected files and functions
+         - Recommended files to modify (prefer existing)
+         - New files only if absolutely required (with justification)
+         - Existing test files to extend
+         - Related spec sections (if any)
+         - Risk assessment (what could break)
+
+      Save the report to `.conductor/designs/{{ workflow.input.description | replace(' ', '-') | lower }}.scope.md`
+    output:
+      scope_report_path:
+        type: string
+        description: Path where the scoping report was saved
+      affected_files:
+        type: array
+        description: Existing files that are affected by the bug/improvement
+      files_to_modify:
+        type: array
+        description: Recommended existing files to modify
+      files_to_create:
+        type: array
+        description: New files to create (only if no existing module fits)
+      existing_test_files:
+        type: array
+        description: Existing test files that should be extended
+      root_cause:
+        type: string
+        description: Brief root cause analysis
+    routes:
+      - to: designer
+
+  # ─── 2. DESIGN AGENT ─────────────────────────────────────────
+  - name: designer
+    description: >-
+      Creates a focused design for the bug fix, improvement, or
+      iterative refinement, grounded in the code explorer's scoping
+      report. Strongly prefers modifying existing code over creating
+      new modules. When a pre-existing design_path is provided,
+      loads it directly and skips review.
+    model: gpt-5.3-codex
+    input:
+      - workflow.input.description
+      - workflow.input.spec_path
+      - workflow.input.phase?
+      - workflow.input.design_path?
+      - code_explorer.output
+      - design_reviewer.output?
+    system_prompt: |
+      You are a Principal Software Architect specializing in Go, Kubernetes
+      controllers, and Azure networking. You create precise, minimal designs
+      for bug fixes and small improvements.
+
+      Project context:
+      - Repository: pod-nsg-controller (Go, controller-runtime)
+      - Logging: All code must use go.uber.org/zap (uber-go/zap)
+      - Controller-runtime code uses logr backed by zapr
+      - Azure clients use *zap.Logger directly
+      - Tests use zaptest.NewLogger(t)
+      - Error wrapping: github.com/pkg/errors (errors.Wrap/Wrapf)
+
+      Your guiding principle: **minimal, surgical changes**. Modify existing
+      files and extend existing tests. Only create new files when the code
+      explorer has explicitly justified it.
+    prompt: |
+      {% if workflow.input.design_path is defined and workflow.input.design_path %}
+      ## Pre-existing Design — Load and Extract Metadata
+
+      A design document already exists. Load it and extract the structured
+      metadata so downstream agents can use it.
+
+      **Description:** {{ workflow.input.description }}
+      **Design File:** Read `{{ workflow.input.design_path }}`
+
+      ## Tasks
+
+      1. **Read the design document** at `{{ workflow.input.design_path }}`
+
+      2. **Extract metadata** from the document:
+         - `files_to_create`: list of new file paths (empty if none)
+         - `files_to_modify`: list of existing file paths to change
+         - `test_files`: list of test file paths to create or extend
+
+      3. **Set outputs:**
+         - `design_path` = `{{ workflow.input.design_path }}`
+         - `skip_review` = true
+         - `revision_notes` = "Pre-existing design loaded, skipping review"
+
+      **CRITICAL:** Do NOT create a new design. Do NOT modify the design file.
+      Simply read it and extract the file lists.
+      {% else %}
+      Create a focused design for the following change.
+
+      **Description:** {{ workflow.input.description }}
+      **Specification:** Read `{{ workflow.input.spec_path }}`
+      {% if workflow.input.phase is defined and workflow.input.phase %}
+      **Spec Phase:** {{ workflow.input.phase }} — scope the design to the
+      deliverables and acceptance criteria for this phase.
+      {% endif %}
+
+      **Code Explorer Scoping Report:** Read `{{ code_explorer.output.scope_report_path }}`
+
+      **Root Cause:** {{ code_explorer.output.root_cause }}
+
+      **Affected Files:**
+      {% for f in code_explorer.output.affected_files %}
+      - `{{ f }}`
+      {% endfor %}
+
+      **Recommended Files to Modify:**
+      {% for f in code_explorer.output.files_to_modify %}
+      - `{{ f }}`
+      {% endfor %}
+
+      {% if code_explorer.output.files_to_create %}
+      **New Files (explorer-justified):**
+      {% for f in code_explorer.output.files_to_create %}
+      - `{{ f }}`
+      {% endfor %}
+      {% endif %}
+
+      **Existing Test Files to Extend:**
+      {% for f in code_explorer.output.existing_test_files %}
+      - `{{ f }}`
+      {% endfor %}
+
+      {% if design_reviewer is defined and design_reviewer.output and not design_reviewer.output.approved %}
+      **Design Review Feedback (Score: {{ design_reviewer.output.score }}/100):**
+      {{ design_reviewer.output.feedback }}
+
+      **Critical Issues:**
+      {% for issue in design_reviewer.output.critical_issues %}
+      - {{ issue }}
+      {% endfor %}
+
+      IMPORTANT: Revise the existing design to address the feedback.
+      Read the previous design from `{{ designer.output.design_path }}`.
+      {% endif %}
+
+      ## Tasks
+
+      1. **Review the scoping report** — Understand the root cause and
+         affected code paths from the explorer's analysis.
+
+      2. **Design the fix** — Produce a focused document covering:
+         - Exact changes per file (what to add/modify/remove)
+         - Function signatures for any new or modified functions
+         - Edge cases the fix must handle
+         - How the fix interacts with existing code
+         - Test cases needed (extend existing test files first)
+
+      3. **Validate against explorer recommendations:**
+         - Are you modifying only the files the explorer identified?
+         - If you need a file the explorer didn't mention, justify why
+         - If the explorer said "no new files needed," do NOT add new files
+           unless you have a strong reason
+
+      4. **Save the Design** — Write to `.conductor/designs/{{ workflow.input.description | replace(' ', '-') | lower }}.design.md`
+      {% endif %}
+    output:
+      design_path:
+        type: string
+        description: Path where the design document was saved
+      files_to_create:
+        type: array
+        description: List of new files to be created (should be minimal)
+      files_to_modify:
+        type: array
+        description: List of existing files to be modified
+      test_files:
+        type: array
+        description: List of test files to create or extend
+      revision_notes:
+        type: string
+        description: Summary of changes if this is a revision
+      skip_review:
+        type: boolean
+        description: Whether to skip design review (true when using pre-existing design)
+    routes:
+      - to: unit_test_writer
+        when: "{{ output.skip_review }}"
+      - to: design_reviewer
+
+  # ─── 3. DESIGN REVIEW AGENT ──────────────────────────────────
+  - name: design_reviewer
+    description: >-
+      Reviews the design for correctness, minimal scope,
+      and alignment with the explorer's scoping report.
+    model: gpt-5.4
+    input:
+      - workflow.input.description
+      - workflow.input.spec_path
+      - code_explorer.output
+      - designer.output
+    system_prompt: |
+      You are a Senior Engineering Reviewer specializing in Go, Kubernetes
+      controller-runtime, and Azure SDK. You validate bugfix designs for
+      correctness and minimal scope.
+
+      You are especially attentive to:
+      - Whether the design stays within the scope identified by the explorer
+      - Whether existing modules are modified instead of creating new ones
+      - Whether the root cause is correctly addressed
+      - Proper use of uber-go/zap logging
+      - Error wrapping with github.com/pkg/errors (not fmt.Errorf with %w)
+      - Whether the fix could introduce regressions
+    prompt: |
+      Review the design for: **{{ workflow.input.description }}**
+
+      **Specification:** Read `{{ workflow.input.spec_path }}`
+      **Scoping Report:** Read `{{ code_explorer.output.scope_report_path }}`
+      **Design Document:** Read `{{ designer.output.design_path }}`
+
+      ## Evaluation Criteria
+
+      | Criteria | Weight |
+      |----------|--------|
+      | Root cause correctly addressed | 30% |
+      | Minimal scope (no unnecessary changes) | 25% |
+      | Uses existing modules (no unjustified new files) | 20% |
+      | Test coverage for the fix | 15% |
+      | Regression risk assessment | 10% |
+
+      **Key questions:**
+      1. Does the design modify only the files the explorer identified?
+      2. Are new files justified, or could changes go in existing modules?
+      3. Does the fix address the root cause, not just symptoms?
+      4. Are edge cases covered?
+      5. Could this fix break existing behavior?
+
+      Score 0-100. Approve if score >= 85.
+    output:
+      score:
+        type: number
+        description: Design quality score 0-100
+      approved:
+        type: boolean
+        description: Whether the design is approved (score >= 85)
+      feedback:
+        type: string
+        description: Detailed review feedback
+      critical_issues:
+        type: array
+        description: Issues that must be addressed before implementation
+    routes:
+      - to: design_approval_gate
+        when: "{{ output.approved }}"
+      - to: designer
+        when: "{{ output.score < 85 }}"
+      - to: design_approval_gate
+
+  # ─── 3b. HUMAN GATE: Design Approval ─────────────────────────
+  - name: design_approval_gate
+    type: human_gate
+    description: >-
+      Human reviews the approved design before test writing begins.
+    prompt: |
+      ## Design Approved — Review Before Implementation
+
+      **Description:** {{ workflow.input.description }}
+      **Design Score:** {{ design_reviewer.output.score }}/100
+      **Root Cause:** {{ code_explorer.output.root_cause }}
+
+      **Design Document:** `{{ designer.output.design_path }}`
+      **Scoping Report:** `{{ code_explorer.output.scope_report_path }}`
+
+      **Files to modify:**
+      {% for f in designer.output.files_to_modify %}
+      - `{{ f }}`
+      {% endfor %}
+
+      {% if designer.output.files_to_create %}
+      **New files to create:**
+      {% for f in designer.output.files_to_create %}
+      - `{{ f }}`
+      {% endfor %}
+      {% endif %}
+
+      **Test files:**
+      {% for f in designer.output.test_files %}
+      - `{{ f }}`
+      {% endfor %}
+
+      **Reviewer feedback:** {{ design_reviewer.output.feedback }}
+    options:
+      - label: Approve — proceed to write tests
+        value: proceed
+        route: unit_test_writer
+      - label: Revise design — send back to designer
+        value: revise
+        route: designer
+        prompt_for: feedback
+      - label: Abort workflow
+        value: abort
+        route: $end
+
+  # ─── 4. UNIT TEST WRITER AGENT (TDD: Write Failing Tests) ───
+  - name: unit_test_writer
+    description: >-
+      Writes failing unit tests for the change. Extends existing
+      test files where possible. Creates new test files only when
+      no existing test file covers the affected code.
+    model: claude-opus-4.6
+    input:
+      - workflow.input.description
+      - workflow.input.spec_path
+      - code_explorer.output
+      - designer.output
+    system_prompt: |
+      You are a Test Engineer specializing in Go testing, TDD, and Kubernetes
+      controller testing (envtest). You write focused tests for bug fixes.
+
+      Testing conventions for this project:
+      - Use standard `testing` package with `t.Run()` subtests
+      - Use `zaptest.NewLogger(t)` from go.uber.org/zap/zaptest for test loggers
+      - Use table-driven tests where appropriate
+      - Assert with `if got != want { t.Errorf(...) }` pattern (no testify)
+
+      IMPORTANT: Prefer extending existing test files over creating new ones.
+      Check if test files already exist before creating new ones.
+    prompt: |
+      Write tests for: **{{ workflow.input.description }}**
+
+      **Specification:** Read `{{ workflow.input.spec_path }}`
+      **Design:** Read `{{ designer.output.design_path }}`
+
+      **Existing test files to extend:**
+      {% for f in code_explorer.output.existing_test_files %}
+      - `{{ f }}`
+      {% endfor %}
+
+      **Test files from design:**
+      {% for test_file in designer.output.test_files %}
+      - `{{ test_file }}`
+      {% endfor %}
+
+      ## Tasks
+
+      1. **Check for existing tests** at the paths above — read each file
+         to understand current coverage
+
+      2. **Write test cases that validate the change:**
+         - A test that FAILS with the current code (reproduces the bug
+           or proves the improvement is needed)
+         - Edge case tests around the change
+         - Regression tests to ensure existing behavior isn't broken
+
+      3. **Extend existing test files first:**
+         - If there's an existing test file for the affected package,
+           add your tests there
+         - Only create a new test file if no existing file covers the
+           affected code path
+
+      4. **Create minimal stubs** so tests compile but FAIL
+
+      5. **Run `go test ./... -v -count=1`** to confirm tests FAIL
+         (proving the bug exists or the improvement is needed)
+
+      **CRITICAL:** Never delete or rewrite existing passing tests.
+      Only add what is needed for this fix.
+    output:
+      test_files_created:
+        type: array
+        description: List of test files created or extended
+      stub_files_created:
+        type: array
+        description: List of stub files created (empty if tests already existed)
+      test_count:
+        type: number
+        description: Total number of new test functions added
+      all_tests_fail:
+        type: boolean
+        description: Whether all NEW tests correctly fail
+      test_output:
+        type: string
+        description: Output from running go test
+      existing_tests_found:
+        type: boolean
+        description: Whether existing test files were found and extended
+    routes:
+      - to: coder
+
+  # ─── 5. CODER AGENT (Implementation) ─────────────────────────
+  - name: coder
+    description: >-
+      Implements the change to make failing tests pass. Makes
+      minimal, surgical changes to existing code.
+    model: claude-opus-4.6
+    input:
+      - workflow.input.description
+      - workflow.input.spec_path
+      - code_explorer.output
+      - designer.output
+      - unit_test_writer.output
+      - unit_test_validator.output?
+      - code_reviewer.output?
+      - qa_validator.output?
+    system_prompt: |
+      You are a Senior Go Engineer specializing in Kubernetes controllers
+      and Azure SDK integration. You make minimal, surgical changes
+      following existing codebase patterns.
+
+      Coding standards:
+      - All logging via go.uber.org/zap (uber-go/zap)
+        - Controller code: logr.Logger backed by zapr
+        - Azure clients: *zap.Logger directly
+        - Use typed field constructors: zap.String, zap.Int, zap.Error
+      - Error handling: wrap with errors.Wrap/errors.Wrapf from github.com/pkg/errors (not fmt.Errorf with %w)
+      - No fmt.Printf or log.Println
+      - Follow existing naming conventions in the codebase
+      - Keep functions focused and testable
+
+      IMPORTANT: Make the SMALLEST change that achieves the goal. Do NOT
+      refactor surrounding code. Do NOT rewrite working implementations.
+    prompt: |
+      Implement: **{{ workflow.input.description }}**
+
+      **Specification:** `{{ workflow.input.spec_path }}`
+      **Design:** `{{ designer.output.design_path }}`
+      **Root Cause:** {{ code_explorer.output.root_cause }}
+
+      **Test files that must pass:**
+      {% for tf in unit_test_writer.output.test_files_created %}
+      - `{{ tf }}`
+      {% endfor %}
+
+      {% if unit_test_validator is defined and unit_test_validator.output and not unit_test_validator.output.all_pass %}
+      **Previous attempt had failing tests — fix ONLY these:**
+      {{ unit_test_validator.output.failure_details }}
+
+      Address ONLY the specific failures listed above. Do NOT rewrite
+      unrelated code that is already working.
+      {% endif %}
+
+      {% if code_reviewer is defined and code_reviewer.output and not code_reviewer.output.approved %}
+      **Code review found issues — fix ONLY these:**
+      {% for issue in code_reviewer.output.critical_issues %}
+      - {{ issue }}
+      {% endfor %}
+      {{ code_reviewer.output.feedback }}
+
+      Address ONLY the specific issues listed above. Do NOT rewrite
+      unrelated code that is already working.
+      {% endif %}
+
+      {% if qa_validator is defined and qa_validator.output and not qa_validator.output.approved %}
+      **QA validator found gaps — address ONLY these:**
+      {% for gap in qa_validator.output.gaps %}
+      - {{ gap }}
+      {% endfor %}
+      {{ qa_validator.output.feedback }}
+
+      Address ONLY the specific gaps listed above. Do NOT rewrite
+      unrelated code that is already passing QA checks.
+      {% endif %}
+
+      ## Tasks
+
+      1. **Check existing state first:**
+         - Run `go build ./...` — does the code already compile?
+         - Run `go test ./... -count=1` — which tests already pass?
+         - If all tests pass and there is no directed feedback to address,
+           report success and proceed without changes.
+
+      2. **If the fix is needed** (tests fail or gaps exist):
+         - Only modify existing files:
+         {% for f in designer.output.files_to_modify %}
+            - `{{ f }}`
+         {% endfor %}
+         {% if designer.output.files_to_create %}
+         - Create only if justified by the design:
+         {% for f in designer.output.files_to_create %}
+            - `{{ f }}`
+         {% endfor %}
+         {% endif %}
+
+      3. **Run `go build ./...`** — Ensure compilation succeeds
+      4. **Run `go test ./... -count=1`** — Verify tests pass
+      5. **Run `go vet ./...`** — No warnings
+
+      **CRITICAL:** Make the smallest possible change. Do NOT refactor
+      unrelated code. If all tests pass, proceed without modifications.
+    output:
+      files_created:
+        type: array
+        description: Files created during implementation
+      files_modified:
+        type: array
+        description: Files modified during implementation
+      build_success:
+        type: boolean
+        description: Whether go build succeeds
+      implementation_notes:
+        type: string
+        description: Notes about decisions made during implementation
+    routes:
+      - to: unit_test_validator
+
+  # ─── 6. UNIT TEST VALIDATOR AGENT ────────────────────────────
+  - name: unit_test_validator
+    description: >-
+      Runs the full test suite and validates that ALL unit tests
+      pass after the fix is applied.
+    model: gpt-5.4
+    input:
+      - workflow.input.description
+      - unit_test_writer.output
+      - coder.output
+    system_prompt: |
+      You are a Test Validation agent. Your ONLY job is to run tests,
+      analyze results, and report pass/fail status. You do NOT write
+      code or fix issues — you only validate.
+    prompt: |
+      Validate that all unit tests pass after the change.
+
+      **Description:** {{ workflow.input.description }}
+
+      **Test files:**
+      {% for tf in unit_test_writer.output.test_files_created %}
+      - `{{ tf }}`
+      {% endfor %}
+
+      ## Tasks
+
+      1. Run `go test ./... -v -count=1` to execute all tests
+      2. Parse the output to identify:
+         - Total tests run
+         - Tests that PASS
+         - Tests that FAIL (with failure messages)
+      3. Run `go vet ./...` to check for issues
+      4. Report results
+
+      Set `all_pass` to true ONLY if every test passes AND go vet is clean.
+    output:
+      all_pass:
+        type: boolean
+        description: Whether ALL tests pass
+      total_tests:
+        type: number
+        description: Total number of tests run
+      passed_tests:
+        type: number
+        description: Number of passing tests
+      failed_tests:
+        type: number
+        description: Number of failing tests
+      failure_details:
+        type: string
+        description: Details of any test failures
+      vet_clean:
+        type: boolean
+        description: Whether go vet passes cleanly
+    routes:
+      - to: code_reviewer
+        when: "{{ output.all_pass }}"
+      - to: coder
+        when: "{{ not output.all_pass }}"
+
+  # ─── 7. CODE REVIEW AGENT ────────────────────────────────────
+  - name: code_reviewer
+    description: >-
+      Reviews the change for correctness, minimal scope, and
+      regression risk. Returns to coder if issues are found.
+    model: gpt-5.4
+    input:
+      - workflow.input.description
+      - workflow.input.spec_path
+      - code_explorer.output
+      - designer.output
+      - coder.output
+      - unit_test_validator.output
+    system_prompt: |
+      You are a Principal Engineer performing a focused code review.
+      You check for correctness, minimal scope, and regression risk.
+
+      You do NOT comment on:
+      - Formatting or style (that's what linters are for)
+      - Trivial naming preferences
+      - Issues already caught by tests or go vet
+
+      Project conventions you enforce:
+      - All logging via go.uber.org/zap (no fmt.Printf, no bare log)
+      - controller-runtime code uses logr.Logger backed by zapr
+      - Azure clients use *zap.Logger directly
+      - Errors wrapped with errors.Wrap/errors.Wrapf from github.com/pkg/errors (not fmt.Errorf with %w)
+      - Functions should be focused and testable
+      - Follow existing codebase patterns
+    prompt: |
+      Review the change: **{{ workflow.input.description }}**
+
+      **Root Cause:** {{ code_explorer.output.root_cause }}
+      **Design:** Read `{{ designer.output.design_path }}`
+      **Specification:** `{{ workflow.input.spec_path }}`
+
+      **Files created:**
+      {% for f in coder.output.files_created %}
+      - `{{ f }}`
+      {% endfor %}
+
+      **Files modified:**
+      {% for f in coder.output.files_modified %}
+      - `{{ f }}`
+      {% endfor %}
+
+      **Unit tests:** {{ unit_test_validator.output.passed_tests }}/{{ unit_test_validator.output.total_tests }} passing
+
+      **Implementation notes:** {{ coder.output.implementation_notes }}
+
+      ## Review Focus Areas
+
+      1. **Correctness** — Does the change achieve its goal?
+         - Not just a workaround?
+         - Will this properly address the issue or implement the improvement?
+
+      2. **Minimal Scope** — Is the change as small as possible?
+         - No unnecessary refactoring?
+         - Only the files identified by the explorer are modified?
+         - New files only if justified by the design?
+
+      3. **Regression Risk** — Could this break existing behavior?
+         - Are existing code paths preserved?
+         - Are nil/edge cases handled?
+         - Are concurrent access patterns safe?
+
+      4. **Error Handling** — Is every error path handled properly?
+         - Errors wrapped with context using errors.Wrap/errors.Wrapf?
+         - Transient vs. permanent errors distinguished?
+
+      5. **Conventions** — Does the fix follow project patterns?
+         - Logging via zap (not fmt.Printf)?
+         - Consistent with surrounding code?
+
+      Read each file that was created or modified and provide your review.
+
+      Set `approved` to true ONLY if there are no logic issues that could
+      cause incorrect behavior. Minor suggestions are fine to note but
+      should not block approval.
+    output:
+      approved:
+        type: boolean
+        description: Whether the code passes review (no logic issues)
+      critical_issues:
+        type: array
+        description: Logic bugs or correctness issues that must be fixed
+      suggestions:
+        type: array
+        description: Non-blocking improvement suggestions
+      feedback:
+        type: string
+        description: Detailed review feedback for the coder
+      review_summary:
+        type: string
+        description: One-paragraph summary of the review
+    routes:
+      - to: review_gate
+        when: "{{ output.approved }}"
+      - to: coder
+        when: "{{ not output.approved }}"
+
+  # ─── 7b. HUMAN GATE: Review Approval ─────────────────────────
+  - name: review_gate
+    type: human_gate
+    description: >-
+      Human reviews the completed change before final QA validation.
+    prompt: |
+      ## Change Complete — Code Reviewed & Unit Tests Passing
+
+      **Description:** {{ workflow.input.description }}
+      **Root Cause:** {{ code_explorer.output.root_cause }}
+
+      **Tests:** {{ unit_test_validator.output.passed_tests }}/{{ unit_test_validator.output.total_tests }} passing
+      **Review:** {{ code_reviewer.output.review_summary }}
+
+      {% if code_reviewer.output.suggestions %}
+      **Non-blocking suggestions:**
+      {% for s in code_reviewer.output.suggestions %}
+      - {{ s }}
+      {% endfor %}
+      {% endif %}
+
+      **Files created:**
+      {% for f in coder.output.files_created %}
+      - `{{ f }}`
+      {% endfor %}
+
+      **Files modified:**
+      {% for f in coder.output.files_modified %}
+      - `{{ f }}`
+      {% endfor %}
+
+      **Implementation notes:** {{ coder.output.implementation_notes }}
+    options:
+      - label: Approve — proceed to QA validation
+        value: proceed
+        route: qa_validator
+      - label: Send back to coder for changes
+        value: revise
+        route: coder
+        prompt_for: feedback
+      - label: Abort workflow
+        value: abort
+        route: $end
+
+  # ─── 8. QA VALIDATOR AGENT ───────────────────────────────────
+  - name: qa_validator
+    description: >-
+      Final QA gate that validates the change is complete, correct,
+      and doesn't regress existing functionality.
+    model: gpt-5.4
+    input:
+      - workflow.input.description
+      - workflow.input.spec_path
+      - code_explorer.output
+      - designer.output
+      - coder.output
+      - unit_test_validator.output
+    system_prompt: |
+      You are a QA Validation agent. You perform the final quality gate
+      for a bug fix, improvement, or iterative refinement. You verify
+      correctness, test coverage, and that no regressions were introduced.
+
+      You are thorough and systematic but proportionate to the scope
+      of the change.
+    prompt: |
+      Perform final QA validation for: **{{ workflow.input.description }}**
+
+      **Specification:** Read `{{ workflow.input.spec_path }}`
+      **Design:** `{{ designer.output.design_path }}`
+      **Root Cause:** {{ code_explorer.output.root_cause }}
+
+      ## Validation Checklist
+
+      1. **Change Verification:**
+         - Does the implementation achieve the stated goal?
+         - Run `go test ./... -v -count=1` — all tests must pass
+         - Are there tests that specifically validate the change?
+
+      2. **Regression Check:**
+         - Run `go build ./...` — must succeed
+         - Run `go vet ./...` — must be clean
+         - Do ALL existing tests still pass (not just the new ones)?
+         - Were any existing test files modified (check for accidental changes)?
+
+      3. **Code Quality:**
+         - Verify zap logging is used (no fmt.Printf, no bare logr)
+         - Verify error wrapping with errors.Wrap/errors.Wrapf
+         - Is the change minimal and surgical?
+
+      4. **Scope Validation:**
+         - Were only the files from the design modified?
+         - No unnecessary new files created?
+         - No unrelated changes included?
+
+      5. **QA Score** — Rate 0-100:
+         | Criteria | Weight |
+         |----------|--------|
+         | Change correctness | 35% |
+         | No regressions | 30% |
+         | Test coverage for the fix | 20% |
+         | Code quality and conventions | 15% |
+
+      Approve if score >= 90. Otherwise, list specific gaps.
+    output:
+      score:
+        type: number
+        description: QA score 0-100
+      approved:
+        type: boolean
+        description: Whether the fix passes QA (score >= 90)
+      fix_verified:
+        type: boolean
+        description: Whether the change is verified as correct
+      no_regressions:
+        type: boolean
+        description: Whether all existing tests still pass
+      gaps:
+        type: array
+        description: List of specific gaps or issues found
+      feedback:
+        type: string
+        description: Detailed QA feedback
+    routes:
+      - to: $end
+        when: "{{ output.approved }}"
+      - to: coder
+        when: "{{ not output.approved }}"
+
+# ═══════════════════════════════════════════════════════════════════
+# WORKFLOW OUTPUT
+# ═══════════════════════════════════════════════════════════════════
+
+output:
+  description: "{{ workflow.input.description }}"
+  root_cause: "{{ code_explorer.output.root_cause }}"
+  design_path: "{{ designer.output.design_path }}"
+  design_review_score: "{{ design_reviewer.output.score }}"
+  unit_tests_total: "{{ unit_test_validator.output.total_tests }}"
+  unit_tests_passed: "{{ unit_test_validator.output.passed_tests }}"
+  review_summary: "{{ code_reviewer.output.review_summary }}"
+  qa_score: "{{ qa_validator.output.score }}"
+  qa_approved: "{{ qa_validator.output.approved }}"
+  files_modified: "{{ coder.output.files_modified }}"
+  files_created: "{{ coder.output.files_created }}"
+  iterations: "{{ context.iteration }}"

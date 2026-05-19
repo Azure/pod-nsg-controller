@@ -6,13 +6,34 @@ import (
 	"github.com/Azure/pod-nsg-controller/internal/azure"
 )
 
-// ConvergenceCommitter is a callback invoked by the status updater after a
-// successful status write (or semantic no-op) to commit convergence metrics.
-type ConvergenceCommitter func(key types.NamespacedName, observedGeneration int64, results []azure.ActionResult)
+// StatusWriteOutcome classifies the result of a status write operation.
+type StatusWriteOutcome string
+
+const (
+	// StatusWriteOutcomeWritten indicates the status was successfully written.
+	StatusWriteOutcomeWritten StatusWriteOutcome = "written"
+	// StatusWriteOutcomeNoop indicates the status was semantically unchanged (no write needed).
+	StatusWriteOutcomeNoop StatusWriteOutcome = "noop"
+	// StatusWriteOutcomeError indicates the status write failed after retries.
+	StatusWriteOutcomeError StatusWriteOutcome = "error"
+)
+
+// ConvergenceCommitter is a callback invoked by the status updater after final
+// status resolution to commit convergence metrics. The outcome and statusErr
+// parameters allow the implementation to decide whether to commit based on
+// write success, semantic no-op, or error conditions.
+type ConvergenceCommitter func(
+	key types.NamespacedName,
+	observedGeneration int64,
+	results []azure.ActionResult,
+	outcome StatusWriteOutcome,
+	statusErr error,
+)
 
 // SetConvergenceCommitter sets the convergence committer callback on the status updater.
-// The committer is invoked after UpdateAfterReconcile completes successfully or when
-// the computed status is semantically equal to the existing status (no-op).
+// The committer is invoked after UpdateAfterReconcile completes: on successful status
+// write (outcome=written), semantic no-op (outcome=noop), or write error (outcome=error).
+// Not-found and stale-generation guards skip notification entirely.
 func (u *MappingStatusUpdater) SetConvergenceCommitter(committer ConvergenceCommitter) {
 	u.convergenceCommitter = committer
 }

@@ -26,9 +26,12 @@ func main() {
 	resourceGroup := os.Getenv("AZURE_RESOURCE_GROUP")
 	asgName := os.Getenv("TEST_ASG_NAME")
 
+	// Bootstrap a minimal logger for pre-init fatals.
+	bootstrap, _ := zap.NewProduction()
+
 	if subscriptionID == "" || resourceGroup == "" || asgName == "" {
-		fmt.Println("Required env vars: AZURE_SUBSCRIPTION_ID, AZURE_RESOURCE_GROUP, TEST_ASG_NAME")
-		os.Exit(1)
+		bootstrap.Fatal("Required env vars not set",
+			zap.Strings("required", []string{"AZURE_SUBSCRIPTION_ID", "AZURE_RESOURCE_GROUP", "TEST_ASG_NAME"}))
 	}
 
 	zapCfg := zap.NewProductionConfig()
@@ -36,8 +39,7 @@ func main() {
 	zapCfg.EncoderConfig.EncodeTime = zapcore.ISO8601TimeEncoder
 	zapLog, err := zapCfg.Build()
 	if err != nil {
-		fmt.Printf("FATAL: cannot build logger: %v\n", err)
-		os.Exit(1)
+		bootstrap.Fatal("cannot build logger", zap.Error(err))
 	}
 	defer func() {
 		_ = zapLog.Sync()
@@ -52,8 +54,7 @@ func main() {
 	// --- SDK-based ASG operations ---
 	asgClient, err := azure.NewASGClient(subscriptionID, resourceGroup, logger)
 	if err != nil {
-		fmt.Printf("FATAL: cannot create ASG client: %v\n", err)
-		os.Exit(1)
+		zapLog.Fatal("cannot create ASG client", zap.Error(err))
 	}
 
 	// Test 1: GET ASG
@@ -120,14 +121,12 @@ func main() {
 	// --- REST-based AddressPrefixSet operations ---
 	factory, err := azure.NewClientFactoryWithDefaultCredential(zapLog, nil)
 	if err != nil {
-		fmt.Printf("FATAL: cannot create AddressPrefixSet client factory: %v\n", err)
-		os.Exit(1)
+		zapLog.Fatal("cannot create AddressPrefixSet client factory", zap.Error(err))
 	}
 
 	apsClient, err := factory.ForSubscription(subscriptionID)
 	if err != nil {
-		fmt.Printf("FATAL: cannot get AddressPrefixSet client: %v\n", err)
-		os.Exit(1)
+		zapLog.Fatal("cannot get AddressPrefixSet client", zap.Error(err))
 	}
 
 	prefixSetName := "prefix-set-test"
@@ -199,16 +198,27 @@ func main() {
 	fmt.Println("========================================")
 	passed, failed := 0, 0
 	for _, r := range results {
-		fmt.Printf("  %2d. %-35s %s\n", r.num, r.name, r.status)
-		fmt.Printf("      %s\n", r.details)
+		zapLog.Info("test result",
+			zap.Int("num", r.num),
+			zap.String("name", r.name),
+			zap.String("status", r.status),
+			zap.String("details", r.details),
+		)
 		if r.status == "✅ PASS" {
 			passed++
 		} else {
 			failed++
 		}
 	}
-	fmt.Printf("\n  Total: %d passed, %d failed out of %d\n", passed, failed, len(results))
-	fmt.Println("========================================")
+	zapLog.Info("REST Operations Test Results",
+		zap.String("apiVersion", "2026-01-01 (AddressPrefixSets)"),
+		zap.Int("passed", passed),
+		zap.Int("failed", failed),
+		zap.Int("total", len(results)),
+	)
+	if failed > 0 {
+		os.Exit(1)
+	}
 }
 
 func deref(s *string) string {

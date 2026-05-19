@@ -2,16 +2,17 @@ package controller
 
 import (
 	"context"
+	"errors"
 	"testing"
 	"time"
 
-	dto "github.com/prometheus/client_model/go"
-	"github.com/prometheus/client_golang/prometheus"
 	v1alpha1 "github.com/Azure/pod-nsg-controller/api/v1alpha1"
 	"github.com/Azure/pod-nsg-controller/internal/azure"
 	"github.com/Azure/pod-nsg-controller/internal/azure/fake"
 	"github.com/Azure/pod-nsg-controller/internal/engine"
 	"github.com/Azure/pod-nsg-controller/internal/metrics"
+	"github.com/prometheus/client_golang/prometheus"
+	dto "github.com/prometheus/client_model/go"
 	"k8s.io/apimachinery/pkg/types"
 	ctrl "sigs.k8s.io/controller-runtime"
 	fakeclient "sigs.k8s.io/controller-runtime/pkg/client/fake"
@@ -689,9 +690,9 @@ func TestPhase8_ReconcilerWiring_DriftDetected_EmitsDriftCorrections(t *testing.
 }
 
 // TestPhase8_ReconcilerWiring_ConvergenceCommittedBeforeStatusWrite verifies that
-// convergence timing reflects detection→ARM-success, not detection→status-write.
-// We do this by checking that convergence is committed even when status writes
-// encounter sentinels (which return early before the old commit location).
+// convergence timing reflects detection→ARM-success, committed through the
+// status-updater instrumentation boundary. The status updater invokes the
+// convergence callback after final status resolution (written, noop, or error).
 func TestPhase8_ReconcilerWiring_ConvergenceCommittedBeforeStatusWrite(t *testing.T) {
 	metrics.ResetForTesting()
 	defer metrics.ResetForTesting()
@@ -734,6 +735,25 @@ func TestPhase8_ReconcilerWiring_ConvergenceCommittedBeforeStatusWrite(t *testin
 
 	tracker := metrics.NewConvergenceTracker()
 
+	statusUpdater := NewMappingStatusUpdater(fakeClient, ctrl.Log.WithName("test-status"))
+	// Wire convergence committer as in production (main.go): the status updater
+	// invokes this callback after status resolution to commit convergence.
+	statusUpdater.SetConvergenceCommitter(func(
+		key types.NamespacedName,
+		observedGeneration int64,
+		results []azure.ActionResult,
+		outcome StatusWriteOutcome,
+		statusErr error,
+	) {
+		_ = outcome
+		_ = statusErr
+		for _, res := range results {
+			if res.Success {
+				tracker.CommitConvergence(rec.Convergence, key, res.Action.Target, observedGeneration)
+			}
+		}
+	})
+
 	r := &MappingReconciler{
 		Client:             fakeClient,
 		Scheme:             scheme,
@@ -741,7 +761,7 @@ func TestPhase8_ReconcilerWiring_ConvergenceCommittedBeforeStatusWrite(t *testin
 		ResyncInterval:     60 * time.Second,
 		PrefixSetFactory:   fakeFactory,
 		Executor:           exec,
-		StatusUpdater:      NewMappingStatusUpdater(fakeClient, ctrl.Log.WithName("test-status")),
+		StatusUpdater:      statusUpdater,
 		MetricsRecorder:    rec,
 		PodChurnTracker:    metrics.NewPodChurnTracker(),
 		ConvergenceTracker: tracker,
@@ -770,6 +790,131 @@ func TestPhase8_ReconcilerWiring_ConvergenceCommittedBeforeStatusWrite(t *testin
 	}
 	if !foundConvergence {
 		t.Error("prefix_set_convergence_seconds not emitted; convergence may not be committed before status write")
+	}
+}
+
+// TestPhase8_ReconcilerWiring_ConvergenceCommittedOnStatusWriteError verifies that
+// convergence is still committed when ARM actions succeed but the final status
+// write fails with a generic error. This matches the production wiring in main.go,
+// which commits staged convergence on written, noop, and error outcomes.
+func TestPhase8_ReconcilerWiring_ConvergenceCommittedOnStatusWriteError(t *testing.T) {
+	metrics.ResetForTesting()
+	defer metrics.ResetForTesting()
+
+	reg := prometheus.NewRegistry()
+	rec, err := metrics.RegisterWith(reg)
+	if err != nil {
+		t.Fatalf("RegisterWith failed: %v", err)
+	}
+
+	ctx := context.Background()
+	scheme := testScheme(t)
+	ns := "conv-status-error-ns"
+
+	mapping := newTestMapping(ns, "conv-status-error-mapping", []v1alpha1.Mapping{
+		{
+			PodSelector: v1alpha1.PodSelector{
+				MatchLabels: map[string]string{"app": "conv-status-error"},
+			},
+			ApplicationSecurityGroups: []v1alpha1.ASGReference{
+				{ResourceID: asgResourceID("sub1", "rg1", "asg-conv-status-error")},
+			},
+		},
+	})
+	mapping.Generation = 1
+	mapping.Finalizers = []string{CleanupFinalizer}
+
+	pod := newTestPod(ns, "pod-conv-status-error", "10.0.0.1", map[string]string{"app": "conv-status-error"})
+
+	baseClient := fakeclient.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(mapping, pod).
+		WithStatusSubresource(mapping).
+		Build()
+
+	updateCalls := 0
+	fakeClient := &conflictInjectingClient{
+		Client: baseClient,
+		statusWriter: &errorInjectingStatusWriter{
+			SubResourceWriter:  baseClient.Status(),
+			updateErr:          errors.New("simulated status write failure"),
+			updateCalls:        &updateCalls,
+			passThroughUpdates: 1,
+		},
+	}
+
+	fakeFactory := fake.NewClientFactory()
+	fakeAzClient := fake.NewClient()
+	fakeFactory.RegisterClient("sub1", fakeAzClient)
+
+	exec := &stubExecutor{}
+	tracker := metrics.NewConvergenceTracker()
+	statusUpdater := NewMappingStatusUpdater(fakeClient, statusTestLogger(t))
+
+	var sawOutcomeError bool
+	statusUpdater.SetConvergenceCommitter(func(
+		key types.NamespacedName,
+		observedGeneration int64,
+		results []azure.ActionResult,
+		outcome StatusWriteOutcome,
+		statusErr error,
+	) {
+		if outcome == StatusWriteOutcomeError && statusErr != nil {
+			sawOutcomeError = true
+		}
+		for _, res := range results {
+			if res.Success {
+				tracker.CommitConvergence(rec.Convergence, key, res.Action.Target, observedGeneration)
+			}
+		}
+	})
+
+	r := &MappingReconciler{
+		Client:             fakeClient,
+		Scheme:             scheme,
+		ClusterName:        "test-cluster",
+		ResyncInterval:     60 * time.Second,
+		PrefixSetFactory:   fakeFactory,
+		Executor:           exec,
+		StatusUpdater:      statusUpdater,
+		MetricsRecorder:    rec,
+		PodChurnTracker:    metrics.NewPodChurnTracker(),
+		ConvergenceTracker: tracker,
+		InitialTracker:     metrics.NewInitialReconcileTracker(time.Now()),
+	}
+
+	_, reconcileErr := r.Reconcile(ctx, ctrl.Request{
+		NamespacedName: types.NamespacedName{Name: "conv-status-error-mapping", Namespace: ns},
+	})
+	if reconcileErr != nil {
+		t.Fatalf("Reconcile failed: %v", reconcileErr)
+	}
+
+	if !sawOutcomeError {
+		t.Fatal("status updater did not report StatusWriteOutcomeError during reconcile")
+	}
+	if updateCalls != 2 {
+		t.Errorf("status update calls = %d, want 2 (pending write + failing final write)", updateCalls)
+	}
+
+	mfs, gatherErr := reg.Gather()
+	if gatherErr != nil {
+		t.Fatalf("Gather failed: %v", gatherErr)
+	}
+
+	foundConvergenceObservation := false
+	for _, mf := range mfs {
+		if mf.GetName() != "pod_nsg_controller_prefix_set_convergence_seconds" {
+			continue
+		}
+		for _, m := range mf.GetMetric() {
+			if m.GetHistogram().GetSampleCount() > 0 {
+				foundConvergenceObservation = true
+			}
+		}
+	}
+	if !foundConvergenceObservation {
+		t.Error("prefix_set_convergence_seconds not emitted when final status write failed")
 	}
 }
 

@@ -2,9 +2,10 @@ package controller
 
 import (
 	"context"
+	"errors"
+	"fmt"
 
 	"github.com/go-logr/logr"
-	"github.com/pkg/errors"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
@@ -56,7 +57,7 @@ func (u *MappingStatusUpdater) UpdatePending(
 			if apierrors.IsNotFound(err) {
 				return ErrStatusObjectNotFound
 			}
-			return errors.Wrap(err, "fetching mapping for pending status")
+			return fmt.Errorf("fetching mapping for pending status: %w", err)
 		}
 
 		if mapping.Generation > observedGeneration {
@@ -79,6 +80,9 @@ func (u *MappingStatusUpdater) UpdatePending(
 
 		mapping.Status = newStatus
 		if err := u.Client.Status().Update(ctx, &mapping); err != nil {
+			if apierrors.IsNotFound(err) {
+				return ErrStatusObjectNotFound
+			}
 			lastErr = err
 			if apierrors.IsConflict(err) && attempt < u.MaxAttempts {
 				u.Logger.V(1).Info("conflict on pending status update, retrying",
@@ -87,11 +91,11 @@ func (u *MappingStatusUpdater) UpdatePending(
 				)
 				continue
 			}
-			return errors.Wrap(err, "updating pending status")
+			return fmt.Errorf("updating pending status: %w", err)
 		}
 		return nil
 	}
-	return errors.Wrap(lastErr, "updating pending status: max attempts exceeded")
+	return fmt.Errorf("updating pending status: max attempts exceeded: %w", lastErr)
 }
 
 // UpdateAfterReconcile writes the final status after Azure operations complete.
@@ -112,7 +116,7 @@ func (u *MappingStatusUpdater) UpdateAfterReconcile(
 			if apierrors.IsNotFound(err) {
 				return ErrStatusObjectNotFound
 			}
-			return errors.Wrap(err, "fetching mapping for final status")
+			return fmt.Errorf("fetching mapping for final status: %w", err)
 		}
 
 		if mapping.Generation > observedGeneration {
@@ -133,28 +137,59 @@ func (u *MappingStatusUpdater) UpdateAfterReconcile(
 		})
 
 		if statusSemanticEqual(mapping.Status, newStatus) {
-			if u.convergenceCommitter != nil {
-				u.convergenceCommitter(key, observedGeneration, results)
-			}
+			u.notifyConvergence(key, observedGeneration, results, StatusWriteOutcomeNoop, nil)
 			return nil
 		}
 
 		mapping.Status = newStatus
 		if err := u.Client.Status().Update(ctx, &mapping); err != nil {
-			lastErr = err
-			if apierrors.IsConflict(err) && attempt < u.MaxAttempts {
-				u.Logger.V(1).Info("conflict on final status update, retrying",
-					"attempt", attempt,
-					"maxAttempts", u.MaxAttempts,
-				)
-				continue
+			if apierrors.IsNotFound(err) {
+				return ErrStatusObjectNotFound
 			}
-			return errors.Wrap(err, "updating final status")
+			lastErr = err
+			if apierrors.IsConflict(err) {
+				if attempt < u.MaxAttempts {
+					u.Logger.V(1).Info("conflict on final status update, retrying",
+						"attempt", attempt,
+						"maxAttempts", u.MaxAttempts,
+					)
+					continue
+				}
+				// Terminal conflict: break to post-loop re-fetch for stale-generation detection.
+				break
+			}
+			u.notifyConvergence(key, observedGeneration, results, StatusWriteOutcomeError, err)
+			return fmt.Errorf("updating final status: %w", err)
 		}
-		if u.convergenceCommitter != nil {
-			u.convergenceCommitter(key, observedGeneration, results)
-		}
+		u.notifyConvergence(key, observedGeneration, results, StatusWriteOutcomeWritten, nil)
 		return nil
 	}
-	return errors.Wrap(lastErr, "updating final status: max attempts exceeded")
+	// Final conflict after all attempts: re-fetch to detect generation advancement.
+	if apierrors.IsConflict(lastErr) {
+		var check v1alpha1.PodASGMapping
+		if getErr := u.Client.Get(ctx, key, &check); getErr != nil {
+			if apierrors.IsNotFound(getErr) {
+				return ErrStatusObjectNotFound
+			}
+		} else if check.Generation > observedGeneration {
+			return ErrStatusStaleGeneration
+		}
+	}
+	u.notifyConvergence(key, observedGeneration, results, StatusWriteOutcomeError, lastErr)
+	return fmt.Errorf("updating final status: max attempts exceeded: %w", lastErr)
+}
+
+// notifyConvergence invokes the convergence committer callback with the status
+// write outcome. This is the instrumentation boundary for convergence metrics:
+// the committer decides whether to commit based on the outcome.
+func (u *MappingStatusUpdater) notifyConvergence(
+	key types.NamespacedName,
+	observedGeneration int64,
+	results []azure.ActionResult,
+	outcome StatusWriteOutcome,
+	statusErr error,
+) {
+	if u.convergenceCommitter != nil {
+		u.convergenceCommitter(key, observedGeneration, results, outcome, statusErr)
+	}
 }
