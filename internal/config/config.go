@@ -39,6 +39,9 @@ type Config struct {
 
 	// MaxConcurrentActions is the max parallel ARM mutations per reconcile (default: 5).
 	MaxConcurrentActions int
+
+	// MaxConcurrentReconciles is the number of concurrent reconcile workers (default: 5).
+	MaxConcurrentReconciles int
 }
 
 // Load reads configuration from environment variables and validates required fields.
@@ -92,6 +95,21 @@ func Load() (*Config, error) {
 			return nil, fmt.Errorf("MAX_CONCURRENT_ACTIONS must be >= 1, got %d", val)
 		}
 		cfg.MaxConcurrentActions = val
+	}
+
+	// Parse max concurrent reconciles.
+	mcrStr := os.Getenv("MAX_CONCURRENT_RECONCILES")
+	if mcrStr == "" {
+		cfg.MaxConcurrentReconciles = 5
+	} else {
+		val, err := strconv.Atoi(mcrStr)
+		if err != nil {
+			return nil, errors.Wrap(err, "MAX_CONCURRENT_RECONCILES must be a valid integer")
+		}
+		if val < 1 {
+			return nil, fmt.Errorf("MAX_CONCURRENT_RECONCILES must be >= 1, got %d", val)
+		}
+		cfg.MaxConcurrentReconciles = val
 	}
 
 	if err := cfg.Validate(); err != nil {
