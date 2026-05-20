@@ -30,12 +30,25 @@ func WithARMMetrics(obs metrics.ARMObserver, retryObs metrics.ARMRetryObserver) 
 	}
 }
 
+// WithARMRecorder is a convenience option that wires the same ARMRecorder as
+// both the request observer and retry observer. ARMRecorder implements both
+// ARMObserver and ARMRetryObserver interfaces.
+func WithARMRecorder(rec *metrics.ARMRecorder) AddressPrefixSetClientOption {
+	return WithARMMetrics(rec, rec)
+}
+
 // WithFactoryARMMetrics adds ARM metrics observers to clients created by the factory.
 func WithFactoryARMMetrics(obs metrics.ARMObserver, retryObs metrics.ARMRetryObserver) ClientFactoryOption {
 	return func(f *ClientFactory) {
 		f.armObserver = obs
 		f.armRetryObserver = retryObs
 	}
+}
+
+// WithFactoryARMRecorder is a convenience option that wires the same ARMRecorder
+// as both the request observer and retry observer for all factory-created clients.
+func WithFactoryARMRecorder(rec *metrics.ARMRecorder) ClientFactoryOption {
+	return WithFactoryARMMetrics(rec, rec)
 }
 
 // ExecutorOption configures an Executor.

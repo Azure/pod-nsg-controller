@@ -58,7 +58,7 @@ func TestPhase8_Integration_ARMRecorder_PrometheusRegistry_RetriesAndRequests(t 
 	factory := NewClientFactoryWithCredential(log, nil, server.Client(),
 		WithFactoryARMBaseURL(server.URL),
 		WithFactoryRetryPolicy(RetryPolicy{MaxRetries: 5, BaseDelay: time.Millisecond, MaxDelay: 10 * time.Millisecond}),
-		WithFactoryARMMetrics(rec.ARM, rec.ARM),
+		WithFactoryARMRecorder(rec.ARM),
 	)
 
 	executor := NewExecutor(log, factory, 1, WithExecutorRetryMetrics(rec.ARM))
@@ -177,7 +177,7 @@ func TestPhase8_Integration_ARMRecorder_PrometheusRegistry_429RetryAfter(t *test
 	factory := NewClientFactoryWithCredential(log, nil, server.Client(),
 		WithFactoryARMBaseURL(server.URL),
 		WithFactoryRetryPolicy(RetryPolicy{MaxRetries: 3, BaseDelay: time.Millisecond, MaxDelay: 10 * time.Millisecond}),
-		WithFactoryARMMetrics(rec.ARM, rec.ARM),
+		WithFactoryARMRecorder(rec.ARM),
 	)
 
 	executor := NewExecutor(log, factory, 1, WithExecutorRetryMetrics(rec.ARM))

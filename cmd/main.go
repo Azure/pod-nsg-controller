@@ -92,7 +92,7 @@ func main() {
 		zapLog.With(zap.String("component", "azure-client-factory")),
 		azure.WithFactoryRetryPolicy(azure.DefaultRetryPolicy()),
 		azure.WithFactorySubscriptionRateLimiter(rateLimiter),
-		azure.WithFactoryARMMetrics(rec.ARM, rec.ARM),
+		azure.WithFactoryARMRecorder(rec.ARM),
 	)
 
 	executor := azure.NewExecutor(
