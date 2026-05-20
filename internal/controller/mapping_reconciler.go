@@ -279,7 +279,8 @@ func (r *MappingReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 	logger.V(1).Info("computed diff", "actionCount", len(actions))
 
 	// Detect drift: actual state has IPs not in desired state.
-	r.detectAndRecordDrift(desired, actual)
+	// Only counted when a correcting action is emitted, not on every poll.
+	r.detectAndRecordDrift(desired, actual, actions)
 
 	// Start convergence tracking for targets with changes.
 	// Use reconcileStart as the detection time: the reconcile was triggered by
@@ -600,18 +601,28 @@ func (r *MappingReconciler) stageConvergenceResults(key types.NamespacedName, ob
 	}
 }
 
-// detectAndRecordDrift increments prefix_set_drift_corrections_total for each
-// target where actual contains IPs not present in desired (stale state that
-// the diff engine will remove via an Update or Delete action).
-func (r *MappingReconciler) detectAndRecordDrift(desired map[engine.ASGTarget]engine.DesiredPrefixSet, actual map[engine.ASGTarget]engine.ActualPrefixSet) {
+// detectAndRecordDrift increments prefix_set_drift_corrections_total only for
+// targets where actual state has stale IPs (not in desired) AND a correcting
+// action was emitted by the diff engine. This ensures the counter increments
+// once per correction cycle, not on every poll while drift persists.
+func (r *MappingReconciler) detectAndRecordDrift(desired map[engine.ASGTarget]engine.DesiredPrefixSet, actual map[engine.ASGTarget]engine.ActualPrefixSet, actions []engine.Action) {
 	if r.MetricsRecorder == nil {
 		return
 	}
+	// Build set of targets with correcting actions (Update or Delete).
+	correctedTargets := make(map[engine.ASGTarget]struct{}, len(actions))
+	for _, a := range actions {
+		if a.Kind == engine.UpdatePrefixSet || a.Kind == engine.DeletePrefixSet {
+			correctedTargets[a.Target] = struct{}{}
+		}
+	}
 	for target, actualPS := range actual {
+		if _, corrected := correctedTargets[target]; !corrected {
+			continue
+		}
 		desiredPS, inDesired := desired[target]
 		for ip := range actualPS.IPs {
 			if !inDesired || !containsIP(desiredPS.IPs, ip) {
-				// This target has at least one stale IP → drift.
 				r.MetricsRecorder.Convergence.IncrementDriftCorrections(target)
 				break
 			}
