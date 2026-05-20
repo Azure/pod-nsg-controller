@@ -481,12 +481,18 @@ func (r *MappingReconciler) ensureInitialTrackerFallback() {
 }
 
 // cleanupPerMappingMetricState removes all per-mapping metric state on terminal cleanup.
+// This deletes all per-key time series to prevent unbounded cardinality growth
+// when PodASGMapping resources are deleted.
 func (r *MappingReconciler) cleanupPerMappingMetricState(key types.NamespacedName) {
 	if r.ConvergenceTracker != nil {
 		r.ConvergenceTracker.Forget(key)
 	}
 	if r.PodChurnTracker != nil && r.MetricsRecorder != nil {
 		r.PodChurnTracker.ForgetWithDelete(r.MetricsRecorder.PodChurn, key)
+		r.MetricsRecorder.PodChurn.DeleteForMapping(key.Namespace, key.Name)
+	}
+	if r.MetricsRecorder != nil {
+		r.MetricsRecorder.Reconcile.DeleteForMapping(key.Namespace, key.Name)
 	}
 }
 

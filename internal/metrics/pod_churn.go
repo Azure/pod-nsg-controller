@@ -74,6 +74,14 @@ func (r *PodChurnRecorder) Collectors() []prometheus.Collector {
 	return []prometheus.Collector{r.podIPChangesTotal, r.podChurnRate}
 }
 
+// DeleteForMapping removes all per-mapping metric series for the given
+// namespace/mapping. Called on mapping deletion to prevent cardinality leak.
+func (r *PodChurnRecorder) DeleteForMapping(namespace, mapping string) {
+	labels := prometheus.Labels{"namespace": namespace, "mapping": mapping}
+	r.podIPChangesTotal.DeletePartialMatch(labels)
+	r.podChurnRate.DeletePartialMatch(labels)
+}
+
 // PodChurnTracker tracks pod snapshot state across reconcile cycles.
 type PodChurnTracker struct {
 	mu        sync.Mutex

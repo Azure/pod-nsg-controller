@@ -131,6 +131,17 @@ func (r *ReconcileRecorder) ObserveCRDResolution(namespace, mapping, operation s
 	r.crdResolutionDuration.WithLabelValues(namespace, mapping, operation).Observe(duration.Seconds())
 }
 
+// DeleteForMapping removes all per-mapping metric series for the given
+// namespace/mapping. This prevents unbounded cardinality growth when
+// PodASGMapping resources are deleted.
+func (r *ReconcileRecorder) DeleteForMapping(namespace, mapping string) {
+	labels := prometheus.Labels{"namespace": namespace, "mapping": mapping}
+	r.reconcileDuration.DeletePartialMatch(labels)
+	r.reconcileTotal.DeletePartialMatch(labels)
+	r.reconcileActionsPerCycle.DeletePartialMatch(labels)
+	r.crdResolutionDuration.DeletePartialMatch(labels)
+}
+
 // InitialReconcileTracker tracks the progress of initial reconciliation at startup.
 type InitialReconcileTracker struct {
 	mu              sync.Mutex

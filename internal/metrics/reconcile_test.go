@@ -268,3 +268,77 @@ func TestPhase8_ReconcileQueueDepthGaugeTracksQueue(t *testing.T) {
 		t.Errorf("reconcile_queue_depth = %v, want 0", val)
 	}
 }
+
+// TestPhase8_ReconcileRecorder_DeleteForMapping_ClearsAllSeries
+// Verifies that DeleteForMapping removes all per-mapping series to prevent
+// unbounded cardinality growth.
+func TestPhase8_ReconcileRecorder_DeleteForMapping_ClearsAllSeries(t *testing.T) {
+	rec := newReconcileRecorder()
+
+	ns, mapping := "default", "delete-test"
+
+	// Create series across all per-mapping metric vectors
+	rec.ObserveReconcile(ns, mapping, ReconcileResultSuccess, 100*time.Millisecond)
+	rec.ObserveReconcile(ns, mapping, ReconcileResultError, 200*time.Millisecond)
+	rec.ObserveActionsPerCycle(ns, mapping, 3)
+	rec.ObserveCRDResolution(ns, mapping, "update", 50*time.Millisecond)
+
+	// Verify series exist
+	if count := getReconcileCounterValue(t, rec.reconcileTotal, ns, mapping, "success"); count != 1 {
+		t.Fatalf("pre-delete: reconcile_total{success} = %v, want 1", count)
+	}
+
+	// Delete all series for this mapping
+	rec.DeleteForMapping(ns, mapping)
+
+	// Verify series are gone: GetMetricWithLabelValues after delete should
+	// return a fresh zero-valued metric (not the old accumulated value).
+	val := getReconcileCounterValue(t, rec.reconcileTotal, ns, mapping, "success")
+	if val != 0 {
+		t.Errorf("post-delete: reconcile_total{success} = %v, want 0", val)
+	}
+	val = getReconcileCounterValue(t, rec.reconcileTotal, ns, mapping, "error")
+	if val != 0 {
+		t.Errorf("post-delete: reconcile_total{error} = %v, want 0", val)
+	}
+
+	count := getReconcileHistogramCount(t, rec.reconcileActionsPerCycle, ns, mapping)
+	if count != 0 {
+		t.Errorf("post-delete: reconcile_actions_per_cycle count = %d, want 0", count)
+	}
+}
+
+// TestPhase8_PodChurnRecorder_DeleteForMapping_ClearsAllSeries
+// Verifies that PodChurnRecorder.DeleteForMapping removes counter and gauge series.
+func TestPhase8_PodChurnRecorder_DeleteForMapping_ClearsAllSeries(t *testing.T) {
+	rec := newPodChurnRecorder()
+
+	ns, mapping := "default", "churn-delete-test"
+
+	// Create series
+	rec.podIPChangesTotal.WithLabelValues(ns, mapping, "add").Add(5)
+	rec.podIPChangesTotal.WithLabelValues(ns, mapping, "delete").Add(3)
+	rec.podChurnRate.WithLabelValues(ns, mapping).Set(0.5)
+
+	// Delete all series
+	rec.DeleteForMapping(ns, mapping)
+
+	// Verify counters reset (fresh metric returns 0)
+	counter, _ := rec.podIPChangesTotal.GetMetricWithLabelValues(ns, mapping, "add")
+	var m dto.Metric
+	if err := counter.(prometheus.Metric).Write(&m); err != nil {
+		t.Fatalf("failed to write metric: %v", err)
+	}
+	if m.GetCounter().GetValue() != 0 {
+		t.Errorf("post-delete: pod_ip_changes_total{add} = %v, want 0", m.GetCounter().GetValue())
+	}
+
+	// Verify gauge deleted
+	gauge, _ := rec.podChurnRate.GetMetricWithLabelValues(ns, mapping)
+	if err := gauge.(prometheus.Metric).Write(&m); err != nil {
+		t.Fatalf("failed to write metric: %v", err)
+	}
+	if m.GetGauge().GetValue() != 0 {
+		t.Errorf("post-delete: pod_churn_rate = %v, want 0", m.GetGauge().GetValue())
+	}
+}
