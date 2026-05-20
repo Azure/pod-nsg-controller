@@ -134,6 +134,9 @@ func (t *ConvergenceTracker) StageSuccessfulAction(key types.NamespacedName, tar
 // CommitConvergence commits convergence measurements to the histogram.
 // The recorded duration spans from change detection to ARM PUT success
 // (captured by StageSuccessfulAction), not from the status write.
+//
+// Idempotent: the pending token is deleted on the first call, so subsequent
+// calls with the same (key, target, generation) are no-ops.
 func (t *ConvergenceTracker) CommitConvergence(rec *ConvergenceRecorder, key types.NamespacedName, target engine.ASGTarget, observedGeneration int64) {
 	t.mu.Lock()
 	defer t.mu.Unlock()

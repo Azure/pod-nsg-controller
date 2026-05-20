@@ -22,6 +22,14 @@ const (
 // status resolution to commit convergence metrics. The outcome and statusErr
 // parameters allow the implementation to decide whether to commit based on
 // write success, semantic no-op, or error conditions.
+//
+// Idempotency requirement: implementations MUST be safe to call multiple times
+// with the same (key, observedGeneration, results) arguments. The current
+// retry loop calls the committer exactly once per UpdateAfterReconcile
+// invocation (conflict retries skip notification), but this contract ensures
+// correctness if the call topology changes. The default implementation
+// (ConvergenceTracker.CommitConvergence) satisfies this by deleting the
+// pending token on the first call, making subsequent calls no-ops.
 type ConvergenceCommitter func(
 	key types.NamespacedName,
 	observedGeneration int64,

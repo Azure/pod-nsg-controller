@@ -180,8 +180,10 @@ func (u *MappingStatusUpdater) UpdateAfterReconcile(
 }
 
 // notifyConvergence invokes the convergence committer callback with the status
-// write outcome. This is the instrumentation boundary for convergence metrics:
-// the committer decides whether to commit based on the outcome.
+// write outcome. Called exactly once per UpdateAfterReconcile invocation —
+// conflict retries skip this call and only the terminal path (success, noop,
+// or exhausted retries) invokes it. The committer must still be idempotent
+// per the ConvergenceCommitter contract.
 func (u *MappingStatusUpdater) notifyConvergence(
 	key types.NamespacedName,
 	observedGeneration int64,
