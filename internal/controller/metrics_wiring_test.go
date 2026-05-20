@@ -1,6 +1,7 @@
 package controller
 
 import (
+	"fmt"
 	"testing"
 	"time"
 
@@ -101,7 +102,7 @@ func TestPhase8_T813_ReconcilePath_PodChurnRateGaugeReflectsObservedRate(t *test
 	t1 := t0.Add(1 * time.Second)
 	pods := make(map[metrics.PodIdentity]metrics.PodMembership)
 	for i := 0; i < 5; i++ {
-		pods[metrics.PodIdentity{Namespace: "default", Name: "pod-" + string(rune('a'+i)), UID: "uid-" + string(rune('a'+i))}] = metrics.PodMembership{PodIP: "10.0.0." + string(rune('1'+i))}
+		pods[metrics.PodIdentity{Namespace: "default", Name: fmt.Sprintf("pod-%d", i), UID: fmt.Sprintf("uid-%d", i)}] = metrics.PodMembership{PodIP: fmt.Sprintf("10.0.0.%d", i+1)}
 	}
 	delta := tracker.ObserveSnapshot(rec.PodChurn, key, metrics.MappingPodSnapshot{Pods: pods}, t1)
 

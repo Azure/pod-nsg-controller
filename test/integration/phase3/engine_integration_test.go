@@ -787,9 +787,9 @@ func TestIntegration_LargeScale_ManyMappingsAndPods(t *testing.T) {
 	var pods []corev1.Pod
 
 	for i := 0; i < numMappings; i++ {
-		asgID := asgResourceID("sub-1", "rg-1", "asg-"+string(rune('a'+i)))
-		appLabel := "app-" + string(rune('a'+i))
-		m := makeMapping("default", "mapping-"+string(rune('a'+i)), []v1alpha1.Mapping{
+		asgID := asgResourceID("sub-1", "rg-1", fmt.Sprintf("asg-%d", i))
+		appLabel := fmt.Sprintf("app-%d", i)
+		m := makeMapping("default", fmt.Sprintf("mapping-%d", i), []v1alpha1.Mapping{
 			{
 				PodSelector:               v1alpha1.PodSelector{MatchLabels: map[string]string{"app": appLabel}},
 				ApplicationSecurityGroups: []v1alpha1.ASGReference{{ResourceID: asgID}},
