@@ -82,6 +82,16 @@ func (r *PodChurnRecorder) DeleteForMapping(namespace, mapping string) {
 	r.podChurnRate.DeletePartialMatch(labels)
 }
 
+// PodIPChangesTotal returns the pod IP changes counter vec for direct access in tests.
+func (r *PodChurnRecorder) PodIPChangesTotal() *prometheus.CounterVec {
+	return r.podIPChangesTotal
+}
+
+// PodChurnRate returns the pod churn rate gauge vec for direct access in tests.
+func (r *PodChurnRecorder) PodChurnRate() *prometheus.GaugeVec {
+	return r.podChurnRate
+}
+
 // PodChurnTracker tracks pod snapshot state across reconcile cycles.
 type PodChurnTracker struct {
 	mu        sync.Mutex

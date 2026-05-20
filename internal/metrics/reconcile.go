@@ -142,6 +142,11 @@ func (r *ReconcileRecorder) DeleteForMapping(namespace, mapping string) {
 	r.crdResolutionDuration.DeletePartialMatch(labels)
 }
 
+// CRDResolutionDuration returns the CRD resolution histogram vec for direct access in tests.
+func (r *ReconcileRecorder) CRDResolutionDuration() *prometheus.HistogramVec {
+	return r.crdResolutionDuration
+}
+
 // InitialReconcileTracker tracks the progress of initial reconciliation at startup.
 type InitialReconcileTracker struct {
 	mu              sync.Mutex

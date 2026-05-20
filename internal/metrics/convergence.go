@@ -58,6 +58,16 @@ func (r *ConvergenceRecorder) Collectors() []prometheus.Collector {
 	return []prometheus.Collector{r.convergenceSeconds, r.driftCorrections, r.prefixSetActions}
 }
 
+// DriftCorrections returns the drift corrections counter vec for direct access in tests.
+func (r *ConvergenceRecorder) DriftCorrections() *prometheus.CounterVec {
+	return r.driftCorrections
+}
+
+// ConvergenceSeconds returns the convergence histogram vec for direct access in tests.
+func (r *ConvergenceRecorder) ConvergenceSeconds() *prometheus.HistogramVec {
+	return r.convergenceSeconds
+}
+
 // ObserveConvergence records a convergence histogram observation.
 func (r *ConvergenceRecorder) ObserveConvergence(target engine.ASGTarget, op ConvergenceOperation, duration time.Duration) {
 	r.convergenceSeconds.WithLabelValues(

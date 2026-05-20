@@ -274,115 +274,75 @@ func TestPhase8_T87_ReconcilePath_ConvergenceObservation(t *testing.T) {
 
 func getConvergenceCounterValue(t *testing.T, conv *metrics.ConvergenceRecorder, name, sub, rg, asg string) float64 {
 	t.Helper()
-	// Use the exported IncrementDriftCorrections path; verify via prometheus
-	// The drift corrections counter should already be incremented in the test
-	// We access internal state through Collectors()
-	collectors := conv.Collectors()
-	for _, c := range collectors {
-		if cv, ok := c.(*prometheus.CounterVec); ok {
-			m, err := cv.GetMetricWithLabelValues(sub, rg, asg)
-			if err != nil {
-				continue
-			}
-			var metric dto.Metric
-			if err := m.Write(&metric); err != nil {
-				continue
-			}
-			if metric.GetCounter().GetValue() > 0 {
-				return metric.GetCounter().GetValue()
-			}
-		}
+	m, err := conv.DriftCorrections().GetMetricWithLabelValues(sub, rg, asg)
+	if err != nil {
+		t.Fatalf("failed to get drift corrections counter: %v", err)
 	}
-	t.Fatal("could not find drift corrections counter")
-	return 0
+	var metric dto.Metric
+	if err := m.Write(&metric); err != nil {
+		t.Fatalf("failed to write metric: %v", err)
+	}
+	return metric.GetCounter().GetValue()
 }
 
 func getConvergenceHistogramCount(t *testing.T, conv *metrics.ConvergenceRecorder, sub, rg, asg, op string) uint64 {
 	t.Helper()
-	collectors := conv.Collectors()
-	for _, c := range collectors {
-		if hv, ok := c.(*prometheus.HistogramVec); ok {
-			obs, err := hv.GetMetricWithLabelValues(sub, rg, asg, op)
-			if err != nil {
-				continue
-			}
-			var metric dto.Metric
-			if err := obs.(prometheus.Metric).Write(&metric); err != nil {
-				continue
-			}
-			if metric.GetHistogram() != nil {
-				return metric.GetHistogram().GetSampleCount()
-			}
-		}
+	obs, err := conv.ConvergenceSeconds().GetMetricWithLabelValues(sub, rg, asg, op)
+	if err != nil {
+		t.Fatalf("failed to get convergence histogram: %v", err)
 	}
-	t.Fatal("could not find convergence histogram")
+	var metric dto.Metric
+	if err := obs.(prometheus.Metric).Write(&metric); err != nil {
+		t.Fatalf("failed to write metric: %v", err)
+	}
+	if metric.GetHistogram() != nil {
+		return metric.GetHistogram().GetSampleCount()
+	}
+	t.Fatal("convergence histogram has no histogram data")
 	return 0
 }
 
 func getCRDResolutionHistogramCount(t *testing.T, rec *metrics.ReconcileRecorder, ns, mapping, op string) uint64 {
 	t.Helper()
-	collectors := rec.Collectors()
-	for _, c := range collectors {
-		if hv, ok := c.(*prometheus.HistogramVec); ok {
-			obs, err := hv.GetMetricWithLabelValues(ns, mapping, op)
-			if err != nil {
-				continue
-			}
-			var metric dto.Metric
-			if err := obs.(prometheus.Metric).Write(&metric); err != nil {
-				continue
-			}
-			if metric.GetHistogram() != nil && metric.GetHistogram().GetSampleCount() > 0 {
-				return metric.GetHistogram().GetSampleCount()
-			}
-		}
+	obs, err := rec.CRDResolutionDuration().GetMetricWithLabelValues(ns, mapping, op)
+	if err != nil {
+		t.Fatalf("failed to get crd_resolution_duration_seconds histogram: %v", err)
 	}
-	t.Fatal("could not find crd_resolution_duration_seconds histogram")
+	var metric dto.Metric
+	if err := obs.(prometheus.Metric).Write(&metric); err != nil {
+		t.Fatalf("failed to write metric: %v", err)
+	}
+	if metric.GetHistogram() != nil {
+		return metric.GetHistogram().GetSampleCount()
+	}
+	t.Fatal("crd_resolution_duration_seconds has no histogram data")
 	return 0
 }
 
 func getPodChurnRateGauge(t *testing.T, pcr *metrics.PodChurnRecorder, ns, mapping string) float64 {
 	t.Helper()
-	collectors := pcr.Collectors()
-	for _, c := range collectors {
-		if gv, ok := c.(*prometheus.GaugeVec); ok {
-			g, err := gv.GetMetricWithLabelValues(ns, mapping)
-			if err != nil {
-				continue
-			}
-			var metric dto.Metric
-			if err := g.Write(&metric); err != nil {
-				continue
-			}
-			if metric.GetGauge() != nil {
-				return metric.GetGauge().GetValue()
-			}
-		}
+	g, err := pcr.PodChurnRate().GetMetricWithLabelValues(ns, mapping)
+	if err != nil {
+		t.Fatalf("failed to get pod_churn_rate gauge: %v", err)
 	}
-	t.Fatal("could not find pod_churn_rate gauge")
-	return 0
+	var metric dto.Metric
+	if err := g.Write(&metric); err != nil {
+		t.Fatalf("failed to write metric: %v", err)
+	}
+	return metric.GetGauge().GetValue()
 }
 
 func getPodIPChangesTotal(t *testing.T, pcr *metrics.PodChurnRecorder, ns, mapping, op string) float64 {
 	t.Helper()
-	collectors := pcr.Collectors()
-	for _, c := range collectors {
-		if cv, ok := c.(*prometheus.CounterVec); ok {
-			m, err := cv.GetMetricWithLabelValues(ns, mapping, op)
-			if err != nil {
-				continue
-			}
-			var metric dto.Metric
-			if err := m.Write(&metric); err != nil {
-				continue
-			}
-			if metric.GetCounter() != nil {
-				return metric.GetCounter().GetValue()
-			}
-		}
+	m, err := pcr.PodIPChangesTotal().GetMetricWithLabelValues(ns, mapping, op)
+	if err != nil {
+		t.Fatalf("failed to get pod_ip_changes_total counter: %v", err)
 	}
-	t.Fatal("could not find pod_ip_changes_total counter")
-	return 0
+	var metric dto.Metric
+	if err := m.Write(&metric); err != nil {
+		t.Fatalf("failed to write metric: %v", err)
+	}
+	return metric.GetCounter().GetValue()
 }
 
 // compile-time checks for stubs
