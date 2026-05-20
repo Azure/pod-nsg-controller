@@ -21,7 +21,11 @@ var (
 	singleton    *Recorder
 )
 
-// MustRegister registers all metrics and panics on failure.
+// MustRegister constructs the metrics recorder singleton and panics on failure.
+// Note: this does NOT register collectors with any Prometheus registry.
+// Use RegisterWith to register with a specific registry (e.g., controller-runtime's).
+// This function is primarily useful in tests that read metrics directly from
+// recorder fields without needing a Prometheus registry.
 func MustRegister() *Recorder {
 	r, err := Register()
 	if err != nil {
@@ -30,8 +34,13 @@ func MustRegister() *Recorder {
 	return r
 }
 
-// Register registers all metrics with the default Prometheus registry.
-// It is safe to call multiple times; only the first call performs registration.
+// Register constructs the metrics recorder singleton. It is safe to call
+// multiple times; only the first call creates the recorder.
+//
+// Note: this does NOT register collectors with any Prometheus registry.
+// The returned recorder's collectors are usable for direct reads (e.g., in
+// tests) but will not be scraped by Prometheus until registered via
+// RegisterWith. Production code should use RegisterWith(ctrlmetrics.Registry).
 func Register() (*Recorder, error) {
 	var regErr error
 	registerOnce.Do(func() {
@@ -45,9 +54,10 @@ func Register() (*Recorder, error) {
 	return singleton, regErr
 }
 
-// RegisterWith registers all metrics with the given prometheus.Registerer.
-// On AlreadyRegisteredError, it rebinds recorder fields to the existing collectors.
-// On type mismatch, it returns an error.
+// RegisterWith constructs a new recorder and registers all collectors with the
+// given prometheus.Registerer. On AlreadyRegisteredError, it rebinds recorder
+// fields to the existing collectors. On type mismatch, it returns an error.
+// This is the correct entry point for production use.
 func RegisterWith(reg prometheus.Registerer) (*Recorder, error) {
 	rec := &Recorder{
 		PodChurn:    newPodChurnRecorder(),
@@ -166,18 +176,22 @@ func rebindReconcileCollector(r *ReconcileRecorder, i int, c prometheus.Collecto
 			r.reconcileQueueDepth = g
 		}
 	case 3:
+		if g, ok := c.(prometheus.Gauge); ok {
+			r.reconcileInflight = g
+		}
+	case 4:
 		if hv, ok := c.(*prometheus.HistogramVec); ok {
 			r.reconcileActionsPerCycle = hv
 		}
-	case 4:
+	case 5:
 		if g, ok := c.(prometheus.Gauge); ok {
 			r.initialReconcileDuration = g
 		}
-	case 5:
+	case 6:
 		if g, ok := c.(prometheus.Gauge); ok {
 			r.initialReconcileComplete = g
 		}
-	case 6:
+	case 7:
 		if hv, ok := c.(*prometheus.HistogramVec); ok {
 			r.crdResolutionDuration = hv
 		}
