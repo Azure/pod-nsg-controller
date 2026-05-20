@@ -312,9 +312,8 @@ func (r *MappingReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 		results = r.Executor.Execute(ctx, actions)
 	}
 
-	// Record actions-per-cycle and per-action outcomes.
+	// Record per-action outcomes.
 	if r.MetricsRecorder != nil {
-		r.MetricsRecorder.Reconcile.ObserveActionsPerCycle(req.Namespace, req.Name, len(actions))
 		for _, res := range results {
 			// Skip no-ops: a 412-retry recompute that found the target already
 			// converged is not an ARM mutation and must not inflate action counts.
@@ -439,7 +438,7 @@ func (r *MappingReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 	return ctrl.Result{RequeueAfter: r.ResyncInterval}, nil
 }
 
-// observeReconcile emits reconcile duration and total counter metrics.
+// observeReconcile emits reconcile duration, total counter, and actions-per-cycle metrics.
 func (r *MappingReconciler) observeReconcile(req ctrl.Request, stage ReconcileMetricStage, startTime time.Time, actionCount int) {
 	if r.MetricsRecorder == nil {
 		return
@@ -447,6 +446,7 @@ func (r *MappingReconciler) observeReconcile(req ctrl.Request, stage ReconcileMe
 	result := ClassifyReconcileMetricResult(stage)
 	duration := time.Since(startTime)
 	r.MetricsRecorder.Reconcile.ObserveReconcile(req.Namespace, req.Name, result, duration)
+	r.MetricsRecorder.Reconcile.ObserveActionsPerCycle(req.Namespace, req.Name, actionCount)
 }
 
 // markInitialTerminal marks a key as terminal in the initial-reconcile tracker.
