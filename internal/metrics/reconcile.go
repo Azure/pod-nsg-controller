@@ -24,6 +24,7 @@ type ReconcileRecorder struct {
 	reconcileDuration        *prometheus.HistogramVec
 	reconcileTotal           *prometheus.CounterVec
 	reconcileQueueDepth      prometheus.Gauge
+	reconcileInflight        prometheus.Gauge
 	reconcileActionsPerCycle *prometheus.HistogramVec
 	initialReconcileDuration prometheus.Gauge
 	initialReconcileComplete prometheus.Gauge
@@ -46,7 +47,12 @@ func newReconcileRecorder() *ReconcileRecorder {
 		reconcileQueueDepth: prometheus.NewGauge(prometheus.GaugeOpts{
 			Namespace: "pod_nsg_controller",
 			Name:      "reconcile_queue_depth",
-			Help:      "Current depth of the reconcile work queue",
+			Help:      "Number of pending items in the reconcile work queue (excludes in-flight items being processed)",
+		}),
+		reconcileInflight: prometheus.NewGauge(prometheus.GaugeOpts{
+			Namespace: "pod_nsg_controller",
+			Name:      "reconcile_inflight",
+			Help:      "Number of items currently being processed (between Get and Done)",
 		}),
 		reconcileActionsPerCycle: prometheus.NewHistogramVec(prometheus.HistogramOpts{
 			Namespace: "pod_nsg_controller",
@@ -78,6 +84,7 @@ func (r *ReconcileRecorder) Collectors() []prometheus.Collector {
 		r.reconcileDuration,
 		r.reconcileTotal,
 		r.reconcileQueueDepth,
+		r.reconcileInflight,
 		r.reconcileActionsPerCycle,
 		r.initialReconcileDuration,
 		r.initialReconcileComplete,
@@ -96,9 +103,21 @@ func (r *ReconcileRecorder) ObserveActionsPerCycle(namespace, mapping string, co
 	r.reconcileActionsPerCycle.WithLabelValues(namespace, mapping).Observe(float64(count))
 }
 
-// SetQueueDepth sets the current queue depth gauge.
+// SetQueueDepth sets the current pending queue depth gauge.
+// This reflects only items waiting to be processed (pending), not items
+// currently being processed (in-flight). See SetInflight for in-flight count.
 func (r *ReconcileRecorder) SetQueueDepth(depth int) {
 	r.reconcileQueueDepth.Set(float64(depth))
+}
+
+// IncInflight increments the in-flight gauge when an item is dequeued for processing.
+func (r *ReconcileRecorder) IncInflight() {
+	r.reconcileInflight.Inc()
+}
+
+// DecInflight decrements the in-flight gauge when processing is complete.
+func (r *ReconcileRecorder) DecInflight() {
+	r.reconcileInflight.Dec()
 }
 
 // SetInitialReconcileComplete marks initial reconciliation as complete.

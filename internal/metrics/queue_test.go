@@ -12,7 +12,7 @@ import (
 
 // TestPhase8_QueueFactory_TracksQueueDepthAcrossAddGetDoneForget
 // Verifies the instrumented queue factory correctly tracks queue depth gauge
-// across Add, Get, Done, and Forget operations.
+// and in-flight gauge across Add, Get, Done, and Forget operations.
 func TestPhase8_QueueFactory_TracksQueueDepthAcrossAddGetDoneForget(t *testing.T) {
 	ResetForTesting()
 	defer ResetForTesting()
@@ -34,10 +34,14 @@ func TestPhase8_QueueFactory_TracksQueueDepthAcrossAddGetDoneForget(t *testing.T
 	queue.Add(reconcile.Request{NamespacedName: types.NamespacedName{Namespace: "ns", Name: "b"}})
 	queue.Add(reconcile.Request{NamespacedName: types.NamespacedName{Namespace: "ns", Name: "c"}})
 
-	// Verify depth = 3
+	// Verify depth = 3, inflight = 0
 	depth := getQueueDepthGauge(t, rec.Reconcile)
 	if depth != 3 {
 		t.Errorf("after 3 Add: queue_depth = %v, want 3", depth)
+	}
+	inflight := getInflightGauge(t, rec.Reconcile)
+	if inflight != 0 {
+		t.Errorf("after 3 Add: inflight = %v, want 0", inflight)
 	}
 
 	// Get 1 item (processing)
@@ -46,17 +50,25 @@ func TestPhase8_QueueFactory_TracksQueueDepthAcrossAddGetDoneForget(t *testing.T
 		t.Fatal("unexpected queue shutdown")
 	}
 
-	// Get reduces pending, but item is still tracked until Done
+	// Get reduces pending; inflight increases
 	depthAfterGet := getQueueDepthGauge(t, rec.Reconcile)
 	if depthAfterGet != 2 {
 		t.Errorf("after Get: queue_depth = %v, want 2", depthAfterGet)
 	}
+	inflightAfterGet := getInflightGauge(t, rec.Reconcile)
+	if inflightAfterGet != 1 {
+		t.Errorf("after Get: inflight = %v, want 1", inflightAfterGet)
+	}
 
-	// Done marks item as complete
+	// Done marks item as complete; inflight decreases
 	queue.Done(item)
 	depthAfterDone := getQueueDepthGauge(t, rec.Reconcile)
 	if depthAfterDone != 2 {
 		t.Errorf("after Done: queue_depth = %v, want 2", depthAfterDone)
+	}
+	inflightAfterDone := getInflightGauge(t, rec.Reconcile)
+	if inflightAfterDone != 0 {
+		t.Errorf("after Done: inflight = %v, want 0", inflightAfterDone)
 	}
 
 	// Get and Done remaining
@@ -69,24 +81,61 @@ func TestPhase8_QueueFactory_TracksQueueDepthAcrossAddGetDoneForget(t *testing.T
 	if finalDepth != 0 {
 		t.Errorf("after draining: queue_depth = %v, want 0", finalDepth)
 	}
+	finalInflight := getInflightGauge(t, rec.Reconcile)
+	if finalInflight != 0 {
+		t.Errorf("after draining: inflight = %v, want 0", finalInflight)
+	}
 
 	queue.ShutDown()
 }
 
-func getQueueDepthGauge(t *testing.T, rec *ReconcileRecorder) float64 {
+func readGaugeByName(t *testing.T, rec *ReconcileRecorder, name string) float64 {
 	t.Helper()
-	collectors := rec.Collectors()
-	for _, c := range collectors {
-		if g, ok := c.(prometheus.Gauge); ok {
-			var m dto.Metric
-			if err := g.Write(&m); err != nil {
-				continue
-			}
-			if m.GetGauge() != nil {
-				return m.GetGauge().GetValue()
-			}
+	for _, c := range rec.Collectors() {
+		g, ok := c.(prometheus.Gauge)
+		if !ok {
+			continue
+		}
+		desc := g.Desc().String()
+		if !containsMetricName(desc, name) {
+			continue
+		}
+		var m dto.Metric
+		if err := g.Write(&m); err != nil {
+			continue
+		}
+		if m.GetGauge() != nil {
+			return m.GetGauge().GetValue()
 		}
 	}
-	t.Fatal("could not read reconcile_queue_depth gauge")
+	t.Fatalf("could not read %s gauge", name)
 	return 0
+}
+
+func containsMetricName(desc, name string) bool {
+	// Desc().String() contains fqName="<name>"
+	return len(desc) > 0 && contains(desc, "\""+name+"\"")
+}
+
+func contains(s, substr string) bool {
+	return len(substr) <= len(s) && searchString(s, substr)
+}
+
+func searchString(s, sub string) bool {
+	for i := 0; i <= len(s)-len(sub); i++ {
+		if s[i:i+len(sub)] == sub {
+			return true
+		}
+	}
+	return false
+}
+
+func getQueueDepthGauge(t *testing.T, rec *ReconcileRecorder) float64 {
+	t.Helper()
+	return readGaugeByName(t, rec, "pod_nsg_controller_reconcile_queue_depth")
+}
+
+func getInflightGauge(t *testing.T, rec *ReconcileRecorder) float64 {
+	t.Helper()
+	return readGaugeByName(t, rec, "pod_nsg_controller_reconcile_inflight")
 }

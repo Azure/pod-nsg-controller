@@ -23,12 +23,16 @@ func (q *instrumentedQueue) Add(item reconcile.Request) {
 
 func (q *instrumentedQueue) Get() (reconcile.Request, bool) {
 	item, shutdown := q.TypedRateLimitingInterface.Get()
+	if !shutdown {
+		q.rec.IncInflight()
+	}
 	q.rec.SetQueueDepth(q.Len())
 	return item, shutdown
 }
 
 func (q *instrumentedQueue) Done(item reconcile.Request) {
 	q.TypedRateLimitingInterface.Done(item)
+	q.rec.DecInflight()
 	q.rec.SetQueueDepth(q.Len())
 }
 
@@ -74,7 +78,8 @@ func (q *instrumentedQueue) startDepthSampler() {
 }
 
 // NewInstrumentedQueueFactory returns a function that creates an instrumented
-// work queue which updates reconcile_queue_depth after each operation.
+// work queue which updates reconcile_queue_depth (pending items) and
+// reconcile_inflight (items between Get and Done) after each operation.
 func NewInstrumentedQueueFactory(rec *ReconcileRecorder) func(
 	controllerName string,
 	rateLimiter workqueue.TypedRateLimiter[reconcile.Request],
