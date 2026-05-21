@@ -165,7 +165,8 @@ func (u *MappingStatusUpdater) UpdateAfterReconcile(
 		u.notifyConvergence(key, observedGeneration, results, StatusWriteOutcomeWritten, nil)
 		return nil
 	}
-	// Final conflict after all attempts: re-fetch to detect generation advancement.
+	// Final conflict after all attempts: re-fetch to detect generation advancement
+	// or semantic convergence (another actor may have written the same status).
 	if apierrors.IsConflict(lastErr) {
 		var check v1alpha1.PodASGMapping
 		if getErr := u.Client.Get(ctx, key, &check); getErr != nil {
@@ -174,6 +175,25 @@ func (u *MappingStatusUpdater) UpdateAfterReconcile(
 			}
 		} else if check.Generation > observedGeneration {
 			return ErrStatusStaleGeneration
+		} else {
+			// Recompute desired status against the current object and check
+			// if another actor already applied the same semantic state.
+			desiredStatus := ComputeStatus(ComputeStatusInput{
+				Spec:               check.Spec,
+				PreviousStatus:     check.Status,
+				PrefixSetName:      prefixSetName,
+				Results:            results,
+				MatchedPodsByIndex: matchedPodsByIndex,
+				ValidationIssues:   validationIssues,
+				ReconcileErr:       reconcileErr,
+				ObservedGeneration: observedGeneration,
+				Phase:              StatusPhaseFinal,
+				Now:                u.Now(),
+			})
+			if statusSemanticEqual(check.Status, desiredStatus) {
+				u.notifyConvergence(key, observedGeneration, results, StatusWriteOutcomeNoop, nil)
+				return nil
+			}
 		}
 	}
 	u.notifyConvergence(key, observedGeneration, results, StatusWriteOutcomeError, lastErr)
