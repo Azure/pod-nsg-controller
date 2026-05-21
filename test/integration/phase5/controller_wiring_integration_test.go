@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -13,6 +14,7 @@ import (
 	"github.com/Azure/pod-nsg-controller/internal/azure"
 	"github.com/Azure/pod-nsg-controller/internal/azure/fake"
 	"github.com/Azure/pod-nsg-controller/internal/controller"
+	"github.com/Azure/pod-nsg-controller/internal/engine"
 	"github.com/pkg/errors"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -1099,4 +1101,386 @@ func TestPhase5_DeleteWithCorruptOwnedAnnotation_FinalizerRetained(t *testing.T)
 	if !hasCleanup {
 		t.Error("expected CleanupFinalizer to be retained when owned annotation is corrupt during delete")
 	}
+}
+
+// ---------------------------------------------------------------------------
+// TestPhase5_ParallelReconciliation_MaxConcurrentReconciles
+// Proves: Without MaxConcurrentReconciles wiring in SetupWithManager,
+// distinct mapping keys are serialized (only 1 worker).
+// ---------------------------------------------------------------------------
+
+// blockingExecutor blocks Execute until released, tracking in-flight count.
+type blockingExecutor struct {
+	mu        sync.Mutex
+	wg        sync.WaitGroup
+	inflight  int32
+	maxSeen   int32
+	blockCh   chan struct{}
+	releaseCh chan struct{}
+}
+
+func newBlockingExecutor() *blockingExecutor {
+	return &blockingExecutor{
+		blockCh:   make(chan struct{}, 100),
+		releaseCh: make(chan struct{}),
+	}
+}
+
+func (e *blockingExecutor) Execute(ctx context.Context, actions []engine.Action) []azure.ActionResult {
+	if len(actions) == 0 {
+		return nil
+	}
+
+	e.wg.Add(1)
+	defer e.wg.Done()
+
+	// Track in-flight and capture releaseCh under lock for thread-safe reset.
+	e.mu.Lock()
+	e.inflight++
+	if e.inflight > e.maxSeen {
+		e.maxSeen = e.inflight
+	}
+	releaseCh := e.releaseCh
+	e.mu.Unlock()
+
+	// Signal entry (non-blocking to prevent deadlock if buffer fills).
+	select {
+	case e.blockCh <- struct{}{}:
+	default:
+	}
+
+	// Block until released
+	select {
+	case <-releaseCh:
+	case <-ctx.Done():
+	}
+
+	e.mu.Lock()
+	e.inflight--
+	e.mu.Unlock()
+
+	results := make([]azure.ActionResult, len(actions))
+	for i, a := range actions {
+		results[i] = azure.ActionResult{Action: a, Success: true}
+	}
+	return results
+}
+
+func (e *blockingExecutor) getMaxConcurrent() int32 {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return e.maxSeen
+}
+
+// resetForBlocking re-arms the executor so subsequent Execute calls block again.
+// Waits for all prior Execute calls to fully return before resetting state.
+func (e *blockingExecutor) resetForBlocking() {
+	e.wg.Wait()
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	e.releaseCh = make(chan struct{})
+	e.maxSeen = 0
+	e.inflight = 0
+}
+
+func setupTestEnvWithConcurrency(t *testing.T, maxConcurrentReconciles int) (*testEnv, *blockingExecutor) {
+	t.Helper()
+
+	scheme := integrationScheme(t)
+	zapLog := zaptest.NewLogger(t)
+
+	env := &envtest.Environment{
+		CRDDirectoryPaths: []string{"../../../config/crd"},
+		Scheme:            scheme,
+	}
+
+	cfg, err := env.Start()
+	if err != nil {
+		t.Fatalf("failed to start envtest: %v", err)
+	}
+
+	ctrl.SetLogger(zapr.NewLogger(zapLog))
+
+	mgr := testutil.NewEnvtestManager(t, cfg, scheme)
+
+	fakeFactory := fake.NewClientFactory()
+	fakeAzClient := fake.NewClient()
+	fakeFactory.RegisterClient("sub1", fakeAzClient)
+
+	blockExec := newBlockingExecutor()
+
+	reconciler := &controller.MappingReconciler{
+		Client:                  mgr.GetClient(),
+		Scheme:                  scheme,
+		ClusterName:             "test-cluster",
+		ResyncInterval:          60 * time.Second, // long to avoid resync interference
+		PrefixSetFactory:        fakeFactory,
+		Executor:                blockExec,
+		MaxConcurrentReconciles: maxConcurrentReconciles,
+	}
+
+	if err := reconciler.SetupWithManager(mgr); err != nil {
+		env.Stop()
+		t.Fatalf("failed to setup reconciler: %v", err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+
+	go func() {
+		if err := mgr.Start(ctx); err != nil {
+			t.Errorf("manager exited with error: %v", err)
+		}
+	}()
+
+	if !mgr.GetCache().WaitForCacheSync(ctx) {
+		cancel()
+		env.Stop()
+		t.Fatal("cache sync failed")
+	}
+
+	return &testEnv{
+		env:         env,
+		k8sClient:   mgr.GetClient(),
+		mgr:         mgr,
+		cancel:      cancel,
+		fakeClient:  fakeAzClient,
+		fakeFactory: fakeFactory,
+	}, blockExec
+}
+
+// ---------------------------------------------------------------------------
+// TestPhase5_ParallelReconciliation_SameKeyIsSerialized
+// Proves: Same mapping key never executes concurrently even with workers > 1.
+// A re-enqueued event for the same key waits until the first reconcile completes.
+//
+// Deterministic strategy: drain all initial reconciles first (passthrough mode),
+// then arm the executor and inject targeted events so the follow-up reconcile
+// can only come from the explicitly injected IP update — not from coalesced
+// earlier events.
+// ---------------------------------------------------------------------------
+func TestPhase5_ParallelReconciliation_SameKeyIsSerialized(t *testing.T) {
+	const workerCount = 3
+	te, blockExec := setupTestEnvWithConcurrency(t, workerCount)
+	defer te.teardown(t)
+	ctx := context.Background()
+
+	ns := &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: "test-same-key-serial"}}
+	if err := te.k8sClient.Create(ctx, ns); err != nil {
+		t.Fatalf("failed to create namespace: %v", err)
+	}
+
+	// Create a single mapping + matching pod with initial IP.
+	mapping := &v1alpha1.PodASGMapping{
+		ObjectMeta: metav1.ObjectMeta{Name: "serial-mapping", Namespace: ns.Name},
+		Spec: v1alpha1.PodASGMappingSpec{
+			Mappings: []v1alpha1.Mapping{
+				{
+					PodSelector: v1alpha1.PodSelector{MatchLabels: map[string]string{"app": "serial"}},
+					ApplicationSecurityGroups: []v1alpha1.ASGReference{
+						{ResourceID: asgResourceID("sub1", "rg1", "asg-serial")},
+					},
+				},
+			},
+		},
+	}
+	if err := te.k8sClient.Create(ctx, mapping); err != nil {
+		t.Fatalf("failed to create mapping: %v", err)
+	}
+
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "serial-pod",
+			Namespace: ns.Name,
+			Labels:    map[string]string{"app": "serial"},
+		},
+		Spec: corev1.PodSpec{
+			Containers: []corev1.Container{{Name: "app", Image: "nginx"}},
+		},
+	}
+	if err := te.k8sClient.Create(ctx, pod); err != nil {
+		t.Fatalf("failed to create pod: %v", err)
+	}
+	pod.Status.PodIP = "10.0.0.1"
+	pod.Status.PodIPs = []corev1.PodIP{{IP: "10.0.0.1"}}
+	if err := te.k8sClient.Status().Update(ctx, pod); err != nil {
+		t.Fatalf("failed to set pod IP: %v", err)
+	}
+
+	// --- Phase 1: Drain all initial reconciles (passthrough mode) ---
+	// Release immediately so initial reconciles flow through without blocking.
+	close(blockExec.releaseCh)
+
+	// Wait for quiescence: no new Execute entries for 3 seconds means the
+	// queue is empty and no further reconciles are pending.
+	drainTimeout := time.After(15 * time.Second)
+	quietTimer := time.NewTimer(3 * time.Second)
+	defer quietTimer.Stop()
+	for {
+		select {
+		case <-blockExec.blockCh:
+			// Still draining initial reconciles; reset the quiet period.
+			if !quietTimer.Stop() {
+				<-quietTimer.C
+			}
+			quietTimer.Reset(3 * time.Second)
+		case <-quietTimer.C:
+			// No activity for 3s — system is quiescent.
+			goto drained
+		case <-drainTimeout:
+			t.Fatal("timed out waiting for initial reconciles to drain")
+		}
+	}
+drained:
+
+	// Drain any remaining buffered signals from blockCh.
+	for {
+		select {
+		case <-blockExec.blockCh:
+		default:
+			goto bufferCleared
+		}
+	}
+bufferCleared:
+
+	// --- Phase 2: Arm the executor and run the deterministic test ---
+	blockExec.resetForBlocking()
+
+	// Trigger a reconcile by changing the pod IP. Since the queue is empty and
+	// ResyncInterval is 60s, the only source of a new reconcile is this event.
+	var currentPod corev1.Pod
+	if err := te.k8sClient.Get(ctx, types.NamespacedName{Name: "serial-pod", Namespace: ns.Name}, &currentPod); err != nil {
+		t.Fatalf("failed to get pod: %v", err)
+	}
+	currentPod.Status.PodIP = "10.0.0.2"
+	currentPod.Status.PodIPs = []corev1.PodIP{{IP: "10.0.0.2"}}
+	if err := te.k8sClient.Status().Update(ctx, &currentPod); err != nil {
+		t.Fatalf("failed to update pod IP to 10.0.0.2: %v", err)
+	}
+
+	// Step 1: Wait for the reconcile triggered by our IP change to enter Execute.
+	select {
+	case <-blockExec.blockCh:
+		// Reconcile is in-flight, blocked in Execute.
+	case <-time.After(15 * time.Second):
+		t.Fatal("timed out waiting for executor entry after IP change")
+	}
+
+	// Step 2: While the reconcile is blocked, trigger another same-key event
+	// by changing the IP again. This re-enqueues the key (marks dirty).
+	if err := te.k8sClient.Get(ctx, types.NamespacedName{Name: "serial-pod", Namespace: ns.Name}, &currentPod); err != nil {
+		t.Fatalf("failed to get pod: %v", err)
+	}
+	currentPod.Status.PodIP = "10.0.0.3"
+	currentPod.Status.PodIPs = []corev1.PodIP{{IP: "10.0.0.3"}}
+	if err := te.k8sClient.Status().Update(ctx, &currentPod); err != nil {
+		t.Fatalf("failed to update pod IP to 10.0.0.3: %v", err)
+	}
+
+	// Step 3: Assert NO second executor entry while first is blocked.
+	select {
+	case <-blockExec.blockCh:
+		t.Fatal("second executor entry occurred while first reconcile was still in-flight — same-key serialization violated")
+	case <-time.After(2 * time.Second):
+		// Expected: no concurrent execution for same key.
+	}
+
+	// Step 4: Release the blocked reconcile.
+	e_mu_releaseCh := func() chan struct{} {
+		blockExec.mu.Lock()
+		defer blockExec.mu.Unlock()
+		return blockExec.releaseCh
+	}()
+	close(e_mu_releaseCh)
+
+	// Step 5: Assert that a follow-up reconcile runs. Because we drained all
+	// prior events in Phase 1 and the only activity since arming was the two IP
+	// updates, the follow-up can only come from the 10.0.0.3 event that dirtied
+	// the key while the first reconcile was in-flight — proving non-loss.
+	select {
+	case <-blockExec.blockCh:
+		// Follow-up reconcile entered Execute — the in-flight re-enqueue was not lost.
+	case <-time.After(15 * time.Second):
+		t.Fatal("timed out waiting for follow-up reconcile after first completed — re-enqueued event was lost")
+	}
+
+	// Verify max concurrent was exactly 1 for same-key execution.
+	maxConcurrent := blockExec.getMaxConcurrent()
+	if maxConcurrent > 1 {
+		t.Errorf("expected max concurrent = 1 for same-key execution, got %d", maxConcurrent)
+	}
+}
+
+func TestPhase5_ParallelReconciliation_DifferentKeysRunConcurrently(t *testing.T) {
+	const workerCount = 3
+	te, blockExec := setupTestEnvWithConcurrency(t, workerCount)
+	defer te.teardown(t)
+	ctx := context.Background()
+
+	ns := &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: "test-parallel"}}
+	if err := te.k8sClient.Create(ctx, ns); err != nil {
+		t.Fatalf("failed to create namespace: %v", err)
+	}
+
+	// Create 3 distinct mappings with their own pods (different keys)
+	for i := 0; i < workerCount; i++ {
+		name := fmt.Sprintf("par-mapping-%d", i)
+		mapping := &v1alpha1.PodASGMapping{
+			ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: ns.Name},
+			Spec: v1alpha1.PodASGMappingSpec{
+				Mappings: []v1alpha1.Mapping{
+					{
+						PodSelector: v1alpha1.PodSelector{MatchLabels: map[string]string{"app": fmt.Sprintf("svc-%d", i)}},
+						ApplicationSecurityGroups: []v1alpha1.ASGReference{
+							{ResourceID: asgResourceID("sub1", "rg1", fmt.Sprintf("asg-%d", i))},
+						},
+					},
+				},
+			},
+		}
+		if err := te.k8sClient.Create(ctx, mapping); err != nil {
+			t.Fatalf("failed to create mapping %d: %v", i, err)
+		}
+
+		pod := &corev1.Pod{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      fmt.Sprintf("pod-%d", i),
+				Namespace: ns.Name,
+				Labels:    map[string]string{"app": fmt.Sprintf("svc-%d", i)},
+			},
+			Spec: corev1.PodSpec{
+				Containers: []corev1.Container{{Name: "app", Image: "nginx"}},
+			},
+		}
+		if err := te.k8sClient.Create(ctx, pod); err != nil {
+			t.Fatalf("failed to create pod %d: %v", i, err)
+		}
+		pod.Status.PodIP = fmt.Sprintf("10.0.0.%d", i+1)
+		if err := te.k8sClient.Status().Update(ctx, pod); err != nil {
+			t.Fatalf("failed to set pod %d IP: %v", i, err)
+		}
+	}
+
+	// Wait for at least workerCount executor calls to be in-flight simultaneously.
+	// With MaxConcurrentReconciles properly wired, 3 distinct keys should enter
+	// Execute concurrently. Without wiring (default 1 worker), only 1 at a time.
+	deadline := time.After(15 * time.Second)
+	entered := 0
+	for entered < workerCount {
+		select {
+		case <-blockExec.blockCh:
+			entered++
+		case <-deadline:
+			t.Fatalf("timed out waiting for %d concurrent executor calls, only got %d (MaxConcurrentReconciles not wired)",
+				workerCount, entered)
+		}
+	}
+
+	maxConcurrent := blockExec.getMaxConcurrent()
+	if maxConcurrent < int32(workerCount) {
+		t.Errorf("expected at least %d concurrent reconciles, but max seen was %d (MaxConcurrentReconciles not wired in SetupWithManager)",
+			workerCount, maxConcurrent)
+	}
+
+	// Release all blocked goroutines
+	close(blockExec.releaseCh)
 }

@@ -107,6 +107,70 @@ func TestLoad_ResyncIntervalLessThanOneFails(t *testing.T) {
 	}
 }
 
+// ---------------------------------------------------------------------------
+// TestLoad_MaxConcurrentReconciles: table-driven coverage for MAX_CONCURRENT_RECONCILES
+// ---------------------------------------------------------------------------
+func TestLoad_MaxConcurrentReconciles(t *testing.T) {
+	tests := []struct {
+		name      string
+		envValue  string
+		wantValue int
+		wantErr   bool
+	}{
+		{
+			name:      "explicit value 10",
+			envValue:  "10",
+			wantValue: 10,
+			wantErr:   false,
+		},
+		{
+			name:      "unset defaults to 5",
+			envValue:  "",
+			wantValue: 5,
+			wantErr:   false,
+		},
+		{
+			name:    "zero is invalid",
+			envValue: "0",
+			wantErr: true,
+		},
+		{
+			name:    "negative is invalid",
+			envValue: "-1",
+			wantErr: true,
+		},
+		{
+			name:    "non-integer is invalid",
+			envValue: "abc",
+			wantErr: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Setenv("AZURE_SUBSCRIPTION_ID", "")
+			t.Setenv("AZURE_RESOURCE_GROUP", "")
+			t.Setenv("CLUSTER_NAME", "cluster-a")
+			t.Setenv("RESYNC_INTERVAL_SECONDS", "")
+			t.Setenv("MAX_CONCURRENT_RECONCILES", tt.envValue)
+
+			cfg, err := Load()
+			if tt.wantErr {
+				if err == nil {
+					t.Fatalf("expected error for MAX_CONCURRENT_RECONCILES=%q, got nil", tt.envValue)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if cfg.MaxConcurrentReconciles != tt.wantValue {
+				t.Errorf("MaxConcurrentReconciles = %d, want %d", cfg.MaxConcurrentReconciles, tt.wantValue)
+			}
+		})
+	}
+}
+
 func TestLoad_AZURENSGNAMEIgnored(t *testing.T) {
 	t.Setenv("AZURE_SUBSCRIPTION_ID", "sub-123")
 	t.Setenv("AZURE_RESOURCE_GROUP", "rg-test")

@@ -87,6 +87,12 @@ other to finish its full reconcile cycle (pod list + Azure GETs + diff + Azure P
 Add a `MaxConcurrentReconciles` option to the controller builder in `SetupWithManager`. Make
 it configurable via the `Config` struct with a sensible default.
 
+Each worker is assigned a distinct PodASGMapping key from the work queue. Controller-runtime
+guarantees that at most one worker holds a given key at a time — if a second reconcile is
+enqueued for a mapping that is already in-flight, it waits in the queue until the first
+completes. Workers therefore never process the same mapping concurrently; the parallelism
+is strictly across *different* mappings.
+
 ### Changes
 
 | File | Change |
@@ -104,9 +110,9 @@ it configurable via the `Config` struct with a sensible default.
    - With `MAX_CONCURRENT_RECONCILES=0` → error
    - With `MAX_CONCURRENT_RECONCILES=-1` → error
 
-2. **`internal/controller/setup_test.go`** — `TestSetupWithManager_ConcurrentReconciles`:
-   - Verify the controller is created with the configured `MaxConcurrentReconciles`
-   - Two PodASGMappings reconcile concurrently (not sequentially)
+2. **`test/integration/phase5/controller_wiring_integration_test.go`** — envtest integration tests:
+   - `TestPhase5_ParallelReconciliation_DifferentKeysRunConcurrently`: Two PodASGMappings reconcile concurrently (not sequentially), verifying `MaxConcurrentReconciles` is wired correctly in `SetupWithManager`
+   - `TestPhase5_ParallelReconciliation_SameKeyIsSerialized`: A single PodASGMapping is never reconciled by more than one worker at a time — re-enqueued events for the same key wait until the first reconcile completes (serialization guarantee)
 
 ### Performance Target
 

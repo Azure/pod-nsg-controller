@@ -41,10 +41,11 @@ type MappingReconciler struct {
 	client.Client
 	Scheme *runtime.Scheme
 
-	ClusterName          string
-	DefaultSubscription  string
-	DefaultResourceGroup string
-	ResyncInterval       time.Duration
+	ClusterName             string
+	DefaultSubscription     string
+	DefaultResourceGroup    string
+	ResyncInterval          time.Duration
+	MaxConcurrentReconciles int
 
 	PrefixSetFactory azure.AddressPrefixSetClientFactory
 	Executor         Executor
