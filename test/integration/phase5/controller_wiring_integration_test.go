@@ -1116,7 +1116,6 @@ type blockingExecutor struct {
 	maxSeen    int32
 	blockCh    chan struct{}
 	releaseCh  chan struct{}
-	callCount  int32
 }
 
 func newBlockingExecutor() *blockingExecutor {
@@ -1134,7 +1133,6 @@ func (e *blockingExecutor) Execute(ctx context.Context, actions []engine.Action)
 	// Track in-flight and capture releaseCh under lock for thread-safe reset.
 	e.mu.Lock()
 	e.inflight++
-	e.callCount++
 	if e.inflight > e.maxSeen {
 		e.maxSeen = e.inflight
 	}
@@ -1176,7 +1174,6 @@ func (e *blockingExecutor) resetForBlocking() {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	e.releaseCh = make(chan struct{})
-	e.callCount = 0
 	e.maxSeen = 0
 	e.inflight = 0
 }
