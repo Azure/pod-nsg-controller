@@ -1141,8 +1141,11 @@ func (e *blockingExecutor) Execute(ctx context.Context, actions []engine.Action)
 	releaseCh := e.releaseCh
 	e.mu.Unlock()
 
-	// Signal that we entered
-	e.blockCh <- struct{}{}
+	// Signal entry (non-blocking to prevent deadlock if buffer fills).
+	select {
+	case e.blockCh <- struct{}{}:
+	default:
+	}
 
 	// Block until released
 	select {
