@@ -9,7 +9,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/builder"
-	"sigs.k8s.io/controller-runtime/pkg/controller"
+	ctrlcontroller "sigs.k8s.io/controller-runtime/pkg/controller"
 )
 
 // controllerSeq provides unique controller names to avoid prometheus metrics
@@ -28,13 +28,13 @@ func (r *MappingReconciler) SetupWithManager(mgr ctrl.Manager) error {
 
 	b := ctrl.NewControllerManagedBy(mgr).
 		Named(name).
-		WithOptions(controller.Options{MaxConcurrentReconciles: r.MaxConcurrentReconciles}).
+		WithOptions(ctrlcontroller.Options{MaxConcurrentReconciles: r.MaxConcurrentReconciles}).
 		For(&v1alpha1.PodASGMapping{}, builder.WithPredicates(MappingPredicate())).
 		Watches(&corev1.Pod{}, podHandler, builder.WithPredicates(PodPredicate()))
 
 	// Wire instrumented queue factory if metrics are available.
 	if r.MetricsRecorder != nil {
-		b = b.WithOptions(controller.Options{
+		b = b.WithOptions(ctrlcontroller.Options{
 			NewQueue: metrics.NewInstrumentedQueueFactory(r.MetricsRecorder.Reconcile),
 		})
 	}
