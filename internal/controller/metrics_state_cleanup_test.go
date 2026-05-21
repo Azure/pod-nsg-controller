@@ -186,42 +186,41 @@ func TestPhase8_PodChurnForget_DeletesGaugeSeries(t *testing.T) {
 
 func getPodChurnRateForTest(t *testing.T, pcr *metrics.PodChurnRecorder, ns, mapping string) float64 {
 	t.Helper()
-	collectors := pcr.Collectors()
-	for _, c := range collectors {
-		if gv, ok := c.(*prometheus.GaugeVec); ok {
-			g, err := gv.GetMetricWithLabelValues(ns, mapping)
-			if err != nil {
-				continue
-			}
-			var metric dto.Metric
-			if err := g.Write(&metric); err != nil {
-				continue
-			}
-			if metric.GetGauge() != nil {
-				return metric.GetGauge().GetValue()
-			}
-		}
+	g, err := pcr.PodChurnRate().GetMetricWithLabelValues(ns, mapping)
+	if err != nil {
+		t.Fatalf("failed to get pod_churn_rate gauge: %v", err)
 	}
-	return 0
+	var metric dto.Metric
+	if err := g.Write(&metric); err != nil {
+		t.Fatalf("failed to write metric: %v", err)
+	}
+	return metric.GetGauge().GetValue()
 }
 
 func getPodChurnRateExists(t *testing.T, pcr *metrics.PodChurnRecorder, ns, mapping string) bool {
 	t.Helper()
-	collectors := pcr.Collectors()
-	for _, c := range collectors {
-		if gv, ok := c.(*prometheus.GaugeVec); ok {
-			g, err := gv.GetMetricWithLabelValues(ns, mapping)
-			if err != nil {
-				return false
+	// Collect all metrics from the GaugeVec without calling GetMetricWithLabelValues
+	// (which would re-create the series). This correctly detects deletion.
+	ch := make(chan prometheus.Metric, 100)
+	pcr.PodChurnRate().Collect(ch)
+	close(ch)
+	for m := range ch {
+		var metric dto.Metric
+		if err := m.Write(&metric); err != nil {
+			continue
+		}
+		labels := metric.GetLabel()
+		var foundNS, foundMapping bool
+		for _, l := range labels {
+			if l.GetName() == "namespace" && l.GetValue() == ns {
+				foundNS = true
 			}
-			var metric dto.Metric
-			if err := g.Write(&metric); err != nil {
-				return false
+			if l.GetName() == "mapping" && l.GetValue() == mapping {
+				foundMapping = true
 			}
-			// If the gauge value is non-zero or it was explicitly written, it exists.
-			if metric.GetGauge() != nil && metric.GetGauge().GetValue() != 0 {
-				return true
-			}
+		}
+		if foundNS && foundMapping {
+			return true
 		}
 	}
 	return false
