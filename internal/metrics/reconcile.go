@@ -235,6 +235,11 @@ func (t *InitialReconcileTracker) IsInitialized() bool {
 	return t.initialized
 }
 
+// ControllerStart returns the controller start time used for duration calculation.
+func (t *InitialReconcileTracker) ControllerStart() time.Time {
+	return t.controllerStart
+}
+
 // Forget removes a key from tracking (e.g., mapping deleted).
 func (t *InitialReconcileTracker) Forget(key types.NamespacedName) {
 	t.mu.Lock()

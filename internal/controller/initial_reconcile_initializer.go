@@ -19,8 +19,6 @@ type InitialReconcileInitializer struct {
 	Tracker *metrics.InitialReconcileTracker
 	Rec     *metrics.ReconcileRecorder
 	Log     logr.Logger
-
-	controllerStart time.Time
 }
 
 // NewInitialReconcileInitializer creates a new InitialReconcileInitializer.
@@ -31,11 +29,10 @@ func NewInitialReconcileInitializer(
 	log logr.Logger,
 ) *InitialReconcileInitializer {
 	return &InitialReconcileInitializer{
-		Reader:          reader,
-		Tracker:         tracker,
-		Rec:             rec,
-		Log:             log,
-		controllerStart: time.Now(),
+		Reader:  reader,
+		Tracker: tracker,
+		Rec:     rec,
+		Log:     log,
 	}
 }
 
@@ -65,7 +62,7 @@ func (i *InitialReconcileInitializer) Start(ctx context.Context) error {
 
 	// If empty startup set, emit completion immediately
 	if i.Tracker.IsComplete() {
-		i.Rec.SetInitialReconcileComplete(time.Since(i.controllerStart))
+		i.Rec.SetInitialReconcileComplete(time.Since(i.Tracker.ControllerStart()))
 	}
 
 	return nil
