@@ -2,9 +2,9 @@ package metrics
 
 import (
 	"errors"
-	"fmt"
 	"sync"
 
+	pkgerrors "github.com/pkg/errors"
 	"github.com/prometheus/client_golang/prometheus"
 )
 
@@ -100,7 +100,7 @@ func registerCollectors(reg prometheus.Registerer, collectors []prometheus.Colle
 				rebindFn(i, alreadyRegistered.ExistingCollector)
 				continue
 			}
-			return fmt.Errorf("registering collector: %w", err)
+			return pkgerrors.Wrap(err, "registering collector")
 		}
 	}
 	return nil
