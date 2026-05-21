@@ -9,6 +9,22 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 )
 
+// pollGaugeUntil polls the queue depth gauge until it equals the expected value
+// or the deadline expires. Returns the last observed value.
+func pollGaugeUntil(t *testing.T, rec *ReconcileRecorder, expected float64, timeout time.Duration) float64 {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	var val float64
+	for time.Now().Before(deadline) {
+		val = getQueueDepthGauge(t, rec)
+		if val == expected {
+			return val
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	return val
+}
+
 // TestPhase8_QueueDepth_AddAfterDelayed_DoesNotInflateImmediateDepth verifies that
 // AddAfter with a positive delay does NOT inflate the immediate queue depth gauge.
 // Items added with delay are not ready yet and should not count toward depth.
@@ -62,14 +78,8 @@ func TestPhase8_QueueDepth_AddAfterDelayed_IncrementsWhenItemBecomesReady(t *tes
 		t.Errorf("immediately after AddAfter(50ms): queue_depth = %v, want 0", initialDepth)
 	}
 
-	// Wait for item to become ready
-	time.Sleep(200 * time.Millisecond)
-
-	// After the delay, the depth sampler should reflect the ready item.
-	// Give the sampler time to detect it.
-	time.Sleep(100 * time.Millisecond)
-
-	readyDepth := getQueueDepthGauge(t, rec.Reconcile)
+	// Poll until the sampler detects the item has become ready
+	readyDepth := pollGaugeUntil(t, rec.Reconcile, 1, 2*time.Second)
 	if readyDepth != 1 {
 		t.Errorf("after delay expires: queue_depth = %v, want 1 (item should be ready)", readyDepth)
 	}
@@ -106,10 +116,8 @@ func TestPhase8_QueueDepth_AddRateLimited_DelayedBehaviorMatchesReadyDepthSemant
 	queue.AddRateLimited(req)
 
 	// The depth should reflect Len() which counts only ready items.
-	// With default rate limiter, the first call has a short delay, but
-	// the semantic guarantee is that depth equals ready-only count.
-	// We accept that the first call may have delay=0 (immediate) or short delay.
-	time.Sleep(100 * time.Millisecond) // allow any short delay to expire
+	// Poll until the rate-limited item becomes ready.
+	pollGaugeUntil(t, rec.Reconcile, float64(1), 2*time.Second)
 
 	depth := getQueueDepthGauge(t, rec.Reconcile)
 	actualLen := queue.Len()
@@ -136,10 +144,8 @@ func TestPhase8_QueueDepth_AddAfterZeroDelay_ImmediatelyReflected(t *testing.T) 
 	// AddAfter with 0 duration = immediate
 	queue.AddAfter(reconcile.Request{NamespacedName: types.NamespacedName{Namespace: "ns", Name: "zero-delay"}}, 0)
 
-	// Allow queue internals to process
-	time.Sleep(50 * time.Millisecond)
-
-	depth := getQueueDepthGauge(t, rec.Reconcile)
+	// Poll until the queue processes the zero-delay item
+	depth := pollGaugeUntil(t, rec.Reconcile, 1, 2*time.Second)
 	if depth != 1 {
 		t.Errorf("after AddAfter(0): queue_depth = %v, want 1 (zero delay = immediate)", depth)
 	}
