@@ -110,10 +110,9 @@ is strictly across *different* mappings.
    - With `MAX_CONCURRENT_RECONCILES=0` → error
    - With `MAX_CONCURRENT_RECONCILES=-1` → error
 
-2. **`internal/controller/setup_test.go`** — `TestSetupWithManager_ConcurrentReconciles`:
-   - Verify the controller is created with the configured `MaxConcurrentReconciles`
-   - Two PodASGMappings reconcile concurrently (not sequentially)
-   - A single PodASGMapping is never reconciled by more than one worker at a time: enqueue two rapid reconcile requests for the same mapping and verify the second does not start until the first completes (serialization guarantee)
+2. **`test/integration/phase5/controller_wiring_integration_test.go`** — envtest integration tests:
+   - `TestPhase5_ParallelReconciliation_DifferentKeysRunConcurrently`: Two PodASGMappings reconcile concurrently (not sequentially), verifying `MaxConcurrentReconciles` is wired correctly in `SetupWithManager`
+   - `TestPhase5_ParallelReconciliation_SameKeyIsSerialized`: A single PodASGMapping is never reconciled by more than one worker at a time — re-enqueued events for the same key wait until the first reconcile completes (serialization guarantee)
 
 ### Performance Target
 
