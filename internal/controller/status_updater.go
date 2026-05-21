@@ -3,7 +3,8 @@ package controller
 import (
 	"context"
 	"errors"
-	"fmt"
+
+	pkgerrors "github.com/pkg/errors"
 
 	"github.com/go-logr/logr"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -57,7 +58,7 @@ func (u *MappingStatusUpdater) UpdatePending(
 			if apierrors.IsNotFound(err) {
 				return ErrStatusObjectNotFound
 			}
-			return fmt.Errorf("fetching mapping for pending status: %w", err)
+			return pkgerrors.Wrap(err, "fetching mapping for pending status")
 		}
 
 		if mapping.Generation > observedGeneration {
@@ -91,11 +92,11 @@ func (u *MappingStatusUpdater) UpdatePending(
 				)
 				continue
 			}
-			return fmt.Errorf("updating pending status: %w", err)
+			return pkgerrors.Wrap(err, "updating pending status")
 		}
 		return nil
 	}
-	return fmt.Errorf("updating pending status: max attempts exceeded: %w", lastErr)
+	return pkgerrors.Wrap(lastErr, "updating pending status: max attempts exceeded")
 }
 
 // UpdateAfterReconcile writes the final status after Azure operations complete.
@@ -116,7 +117,7 @@ func (u *MappingStatusUpdater) UpdateAfterReconcile(
 			if apierrors.IsNotFound(err) {
 				return ErrStatusObjectNotFound
 			}
-			return fmt.Errorf("fetching mapping for final status: %w", err)
+			return pkgerrors.Wrap(err, "fetching mapping for final status")
 		}
 
 		if mapping.Generation > observedGeneration {
@@ -159,7 +160,7 @@ func (u *MappingStatusUpdater) UpdateAfterReconcile(
 				break
 			}
 			u.notifyConvergence(key, observedGeneration, results, StatusWriteOutcomeError, err)
-			return fmt.Errorf("updating final status: %w", err)
+			return pkgerrors.Wrap(err, "updating final status")
 		}
 		u.notifyConvergence(key, observedGeneration, results, StatusWriteOutcomeWritten, nil)
 		return nil
@@ -176,7 +177,7 @@ func (u *MappingStatusUpdater) UpdateAfterReconcile(
 		}
 	}
 	u.notifyConvergence(key, observedGeneration, results, StatusWriteOutcomeError, lastErr)
-	return fmt.Errorf("updating final status: max attempts exceeded: %w", lastErr)
+	return pkgerrors.Wrap(lastErr, "updating final status: max attempts exceeded")
 }
 
 // notifyConvergence invokes the convergence committer callback with the status
