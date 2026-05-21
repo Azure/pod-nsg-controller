@@ -57,8 +57,8 @@ func ComputeDesiredStateWithSnapshot(
 					continue
 				}
 				if pod.Status.PodIP != "" {
-					matchedIPs = append(matchedIPs, pod.Status.PodIP)
-					// Add matched pod to snapshot (deduplicates via map key)
+					matchedIPs = append(matchedIPs, toCIDR(pod.Status.PodIP))
+					// Add matched pod to snapshot with raw IP (for churn metrics)
 					id := PodIdentity{
 						Namespace: pod.Namespace,
 						Name:      pod.Name,
