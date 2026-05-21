@@ -1311,12 +1311,17 @@ func TestPhase5_ParallelReconciliation_SameKeyIsSerialized(t *testing.T) {
 	// Wait for quiescence: no new Execute entries for 3 seconds means the
 	// queue is empty and no further reconciles are pending.
 	drainTimeout := time.After(15 * time.Second)
+	quietTimer := time.NewTimer(3 * time.Second)
+	defer quietTimer.Stop()
 	for {
 		select {
 		case <-blockExec.blockCh:
-			// Still draining initial reconciles; continue waiting.
-			continue
-		case <-time.After(3 * time.Second):
+			// Still draining initial reconciles; reset the quiet period.
+			if !quietTimer.Stop() {
+				<-quietTimer.C
+			}
+			quietTimer.Reset(3 * time.Second)
+		case <-quietTimer.C:
 			// No activity for 3s — system is quiescent.
 			goto drained
 		case <-drainTimeout:
