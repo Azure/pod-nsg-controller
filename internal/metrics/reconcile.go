@@ -155,7 +155,6 @@ type InitialReconcileTracker struct {
 	completedKeys   map[types.NamespacedName]struct{}
 	initialized     bool
 	complete        bool
-	initAttempted   bool
 }
 
 // NewInitialReconcileTracker creates a tracker with the given controller start time.
