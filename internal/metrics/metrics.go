@@ -66,23 +66,23 @@ func RegisterWith(reg prometheus.Registerer) (*Recorder, error) {
 		Reconcile:   newReconcileRecorder(),
 	}
 
-	if err := registerCollectors(reg, rec.PodChurn.Collectors(), func(i int, c prometheus.Collector) {
-		rebindPodChurnCollector(rec.PodChurn, i, c)
+	if err := registerCollectors(reg, rec.PodChurn.Collectors(), func(i int, c prometheus.Collector) error {
+		return rebindPodChurnCollector(rec.PodChurn, i, c)
 	}); err != nil {
 		return nil, err
 	}
-	if err := registerCollectors(reg, rec.ARM.Collectors(), func(i int, c prometheus.Collector) {
-		rebindARMCollector(rec.ARM, i, c)
+	if err := registerCollectors(reg, rec.ARM.Collectors(), func(i int, c prometheus.Collector) error {
+		return rebindARMCollector(rec.ARM, i, c)
 	}); err != nil {
 		return nil, err
 	}
-	if err := registerCollectors(reg, rec.Convergence.Collectors(), func(i int, c prometheus.Collector) {
-		rebindConvergenceCollector(rec.Convergence, i, c)
+	if err := registerCollectors(reg, rec.Convergence.Collectors(), func(i int, c prometheus.Collector) error {
+		return rebindConvergenceCollector(rec.Convergence, i, c)
 	}); err != nil {
 		return nil, err
 	}
-	if err := registerCollectors(reg, rec.Reconcile.Collectors(), func(i int, c prometheus.Collector) {
-		rebindReconcileCollector(rec.Reconcile, i, c)
+	if err := registerCollectors(reg, rec.Reconcile.Collectors(), func(i int, c prometheus.Collector) error {
+		return rebindReconcileCollector(rec.Reconcile, i, c)
 	}); err != nil {
 		return nil, err
 	}
@@ -91,13 +91,16 @@ func RegisterWith(reg prometheus.Registerer) (*Recorder, error) {
 }
 
 // registerCollectors registers a slice of collectors, calling rebindFn with
-// the existing collector on AlreadyRegisteredError. Returns error on type mismatch.
-func registerCollectors(reg prometheus.Registerer, collectors []prometheus.Collector, rebindFn func(int, prometheus.Collector)) error {
+// the existing collector on AlreadyRegisteredError. Returns error on type
+// mismatch or registration failure.
+func registerCollectors(reg prometheus.Registerer, collectors []prometheus.Collector, rebindFn func(int, prometheus.Collector) error) error {
 	for i, c := range collectors {
 		if err := reg.Register(c); err != nil {
 			var alreadyRegistered prometheus.AlreadyRegisteredError
 			if errors.As(err, &alreadyRegistered) {
-				rebindFn(i, alreadyRegistered.ExistingCollector)
+				if rebindErr := rebindFn(i, alreadyRegistered.ExistingCollector); rebindErr != nil {
+					return rebindErr
+				}
 				continue
 			}
 			return pkgerrors.Wrap(err, "registering collector")
@@ -106,96 +109,118 @@ func registerCollectors(reg prometheus.Registerer, collectors []prometheus.Colle
 	return nil
 }
 
-func rebindPodChurnCollector(r *PodChurnRecorder, i int, c prometheus.Collector) {
+func rebindPodChurnCollector(r *PodChurnRecorder, i int, c prometheus.Collector) error {
 	switch i {
 	case 0:
 		if cv, ok := c.(*prometheus.CounterVec); ok {
 			r.podIPChangesTotal = cv
+			return nil
 		}
 	case 1:
 		if gv, ok := c.(*prometheus.GaugeVec); ok {
 			r.podChurnRate = gv
+			return nil
 		}
 	}
+	return pkgerrors.Errorf("rebind PodChurn collector %d: type mismatch (got %T)", i, c)
 }
 
-func rebindARMCollector(r *ARMRecorder, i int, c prometheus.Collector) {
+func rebindARMCollector(r *ARMRecorder, i int, c prometheus.Collector) error {
 	switch i {
 	case 0:
 		if cv, ok := c.(*prometheus.CounterVec); ok {
 			r.requestsTotal = cv
+			return nil
 		}
 	case 1:
 		if hv, ok := c.(*prometheus.HistogramVec); ok {
 			r.requestDuration = hv
+			return nil
 		}
 	case 2:
 		if cv, ok := c.(*prometheus.CounterVec); ok {
 			r.retriesTotal = cv
+			return nil
 		}
 	case 3:
 		if cv, ok := c.(*prometheus.CounterVec); ok {
 			r.rateLimitDelays = cv
+			return nil
 		}
 	case 4:
 		if hv, ok := c.(*prometheus.HistogramVec); ok {
 			r.rateLimitDuration = hv
+			return nil
 		}
 	}
+	return pkgerrors.Errorf("rebind ARM collector %d: type mismatch (got %T)", i, c)
 }
 
-func rebindConvergenceCollector(r *ConvergenceRecorder, i int, c prometheus.Collector) {
+func rebindConvergenceCollector(r *ConvergenceRecorder, i int, c prometheus.Collector) error {
 	switch i {
 	case 0:
 		if hv, ok := c.(*prometheus.HistogramVec); ok {
 			r.convergenceSeconds = hv
+			return nil
 		}
 	case 1:
 		if cv, ok := c.(*prometheus.CounterVec); ok {
 			r.driftCorrections = cv
+			return nil
 		}
 	case 2:
 		if cv, ok := c.(*prometheus.CounterVec); ok {
 			r.prefixSetActions = cv
+			return nil
 		}
 	}
+	return pkgerrors.Errorf("rebind Convergence collector %d: type mismatch (got %T)", i, c)
 }
 
-func rebindReconcileCollector(r *ReconcileRecorder, i int, c prometheus.Collector) {
+func rebindReconcileCollector(r *ReconcileRecorder, i int, c prometheus.Collector) error {
 	switch i {
 	case 0:
 		if hv, ok := c.(*prometheus.HistogramVec); ok {
 			r.reconcileDuration = hv
+			return nil
 		}
 	case 1:
 		if cv, ok := c.(*prometheus.CounterVec); ok {
 			r.reconcileTotal = cv
+			return nil
 		}
 	case 2:
 		if g, ok := c.(prometheus.Gauge); ok {
 			r.reconcileQueueDepth = g
+			return nil
 		}
 	case 3:
 		if g, ok := c.(prometheus.Gauge); ok {
 			r.reconcileInflight = g
+			return nil
 		}
 	case 4:
 		if hv, ok := c.(*prometheus.HistogramVec); ok {
 			r.reconcileActionsPerCycle = hv
+			return nil
 		}
 	case 5:
 		if g, ok := c.(prometheus.Gauge); ok {
 			r.initialReconcileDuration = g
+			return nil
 		}
 	case 6:
 		if g, ok := c.(prometheus.Gauge); ok {
 			r.initialReconcileComplete = g
+			return nil
 		}
 	case 7:
 		if hv, ok := c.(*prometheus.HistogramVec); ok {
 			r.crdResolutionDuration = hv
+			return nil
 		}
 	}
+	return pkgerrors.Errorf("rebind Reconcile collector %d: type mismatch (got %T)", i, c)
 }
 
 // ResetForTesting resets the singleton for test isolation.
