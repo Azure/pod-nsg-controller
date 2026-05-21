@@ -35,3 +35,10 @@ func targetKey(target ASGTarget) string {
 
 	return targetIdentityKey(resourceID, target.PrefixSetName)
 }
+
+// TargetKey returns the normalized identity key for an ASGTarget, suitable for
+// use as a convergence tracking key. It uses the full resource ID when available,
+// falling back to a canonical form constructed from component fields.
+func TargetKey(target ASGTarget) string {
+	return targetKey(target)
+}

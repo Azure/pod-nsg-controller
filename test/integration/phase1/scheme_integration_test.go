@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/go-logr/zapr"
+	"go.uber.org/zap"
 	"go.uber.org/zap/zaptest"
 
 	corev1 "k8s.io/api/core/v1"
@@ -34,14 +35,14 @@ const envtestK8sVersion = "1.31.x"
 func TestMain(m *testing.M) {
 	repoRoot, err := repoRootFromCWD()
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "failed to resolve repo root: %v\n", err)
-		os.Exit(1)
+		zapLogger, _ := zap.NewProduction()
+		zapLogger.Fatal("failed to resolve repo root", zap.Error(err))
 	}
 
 	oldAssets, hadOldAssets := os.LookupEnv("KUBEBUILDER_ASSETS")
 	if err := configureEnvtestAssets(repoRoot); err != nil {
-		fmt.Fprintf(os.Stderr, "failed to configure envtest assets: %v\n", err)
-		os.Exit(1)
+		zapLogger, _ := zap.NewProduction()
+		zapLogger.Fatal("failed to configure envtest assets", zap.Error(err))
 	}
 
 	code := m.Run()

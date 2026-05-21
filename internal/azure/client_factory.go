@@ -120,6 +120,10 @@ type ClientFactory struct {
 	retryPolicySet bool
 	rateLimiter    SubscriptionRateLimiter
 
+	// Metric observers passed to child clients
+	armObserver      armRequestObserver
+	armRetryObserver armRetryObserver
+
 	credExplicit bool // true if credential was explicitly provided (even if nil)
 	credOnce     sync.Once
 	credErr      error
@@ -248,6 +252,12 @@ func (f *ClientFactory) ForSubscription(subscriptionID string) (AddressPrefixSet
 	}
 	if f.rateLimiter != nil {
 		clientOpts = append(clientOpts, WithSubscriptionRateLimiter(f.rateLimiter))
+	}
+	if f.armObserver != nil || f.armRetryObserver != nil {
+		clientOpts = append(clientOpts, func(c *AddressPrefixSetClient) {
+			c.armObserver = f.armObserver
+			c.armRetryObserver = f.armRetryObserver
+		})
 	}
 
 	client = NewAddressPrefixSetClient(

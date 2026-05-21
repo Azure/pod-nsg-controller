@@ -1639,8 +1639,8 @@ func TestPhase7_FinalizeSystemError_MethodExists(t *testing.T) {
 	sysErr := fmt.Errorf("test system error")
 	logger := ctrl.Log.WithName("test")
 
-	// Call the new method. This must compile and return (result, nil).
-	result, err := r.finalizeSystemError(
+	// Call the new method. This must compile and return (result, nil, stage).
+	result, err, metricStage := r.finalizeSystemError(
 		ctx,
 		ctrl.Request{NamespacedName: types.NamespacedName{Name: "m1", Namespace: ns}},
 		mapping,
@@ -1654,6 +1654,10 @@ func TestPhase7_FinalizeSystemError_MethodExists(t *testing.T) {
 
 	if err != nil {
 		t.Fatalf("finalizeSystemError must return nil error, got %v", err)
+	}
+
+	if metricStage != ReconcileStageSystemError {
+		t.Errorf("expected stage %q, got %q", ReconcileStageSystemError, metricStage)
 	}
 
 	if result.RequeueAfter == 0 {

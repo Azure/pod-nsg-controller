@@ -2,9 +2,11 @@ package controller
 
 import (
 	"context"
+	"errors"
+
+	pkgerrors "github.com/pkg/errors"
 
 	"github.com/go-logr/logr"
-	"github.com/pkg/errors"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
@@ -25,6 +27,10 @@ type MappingStatusUpdater struct {
 	Logger      logr.Logger
 	Now         func() metav1.Time
 	MaxAttempts int
+
+	// convergenceCommitter is invoked after a successful status write or
+	// semantic no-op to commit convergence metrics. Set via SetConvergenceCommitter.
+	convergenceCommitter ConvergenceCommitter
 }
 
 // NewMappingStatusUpdater creates a MappingStatusUpdater with sensible defaults.
@@ -52,7 +58,7 @@ func (u *MappingStatusUpdater) UpdatePending(
 			if apierrors.IsNotFound(err) {
 				return ErrStatusObjectNotFound
 			}
-			return errors.Wrap(err, "fetching mapping for pending status")
+			return pkgerrors.Wrap(err, "fetching mapping for pending status")
 		}
 
 		if mapping.Generation > observedGeneration {
@@ -75,6 +81,9 @@ func (u *MappingStatusUpdater) UpdatePending(
 
 		mapping.Status = newStatus
 		if err := u.Client.Status().Update(ctx, &mapping); err != nil {
+			if apierrors.IsNotFound(err) {
+				return ErrStatusObjectNotFound
+			}
 			lastErr = err
 			if apierrors.IsConflict(err) && attempt < u.MaxAttempts {
 				u.Logger.V(1).Info("conflict on pending status update, retrying",
@@ -83,11 +92,11 @@ func (u *MappingStatusUpdater) UpdatePending(
 				)
 				continue
 			}
-			return errors.Wrap(err, "updating pending status")
+			return pkgerrors.Wrap(err, "updating pending status")
 		}
 		return nil
 	}
-	return errors.Wrap(lastErr, "updating pending status: max attempts exceeded")
+	return pkgerrors.Wrap(lastErr, "updating pending status: max attempts exceeded")
 }
 
 // UpdateAfterReconcile writes the final status after Azure operations complete.
@@ -108,7 +117,7 @@ func (u *MappingStatusUpdater) UpdateAfterReconcile(
 			if apierrors.IsNotFound(err) {
 				return ErrStatusObjectNotFound
 			}
-			return errors.Wrap(err, "fetching mapping for final status")
+			return pkgerrors.Wrap(err, "fetching mapping for final status")
 		}
 
 		if mapping.Generation > observedGeneration {
@@ -129,22 +138,81 @@ func (u *MappingStatusUpdater) UpdateAfterReconcile(
 		})
 
 		if statusSemanticEqual(mapping.Status, newStatus) {
+			u.notifyConvergence(key, observedGeneration, results, StatusWriteOutcomeNoop, nil)
 			return nil
 		}
 
 		mapping.Status = newStatus
 		if err := u.Client.Status().Update(ctx, &mapping); err != nil {
-			lastErr = err
-			if apierrors.IsConflict(err) && attempt < u.MaxAttempts {
-				u.Logger.V(1).Info("conflict on final status update, retrying",
-					"attempt", attempt,
-					"maxAttempts", u.MaxAttempts,
-				)
-				continue
+			if apierrors.IsNotFound(err) {
+				return ErrStatusObjectNotFound
 			}
-			return errors.Wrap(err, "updating final status")
+			lastErr = err
+			if apierrors.IsConflict(err) {
+				if attempt < u.MaxAttempts {
+					u.Logger.V(1).Info("conflict on final status update, retrying",
+						"attempt", attempt,
+						"maxAttempts", u.MaxAttempts,
+					)
+					continue
+				}
+				// Terminal conflict: break to post-loop re-fetch for stale-generation detection.
+				break
+			}
+			u.notifyConvergence(key, observedGeneration, results, StatusWriteOutcomeError, err)
+			return pkgerrors.Wrap(err, "updating final status")
 		}
+		u.notifyConvergence(key, observedGeneration, results, StatusWriteOutcomeWritten, nil)
 		return nil
 	}
-	return errors.Wrap(lastErr, "updating final status: max attempts exceeded")
+	// Final conflict after all attempts: re-fetch to detect generation advancement
+	// or semantic convergence (another actor may have written the same status).
+	if apierrors.IsConflict(lastErr) {
+		var check v1alpha1.PodASGMapping
+		if getErr := u.Client.Get(ctx, key, &check); getErr != nil {
+			if apierrors.IsNotFound(getErr) {
+				return ErrStatusObjectNotFound
+			}
+		} else if check.Generation > observedGeneration {
+			return ErrStatusStaleGeneration
+		} else {
+			// Recompute desired status against the current object and check
+			// if another actor already applied the same semantic state.
+			desiredStatus := ComputeStatus(ComputeStatusInput{
+				Spec:               check.Spec,
+				PreviousStatus:     check.Status,
+				PrefixSetName:      prefixSetName,
+				Results:            results,
+				MatchedPodsByIndex: matchedPodsByIndex,
+				ValidationIssues:   validationIssues,
+				ReconcileErr:       reconcileErr,
+				ObservedGeneration: observedGeneration,
+				Phase:              StatusPhaseFinal,
+				Now:                u.Now(),
+			})
+			if statusSemanticEqual(check.Status, desiredStatus) {
+				u.notifyConvergence(key, observedGeneration, results, StatusWriteOutcomeNoop, nil)
+				return nil
+			}
+		}
+	}
+	u.notifyConvergence(key, observedGeneration, results, StatusWriteOutcomeError, lastErr)
+	return pkgerrors.Wrap(lastErr, "updating final status: max attempts exceeded")
+}
+
+// notifyConvergence invokes the convergence committer callback with the status
+// write outcome. Called exactly once per UpdateAfterReconcile invocation —
+// conflict retries skip this call and only the terminal path (success, noop,
+// or exhausted retries) invokes it. The committer must still be idempotent
+// per the ConvergenceCommitter contract.
+func (u *MappingStatusUpdater) notifyConvergence(
+	key types.NamespacedName,
+	observedGeneration int64,
+	results []azure.ActionResult,
+	outcome StatusWriteOutcome,
+	statusErr error,
+) {
+	if u.convergenceCommitter != nil {
+		u.convergenceCommitter(key, observedGeneration, results, outcome, statusErr)
+	}
 }

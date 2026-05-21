@@ -33,3 +33,6 @@ bin/
 # Editor/IDE
 # .idea/
 # .vscode/
+
+# Compiled binary
+main

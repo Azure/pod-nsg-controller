@@ -2,11 +2,11 @@ package controller
 
 import (
 	"context"
-	"fmt"
 	"strings"
 
 	"github.com/Azure/azure-sdk-for-go/sdk/resourcemanager/network/armnetwork/v6"
 	"github.com/go-logr/logr"
+	"github.com/pkg/errors"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	ctrl "sigs.k8s.io/controller-runtime"
@@ -36,7 +36,7 @@ func (r *PodReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.R
 			logger.Info("pod deleted; ASG memberships are not cleaned up automatically yet")
 			return ctrl.Result{}, nil
 		}
-		return ctrl.Result{}, fmt.Errorf("fetching pod: %w", err)
+		return ctrl.Result{}, errors.Wrap(err, "fetching pod")
 	}
 
 	if pod.Status.PodIP == "" {

@@ -62,11 +62,14 @@ func (e *Executor) ExecuteWithMetrics(ctx context.Context, actions []engine.Acti
 				return
 			}
 
-			err = e.executeWithETagRetry(ctx, client, act)
+			outcome := e.executeWithETagRetry(ctx, client, act)
 			results[idx] = ActionResult{
-				Action:  act,
-				Success: err == nil,
-				Err:     err,
+				Action:          act,
+				Success:         outcome.err == nil,
+				Err:             outcome.err,
+				CompletedAt:     time.Now(),
+				NoOp:            outcome.noOp,
+				FinalActionKind: outcome.finalActionKind,
 			}
 		}(i, action)
 	}

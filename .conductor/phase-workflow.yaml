@@ -402,6 +402,7 @@ agents:
       - designer.output
       - unit_test_writer.output
       - unit_test_validator.output?
+      - code_reviewer.output?
       - qa_validator.output?
     system_prompt: |
       You are a Senior Go Engineer specializing in Kubernetes controllers
@@ -439,6 +440,17 @@ agents:
       {{ unit_test_validator.output.failure_details }}
 
       Address ONLY the specific failures listed above. Do NOT rewrite
+      unrelated code that is already working.
+      {% endif %}
+
+      {% if code_reviewer is defined and code_reviewer.output and not code_reviewer.output.approved %}
+      **Code review found issues — fix ONLY these:**
+      {% for issue in code_reviewer.output.critical_issues %}
+      - {{ issue }}
+      {% endfor %}
+      {{ code_reviewer.output.feedback }}
+
+      Address ONLY the specific issues listed above. Do NOT rewrite
       unrelated code that is already working.
       {% endif %}
 
@@ -759,6 +771,7 @@ agents:
       - code_reviewer.output
       - unit_test_writer_v2.output
       - unit_test_validator_v2.output?
+      - code_reviewer_v2.output?
     system_prompt: |
       You are a Senior Go Engineer performing a targeted second pass.
       You fix ONLY specific issues identified by code review or failing
@@ -793,6 +806,17 @@ agents:
       {% for tf in unit_test_writer_v2.output.test_files_updated %}
       - `{{ tf }}`
       {% endfor %}
+
+      {% if code_reviewer_v2 is defined and code_reviewer_v2.output and not code_reviewer_v2.output.approved %}
+      **Code review v2 found issues — fix ONLY these:**
+      {% for issue in code_reviewer_v2.output.critical_issues %}
+      - {{ issue }}
+      {% endfor %}
+      {{ code_reviewer_v2.output.feedback }}
+
+      Address ONLY the specific issues listed above. Do NOT rewrite
+      unrelated code that is already working.
+      {% endif %}
 
       {% if unit_test_validator_v2 is defined and unit_test_validator_v2.output and not unit_test_validator_v2.output.all_pass %}
       **Failing tests to fix:**

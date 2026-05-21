@@ -62,6 +62,10 @@ type AddressPrefixSetClient struct {
 	tokenMu        sync.Mutex
 	cachedToken    string
 	tokenExpiresOn time.Time
+
+	// Metric observers (nil = no-op)
+	armObserver      armRequestObserver
+	armRetryObserver armRetryObserver
 }
 
 // AddressPrefixSetClientOption configures an AddressPrefixSetClient.
@@ -172,12 +176,25 @@ func (c *AddressPrefixSetClient) doRequest(ctx context.Context, retryCtx RetryCo
 			req.Header.Set(k, v)
 		}
 
+		start := time.Now()
 		resp, httpErr := c.httpClient.Do(req)
+		duration := time.Since(start)
+
 		if httpErr != nil {
+			// Record transport failure as status "0"
+			if c.armObserver != nil {
+				c.armObserver.ObserveRequest(retryCtx.SubscriptionID, string(retryCtx.Operation), "0", duration)
+			}
+
 			decision := DecideRetry(httpErr, attempt, policy)
 			if !decision.Retry {
 				return nil, errors.Wrap(httpErr, "executing request")
 			}
+
+			if c.armRetryObserver != nil {
+				c.armRetryObserver.ObserveRetry(retryCtx.SubscriptionID, string(retryCtx.Operation), decision.RetryReason)
+			}
+
 			c.log.Warn("transient request error, retrying",
 				zap.String("method", method),
 				zap.String("operation", string(retryCtx.Operation)),
@@ -195,6 +212,11 @@ func (c *AddressPrefixSetClient) doRequest(ctx context.Context, retryCtx RetryCo
 			continue
 		}
 
+		// Record the HTTP attempt with actual status code
+		if c.armObserver != nil {
+			c.armObserver.ObserveRequest(retryCtx.SubscriptionID, string(retryCtx.Operation), fmt.Sprintf("%d", resp.StatusCode), duration)
+		}
+
 		// 2xx success.
 		if resp.StatusCode >= 200 && resp.StatusCode < 300 {
 			return resp, nil
@@ -209,6 +231,10 @@ func (c *AddressPrefixSetClient) doRequest(ctx context.Context, retryCtx RetryCo
 		decision := DecideRetry(armErr, attempt, policy)
 		if !decision.Retry {
 			return nil, armErr
+		}
+
+		if c.armRetryObserver != nil {
+			c.armRetryObserver.ObserveRetry(retryCtx.SubscriptionID, string(retryCtx.Operation), decision.RetryReason)
 		}
 
 		c.log.Warn("retryable ARM error, retrying",
