@@ -26,18 +26,17 @@ func (r *MappingReconciler) SetupWithManager(mgr ctrl.Manager) error {
 
 	name := fmt.Sprintf("podasgmapping-%d", atomic.AddInt64(&controllerSeq, 1))
 
-	b := ctrl.NewControllerManagedBy(mgr).
-		Named(name).
-		WithOptions(ctrlcontroller.Options{MaxConcurrentReconciles: r.MaxConcurrentReconciles}).
-		For(&v1alpha1.PodASGMapping{}, builder.WithPredicates(MappingPredicate())).
-		Watches(&corev1.Pod{}, podHandler, builder.WithPredicates(PodPredicate()))
+	opts := ctrlcontroller.Options{MaxConcurrentReconciles: r.MaxConcurrentReconciles}
 
 	// Wire instrumented queue factory if metrics are available.
 	if r.MetricsRecorder != nil {
-		b = b.WithOptions(ctrlcontroller.Options{
-			NewQueue: metrics.NewInstrumentedQueueFactory(r.MetricsRecorder.Reconcile),
-		})
+		opts.NewQueue = metrics.NewInstrumentedQueueFactory(r.MetricsRecorder.Reconcile)
 	}
 
-	return b.Complete(r)
+	return ctrl.NewControllerManagedBy(mgr).
+		Named(name).
+		WithOptions(opts).
+		For(&v1alpha1.PodASGMapping{}, builder.WithPredicates(MappingPredicate())).
+		Watches(&corev1.Pod{}, podHandler, builder.WithPredicates(PodPredicate())).
+		Complete(r)
 }
