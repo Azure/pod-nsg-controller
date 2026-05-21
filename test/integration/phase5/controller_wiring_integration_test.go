@@ -1111,11 +1111,12 @@ func TestPhase5_DeleteWithCorruptOwnedAnnotation_FinalizerRetained(t *testing.T)
 
 // blockingExecutor blocks Execute until released, tracking in-flight count.
 type blockingExecutor struct {
-	mu         sync.Mutex
-	inflight   int32
-	maxSeen    int32
-	blockCh    chan struct{}
-	releaseCh  chan struct{}
+	mu        sync.Mutex
+	wg        sync.WaitGroup
+	inflight  int32
+	maxSeen   int32
+	blockCh   chan struct{}
+	releaseCh chan struct{}
 }
 
 func newBlockingExecutor() *blockingExecutor {
@@ -1129,6 +1130,9 @@ func (e *blockingExecutor) Execute(ctx context.Context, actions []engine.Action)
 	if len(actions) == 0 {
 		return nil
 	}
+
+	e.wg.Add(1)
+	defer e.wg.Done()
 
 	// Track in-flight and capture releaseCh under lock for thread-safe reset.
 	e.mu.Lock()
@@ -1169,8 +1173,9 @@ func (e *blockingExecutor) getMaxConcurrent() int32 {
 }
 
 // resetForBlocking re-arms the executor so subsequent Execute calls block again.
-// Call only after closing the previous releaseCh and draining blockCh.
+// Waits for all prior Execute calls to fully return before resetting state.
 func (e *blockingExecutor) resetForBlocking() {
+	e.wg.Wait()
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	e.releaseCh = make(chan struct{})
