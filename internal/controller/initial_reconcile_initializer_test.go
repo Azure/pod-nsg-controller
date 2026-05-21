@@ -5,8 +5,8 @@ import (
 	"testing"
 	"time"
 
-	"go.uber.org/zap/zaptest"
 	"github.com/go-logr/zapr"
+	"go.uber.org/zap/zaptest"
 	"k8s.io/apimachinery/pkg/types"
 
 	"github.com/Azure/pod-nsg-controller/internal/metrics"
