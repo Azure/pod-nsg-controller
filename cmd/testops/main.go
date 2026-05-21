@@ -217,6 +217,7 @@ func main() {
 		zap.Int("total", len(results)),
 	)
 	if failed > 0 {
+		_ = zapLog.Sync()
 		os.Exit(1)
 	}
 }
