@@ -4,10 +4,13 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/go-logr/logr"
+	pkgerrors "github.com/pkg/errors"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/labels"
@@ -46,6 +49,11 @@ type MappingReconciler struct {
 	DefaultResourceGroup    string
 	ResyncInterval          time.Duration
 	MaxConcurrentReconciles int
+
+	// AzureReadSem is a shared semaphore that caps total in-flight Azure GET
+	// calls across all concurrent reconciles. Initialised from
+	// config.MaxConcurrentAzureReads in cmd/main.go.
+	AzureReadSem chan struct{}
 
 	PrefixSetFactory azure.AddressPrefixSetClientFactory
 	Executor         Executor
@@ -774,39 +782,191 @@ func (r *MappingReconciler) reconcileDelete(ctx context.Context, m *v1alpha1.Pod
 
 // listActualForTargets fetches actual prefix set state from Azure for all targets.
 func (r *MappingReconciler) listActualForTargets(ctx context.Context, targets map[engine.ASGTarget]struct{}) (map[engine.ASGTarget]engine.ActualPrefixSet, error) {
-	actual := make(map[engine.ASGTarget]engine.ActualPrefixSet)
-	clientsBySubscription := make(map[string]azure.AddressPrefixSetAPI)
-
-	for target := range targets {
-		apiClient, ok := clientsBySubscription[target.SubscriptionID]
-		if !ok {
-			var err error
-			apiClient, err = r.PrefixSetFactory.ForSubscription(target.SubscriptionID)
-			if err != nil {
-				return nil, fmt.Errorf("getting client for subscription %s: %w", target.SubscriptionID, err)
-			}
-			clientsBySubscription[target.SubscriptionID] = apiClient
-		}
-
-		ps, err := apiClient.Get(ctx, target.SubscriptionID, target.ResourceGroup, target.ASGName, target.PrefixSetName)
-		if err != nil {
-			if azure.IsNotFound(err) {
-				continue
-			}
-			return nil, fmt.Errorf("getting prefix set %s/%s/%s/%s: %w",
-				target.SubscriptionID, target.ResourceGroup, target.ASGName, target.PrefixSetName, err)
-		}
-
-		ips := make(map[string]struct{})
-		if ps.Properties != nil {
-			for _, ip := range ps.Properties.AddressPrefixes {
-				ips[ip] = struct{}{}
-			}
-		}
-		actual[target] = engine.ActualPrefixSet{IPs: ips}
+	if len(targets) == 0 {
+		return make(map[engine.ASGTarget]engine.ActualPrefixSet), nil
 	}
 
-	return actual, nil
+	// Build deterministic target slice for stable ordering.
+	targetList := make([]engine.ASGTarget, 0, len(targets))
+	for t := range targets {
+		targetList = append(targetList, t)
+	}
+	sort.Slice(targetList, func(i, j int) bool {
+		return engine.TargetKey(targetList[i]) < engine.TargetKey(targetList[j])
+	})
+
+	// Resolve subscription clients (sequential; typically 1 subscription).
+	clientsBySubscription := make(map[string]azure.AddressPrefixSetAPI)
+	failedSubscriptions := make(map[string]error)
+	var subErrors []listActualTargetError
+	for _, t := range targetList {
+		if _, ok := clientsBySubscription[t.SubscriptionID]; ok {
+			continue
+		}
+		if _, ok := failedSubscriptions[t.SubscriptionID]; ok {
+			continue
+		}
+		c, err := r.PrefixSetFactory.ForSubscription(t.SubscriptionID)
+		if err != nil {
+			failedSubscriptions[t.SubscriptionID] = err
+			// Record error for all targets in this subscription.
+			for _, tt := range targetList {
+				if tt.SubscriptionID == t.SubscriptionID {
+					subErrors = append(subErrors, listActualTargetError{
+						target: tt,
+						err:    pkgerrors.Wrapf(err, "getting client for subscription %s", t.SubscriptionID),
+					})
+				}
+			}
+		} else {
+			clientsBySubscription[t.SubscriptionID] = c
+		}
+	}
+
+	// Use the shared reconciler-wide semaphore to cap total in-flight Azure
+	// reads across all concurrent reconciles. Fall back to unbounded if not set.
+	sem := r.AzureReadSem
+
+	var (
+		mu       sync.Mutex
+		actual   = make(map[engine.ASGTarget]engine.ActualPrefixSet)
+		failures []listActualTargetError
+		wg       sync.WaitGroup
+	)
+	failures = append(failures, subErrors...)
+
+	for _, target := range targetList {
+		apiClient, ok := clientsBySubscription[target.SubscriptionID]
+		if !ok {
+			// Already recorded subscription error above.
+			continue
+		}
+
+		wg.Add(1)
+		go func(t engine.ASGTarget, c azure.AddressPrefixSetAPI) {
+			defer wg.Done()
+
+			// Acquire semaphore with context awareness (skip if no semaphore configured).
+			if sem != nil {
+				select {
+				case sem <- struct{}{}:
+				case <-ctx.Done():
+					mu.Lock()
+					failures = append(failures, listActualTargetError{
+						target: t,
+						err:    pkgerrors.Wrap(ctx.Err(), "context canceled waiting for semaphore"),
+					})
+					mu.Unlock()
+					return
+				}
+				defer func() { <-sem }()
+			}
+
+			ps, err := c.Get(ctx, t.SubscriptionID, t.ResourceGroup, t.ASGName, t.PrefixSetName)
+			if err != nil {
+				if azure.IsNotFound(err) {
+					return
+				}
+				mu.Lock()
+				failures = append(failures, listActualTargetError{
+					target: t,
+					err:    err,
+				})
+				mu.Unlock()
+				return
+			}
+
+			ips := make(map[string]struct{})
+			if ps.Properties != nil {
+				for _, ip := range ps.Properties.AddressPrefixes {
+					ips[ip] = struct{}{}
+				}
+			}
+			mu.Lock()
+			actual[t] = engine.ActualPrefixSet{IPs: ips}
+			mu.Unlock()
+		}(target, apiClient)
+	}
+
+	wg.Wait()
+
+	if len(failures) == 0 {
+		return actual, nil
+	}
+	return actual, aggregateListActualTargetErrors(failures)
+}
+
+// listActualTargetError records a per-target failure from listActualForTargets.
+type listActualTargetError struct {
+	target engine.ASGTarget
+	err    error
+}
+
+// listActualAggregateError is the aggregated error returned when multiple
+// target GETs fail. It unwraps to a policy-primary cause so that
+// azure.IsRetriableARM and azure.ExtractRetryAfterHint work correctly.
+type listActualAggregateError struct {
+	primary error
+	items   []listActualTargetError
+	msg     string
+}
+
+func (e *listActualAggregateError) Error() string { return e.msg }
+func (e *listActualAggregateError) Unwrap() error { return e.primary }
+
+// aggregateListActualTargetErrors builds a deterministic aggregated error
+// from per-target failures. The aggregated error unwraps to the primary cause
+// selected by selectListActualPrimaryCause.
+func aggregateListActualTargetErrors(items []listActualTargetError) error {
+	if len(items) == 0 {
+		return nil
+	}
+
+	// Sort for deterministic message.
+	sort.Slice(items, func(i, j int) bool {
+		return engine.TargetKey(items[i].target) < engine.TargetKey(items[j].target)
+	})
+
+	primary := selectListActualPrimaryCause(items)
+
+	var parts []string
+	for _, item := range items {
+		key := engine.TargetKey(item.target)
+		parts = append(parts, fmt.Sprintf("%s: %v", key, item.err))
+	}
+	msg := "list-actual-state failures: " + strings.Join(parts, "; ")
+
+	return &listActualAggregateError{
+		primary: primary,
+		items:   items,
+		msg:     msg,
+	}
+}
+
+// selectListActualPrimaryCause picks the primary underlying error for policy
+// classification. If any failure is retriable (429, 5xx, 408, network), select
+// the retriable error with the highest RetryAfter (tie-break by target key).
+// Otherwise select the first deterministic non-retriable failure.
+func selectListActualPrimaryCause(items []listActualTargetError) error {
+	var bestRetriable *listActualTargetError
+	var bestRetryAfter time.Duration
+
+	for i := range items {
+		if azure.IsRetriableARM(items[i].err) {
+			hint := azure.ExtractRetryAfterHint(items[i].err)
+			if bestRetriable == nil || hint > bestRetryAfter ||
+				(hint == bestRetryAfter && engine.TargetKey(items[i].target) < engine.TargetKey(bestRetriable.target)) {
+				bestRetriable = &items[i]
+				bestRetryAfter = hint
+			}
+		}
+	}
+
+	if bestRetriable != nil {
+		return bestRetriable.err
+	}
+	// No retriable errors; use first deterministic non-retriable.
+	return items[0].err
 }
 
 // aggregateActionFailures combines failures from action results into a single error.

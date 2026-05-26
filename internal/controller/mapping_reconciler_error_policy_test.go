@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net"
+	"strings"
 	"testing"
 	"time"
 
@@ -1818,6 +1819,123 @@ func TestPhase7_T75_Reconciler_StatusContractValidation(t *testing.T) {
 	}
 
 	_ = logger
+}
+
+// ---------------------------------------------------------------------------
+// Phase 2 regression test: list-actual-state aggregated mixed errors
+//
+// TestPhase7_ListActualState_AggregatedMixedErrors_UsesRetriablePolicy verifies
+// that when listActualForTargets returns an aggregated error containing both
+// non-retriable (403) and retriable (429) failures, the reconciler:
+// 1. Returns nil error (Phase 7 contract).
+// 2. Uses policy-driven retriable delay (honoring Retry-After semantics).
+// 3. Status updater receives non-nil reconcileErr.
+// 4. reconcileErr still classifies as retriable ARM.
+//
+// This prevents silent behavior drift from single-error fail-fast to aggregated errors.
+// ---------------------------------------------------------------------------
+
+func TestPhase7_ListActualState_AggregatedMixedErrors_UsesRetriablePolicy(t *testing.T) {
+	_ = zaptest.NewLogger(t)
+	ctx := context.Background()
+	ns := "test-ns"
+
+	// Mapping with at least two ASG targets.
+	mapping := newTestMapping(ns, "m-mixed", []v1alpha1.Mapping{
+		{
+			PodSelector: v1alpha1.PodSelector{
+				MatchLabels: map[string]string{"app": "web"},
+			},
+			ApplicationSecurityGroups: []v1alpha1.ASGReference{
+				{ResourceID: asgResourceID("sub1", "rg1", "asg-forbidden")},
+				{ResourceID: asgResourceID("sub1", "rg1", "asg-throttled")},
+			},
+		},
+	})
+	mapping.Finalizers = []string{CleanupFinalizer}
+
+	pod := newTestPod(ns, "pod-1", "10.0.0.1", map[string]string{"app": "web"})
+
+	// Fake Azure clients: inject 403 for first target, 429 (with Retry-After 15s) for second.
+	fakeFactory := fake.NewClientFactory()
+	fakeAzClient := fake.NewClient()
+	fakeFactory.RegisterClient("sub1", fakeAzClient)
+
+	// Inject GET errors for both targets
+	fakeAzClient.InjectError(fake.InjectKey{
+		Operation:      fake.OperationGet,
+		SubscriptionID: "sub1",
+		ResourceGroup:  "rg1",
+		ASGName:        "asg-forbidden",
+		PrefixSetName:  "test-cluster-test-ns-m-mixed",
+	}, &azure.ARMStatusError{
+		StatusCode: 403,
+		ARMCode:    "AuthorizationFailed",
+		Message:    "forbidden",
+	}, 1)
+
+	fakeAzClient.InjectError(fake.InjectKey{
+		Operation:      fake.OperationGet,
+		SubscriptionID: "sub1",
+		ResourceGroup:  "rg1",
+		ASGName:        "asg-throttled",
+		PrefixSetName:  "test-cluster-test-ns-m-mixed",
+	}, &azure.ARMStatusError{
+		StatusCode: 429,
+		ARMCode:    "TooManyRequests",
+		Message:    "throttled",
+		RetryAfter: 15 * time.Second,
+	}, 1)
+
+	// Executor should not be reached (list-actual fails before diff)
+	exec := &stubExecutor{}
+	statusUpdater := &stubStatusUpdaterP7{}
+
+	r := newReconcilerP7(t,
+		[]client.Object{mapping, pod},
+		fakeFactory, exec, statusUpdater,
+	)
+
+	result, err := r.Reconcile(ctx, ctrl.Request{
+		NamespacedName: types.NamespacedName{Name: "m-mixed", Namespace: ns},
+	})
+
+	// Assertion 1: Phase 7 contract — reconcile returns nil error.
+	if err != nil {
+		t.Fatalf("TestPhase7_ListActualState_AggregatedMixedErrors: expected nil error from reconcile, got %v", err)
+	}
+
+	// Assertion 2: requeue delay is policy-driven retriable (>= Retry-After 15s).
+	// The 429 with Retry-After=15s must dominate the requeue decision.
+	if result.RequeueAfter < 15*time.Second {
+		t.Errorf("TestPhase7_ListActualState_AggregatedMixedErrors: expected RequeueAfter >= 15s (Retry-After from 429), got %v", result.RequeueAfter)
+	}
+
+	// Assertion 3: status updater receives non-nil reconcileErr.
+	if len(statusUpdater.reconcileCalls) == 0 {
+		t.Fatal("TestPhase7_ListActualState_AggregatedMixedErrors: expected status updater UpdateAfterReconcile to be called")
+	}
+	lastCall := statusUpdater.reconcileCalls[len(statusUpdater.reconcileCalls)-1]
+	if lastCall.reconcileErr == nil {
+		t.Error("TestPhase7_ListActualState_AggregatedMixedErrors: expected non-nil reconcileErr passed to status updater")
+	}
+
+	// Assertion 4: reconcileErr still classifies as retriable ARM.
+	if lastCall.reconcileErr != nil && !azure.IsRetriableARM(lastCall.reconcileErr) {
+		t.Errorf("TestPhase7_ListActualState_AggregatedMixedErrors: expected reconcileErr to classify as retriable (IsRetriableARM=true), got false; err=%v", lastCall.reconcileErr)
+	}
+
+	// Assertion 5 (Phase 2 specific): aggregated error MUST include BOTH target
+	// failures in its message. With fail-fast only one is reported.
+	if lastCall.reconcileErr != nil {
+		errMsg := lastCall.reconcileErr.Error()
+		hasForbidden := strings.Contains(errMsg, "asg-forbidden")
+		hasThrottled := strings.Contains(errMsg, "asg-throttled")
+		if !hasForbidden || !hasThrottled {
+			t.Errorf("TestPhase7_ListActualState_AggregatedMixedErrors: expected aggregated error to mention both targets (asg-forbidden=%v, asg-throttled=%v); err=%v",
+				hasForbidden, hasThrottled, lastCall.reconcileErr)
+		}
+	}
 }
 
 // ---------------------------------------------------------------------------

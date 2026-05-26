@@ -4,6 +4,9 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -1585,5 +1588,254 @@ func TestReconcile_NonDeletePath_CorruptOwnedAnnotation_ReturnsError(t *testing.
 	// Phase 7 contract: reconcile returns nil error with policy-driven requeue
 	if err != nil {
 		t.Fatalf("expected nil error (Phase 7 policy-driven), got: %v", err)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Phase 2: Parallel Azure GET Calls — listActualForTargets tests
+// ---------------------------------------------------------------------------
+
+// delayingFakeClient wraps a fake Azure API to inject per-GET delay and track concurrency.
+type delayingFakeClient struct {
+	delay       time.Duration
+	mu          sync.Mutex
+	inFlight    int64
+	maxInFlight int64
+	attempts    int64
+	// Per-target error injection (target key -> error)
+	targetErrors map[string]error
+}
+
+func (d *delayingFakeClient) Get(ctx context.Context, sub, rg, asg, ps string) (*azure.AddressPrefixSet, error) {
+	atomic.AddInt64(&d.attempts, 1)
+
+	current := atomic.AddInt64(&d.inFlight, 1)
+	defer atomic.AddInt64(&d.inFlight, -1)
+
+	d.mu.Lock()
+	if current > d.maxInFlight {
+		d.maxInFlight = current
+	}
+	d.mu.Unlock()
+
+	// Simulate network delay
+	select {
+	case <-time.After(d.delay):
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+
+	key := sub + "/" + rg + "/" + asg + "/" + ps
+	d.mu.Lock()
+	injErr := d.targetErrors[key]
+	d.mu.Unlock()
+
+	if injErr != nil {
+		return nil, injErr
+	}
+
+	name := ps
+	etag := `"v-1"`
+	return &azure.AddressPrefixSet{
+		Name: &name,
+		Etag: &etag,
+		Properties: &azure.AddressPrefixSetProperties{
+			AddressPrefixes: []string{"10.0.0.1"},
+		},
+	}, nil
+}
+
+func (d *delayingFakeClient) Put(_ context.Context, _, _, _, _ string, _ []string) error {
+	return nil
+}
+
+func (d *delayingFakeClient) Delete(_ context.Context, _, _, _, _ string) error {
+	return nil
+}
+
+func (d *delayingFakeClient) List(_ context.Context, _, _, _ string) ([]azure.AddressPrefixSet, error) {
+	return nil, nil
+}
+
+// delayingFakeFactory returns the same delayingFakeClient for any subscription.
+type delayingFakeFactory struct {
+	client *delayingFakeClient
+}
+
+func (f *delayingFakeFactory) ForSubscription(_ string) (azure.AddressPrefixSetAPI, error) {
+	return f.client, nil
+}
+
+// TestListActualForTargets_Parallel verifies parallel GET execution.
+// Asserts: all 5 attempts occurred, observed concurrency > 1 and <= semaphore bound,
+// and aggregated error is returned for the failed target.
+func TestListActualForTargets_Parallel(t *testing.T) {
+	ctx := context.Background()
+
+	delayClient := &delayingFakeClient{
+		delay:        100 * time.Millisecond,
+		targetErrors: make(map[string]error),
+	}
+
+	// Inject one non-NotFound failure for target 3
+	delayClient.targetErrors["sub1/rg1/asg3/prefix-set"] = &azure.ARMStatusError{
+		StatusCode: 500,
+		ARMCode:    "InternalServerError",
+		Message:    "injected failure",
+	}
+
+	factory := &delayingFakeFactory{client: delayClient}
+
+	r := &MappingReconciler{
+		PrefixSetFactory: factory,
+		AzureReadSem:     make(chan struct{}, 5),
+	}
+
+	targets := map[engine.ASGTarget]struct{}{
+		{SubscriptionID: "sub1", ResourceGroup: "rg1", ASGName: "asg1", PrefixSetName: "prefix-set"}: {},
+		{SubscriptionID: "sub1", ResourceGroup: "rg1", ASGName: "asg2", PrefixSetName: "prefix-set"}: {},
+		{SubscriptionID: "sub1", ResourceGroup: "rg1", ASGName: "asg3", PrefixSetName: "prefix-set"}: {},
+		{SubscriptionID: "sub1", ResourceGroup: "rg1", ASGName: "asg4", PrefixSetName: "prefix-set"}: {},
+		{SubscriptionID: "sub1", ResourceGroup: "rg1", ASGName: "asg5", PrefixSetName: "prefix-set"}: {},
+	}
+
+	_, err := r.listActualForTargets(ctx, targets)
+
+	// Phase 2 acceptance: aggregated error is returned (one target failed)
+	if err == nil {
+		t.Fatal("TestListActualForTargets_Parallel: expected aggregated error from failed target, got nil")
+	}
+
+	// Phase 2 acceptance: all 5 GET attempts occurred (no fail-fast abort)
+	gotAttempts := atomic.LoadInt64(&delayClient.attempts)
+	if gotAttempts != 5 {
+		t.Errorf("TestListActualForTargets_Parallel: expected 5 GET attempts, got %d (fail-fast detected)", gotAttempts)
+	}
+
+	// Phase 2 acceptance: observed max concurrent GETs > 1 (proves parallelism)
+	delayClient.mu.Lock()
+	maxConcurrent := delayClient.maxInFlight
+	delayClient.mu.Unlock()
+	if maxConcurrent <= 1 {
+		t.Errorf("TestListActualForTargets_Parallel: expected observed concurrency > 1, got %d (sequential execution detected)", maxConcurrent)
+	}
+	if maxConcurrent > 5 {
+		t.Errorf("TestListActualForTargets_Parallel: expected observed concurrency <= 5 (bounded), got %d", maxConcurrent)
+	}
+}
+
+// TestListActualForTargets_NotFoundSkipped verifies ErrNotFound targets are omitted
+// from the result and do not cause an error when remaining targets succeed.
+func TestListActualForTargets_NotFoundSkipped(t *testing.T) {
+	ctx := context.Background()
+
+	delayClient := &delayingFakeClient{
+		delay:        5 * time.Millisecond,
+		targetErrors: make(map[string]error),
+	}
+
+	// Target 2 returns ErrNotFound (should be omitted, not cause error)
+	delayClient.targetErrors["sub1/rg1/asg2/prefix-set"] = azure.ErrNotFound
+
+	factory := &delayingFakeFactory{client: delayClient}
+
+	r := &MappingReconciler{
+		PrefixSetFactory: factory,
+		AzureReadSem:     make(chan struct{}, 5),
+	}
+
+	targets := map[engine.ASGTarget]struct{}{
+		{SubscriptionID: "sub1", ResourceGroup: "rg1", ASGName: "asg1", PrefixSetName: "prefix-set"}: {},
+		{SubscriptionID: "sub1", ResourceGroup: "rg1", ASGName: "asg2", PrefixSetName: "prefix-set"}: {},
+		{SubscriptionID: "sub1", ResourceGroup: "rg1", ASGName: "asg3", PrefixSetName: "prefix-set"}: {},
+	}
+
+	actual, err := r.listActualForTargets(ctx, targets)
+
+	// No error expected (NotFound is non-fatal, other targets succeed)
+	if err != nil {
+		t.Fatalf("TestListActualForTargets_NotFoundSkipped: expected nil error, got %v", err)
+	}
+
+	// NotFound target (asg2) must be omitted from actual
+	for target := range actual {
+		if target.ASGName == "asg2" {
+			t.Error("TestListActualForTargets_NotFoundSkipped: NotFound target asg2 should be omitted from actual")
+		}
+	}
+
+	// Successful targets must be present
+	found := 0
+	for target := range actual {
+		if target.ASGName == "asg1" || target.ASGName == "asg3" {
+			found++
+		}
+	}
+	if found != 2 {
+		t.Errorf("TestListActualForTargets_NotFoundSkipped: expected 2 successful targets in actual, got %d", found)
+	}
+}
+
+// TestListActualForTargets_AggregatedErrorPrefersRetriableCause verifies that when
+// mixed failures occur (403 + 429), the aggregated error classifies as retriable
+// and exposes the retry hint through unwrapping.
+func TestListActualForTargets_AggregatedErrorPrefersRetriableCause(t *testing.T) {
+	ctx := context.Background()
+
+	delayClient := &delayingFakeClient{
+		delay:        5 * time.Millisecond,
+		targetErrors: make(map[string]error),
+	}
+
+	// 403 non-retriable failure
+	delayClient.targetErrors["sub1/rg1/asg1/prefix-set"] = &azure.ARMStatusError{
+		StatusCode: 403,
+		ARMCode:    "AuthorizationFailed",
+		Message:    "forbidden",
+	}
+
+	// 429 retriable failure with Retry-After
+	delayClient.targetErrors["sub1/rg1/asg2/prefix-set"] = &azure.ARMStatusError{
+		StatusCode: 429,
+		ARMCode:    "TooManyRequests",
+		Message:    "throttled",
+		RetryAfter: 20 * time.Second,
+	}
+
+	factory := &delayingFakeFactory{client: delayClient}
+
+	r := &MappingReconciler{
+		PrefixSetFactory: factory,
+		AzureReadSem:     make(chan struct{}, 5),
+	}
+
+	targets := map[engine.ASGTarget]struct{}{
+		{SubscriptionID: "sub1", ResourceGroup: "rg1", ASGName: "asg1", PrefixSetName: "prefix-set"}: {},
+		{SubscriptionID: "sub1", ResourceGroup: "rg1", ASGName: "asg2", PrefixSetName: "prefix-set"}: {},
+		{SubscriptionID: "sub1", ResourceGroup: "rg1", ASGName: "asg3", PrefixSetName: "prefix-set"}: {},
+	}
+
+	_, err := r.listActualForTargets(ctx, targets)
+
+	// Must return an error (at least two targets failed)
+	if err == nil {
+		t.Fatal("TestListActualForTargets_AggregatedErrorPrefersRetriableCause: expected aggregated error, got nil")
+	}
+
+	// Aggregated error must classify as retriable (429 takes priority over 403)
+	if !azure.IsRetriableARM(err) {
+		t.Errorf("TestListActualForTargets_AggregatedErrorPrefersRetriableCause: expected aggregated error to classify as retriable (IsRetriableARM=true), got false; err=%v", err)
+	}
+
+	// Must expose Retry-After hint from the 429 via unwrapping
+	hint := azure.ExtractRetryAfterHint(err)
+	if hint < 20*time.Second {
+		t.Errorf("TestListActualForTargets_AggregatedErrorPrefersRetriableCause: expected RetryAfter hint >= 20s from 429, got %v", hint)
+	}
+
+	// Error message must include both target failures
+	errMsg := err.Error()
+	if !strings.Contains(errMsg, "asg1") || !strings.Contains(errMsg, "asg2") {
+		t.Errorf("TestListActualForTargets_AggregatedErrorPrefersRetriableCause: error message should include both failed targets; got: %s", errMsg)
 	}
 }
