@@ -186,3 +186,65 @@ func TestLoad_AZURENSGNAMEIgnored(t *testing.T) {
 		t.Errorf("expected ClusterName=cluster-a, got %s", cfg.ClusterName)
 	}
 }
+
+// ---------------------------------------------------------------------------
+// TestLoad_MaxConcurrentAzureReads: table-driven coverage for MAX_CONCURRENT_AZURE_READS
+// ---------------------------------------------------------------------------
+func TestLoad_MaxConcurrentAzureReads(t *testing.T) {
+	tests := []struct {
+		name      string
+		envValue  string
+		wantValue int
+		wantErr   bool
+	}{
+		{
+			name:      "explicit value 20",
+			envValue:  "20",
+			wantValue: 20,
+		},
+		{
+			name:      "unset defaults to 10",
+			envValue:  "",
+			wantValue: 10,
+		},
+		{
+			name:    "zero is invalid",
+			envValue: "0",
+			wantErr: true,
+		},
+		{
+			name:    "negative is invalid",
+			envValue: "-1",
+			wantErr: true,
+		},
+		{
+			name:    "non-integer is invalid",
+			envValue: "abc",
+			wantErr: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Setenv("AZURE_SUBSCRIPTION_ID", "")
+			t.Setenv("AZURE_RESOURCE_GROUP", "")
+			t.Setenv("CLUSTER_NAME", "cluster-a")
+			t.Setenv("RESYNC_INTERVAL_SECONDS", "")
+			t.Setenv("MAX_CONCURRENT_AZURE_READS", tt.envValue)
+
+			cfg, err := Load()
+			if tt.wantErr {
+				if err == nil {
+					t.Fatalf("expected error for MAX_CONCURRENT_AZURE_READS=%q, got nil", tt.envValue)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if cfg.MaxConcurrentAzureReads != tt.wantValue {
+				t.Errorf("MaxConcurrentAzureReads = %d, want %d", cfg.MaxConcurrentAzureReads, tt.wantValue)
+			}
+		})
+	}
+}

@@ -144,6 +144,7 @@ func main() {
 		DefaultResourceGroup:    cfg.ResourceGroup,
 		ResyncInterval:          cfg.ResyncInterval,
 		MaxConcurrentReconciles: cfg.MaxConcurrentReconciles,
+		AzureReadSem:            make(chan struct{}, cfg.MaxConcurrentAzureReads),
 		PrefixSetFactory:        prefixSetFactory,
 		Executor:                executor,
 		StatusUpdater:           statusUpdater,

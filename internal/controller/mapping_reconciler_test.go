@@ -1687,8 +1687,8 @@ func TestListActualForTargets_Parallel(t *testing.T) {
 	factory := &delayingFakeFactory{client: delayClient}
 
 	r := &MappingReconciler{
-		PrefixSetFactory:        factory,
-		MaxConcurrentReconciles: 5,
+		PrefixSetFactory: factory,
+		AzureReadSem:     make(chan struct{}, 5),
 	}
 
 	targets := map[engine.ASGTarget]struct{}{
@@ -1747,8 +1747,8 @@ func TestListActualForTargets_NotFoundSkipped(t *testing.T) {
 	factory := &delayingFakeFactory{client: delayClient}
 
 	r := &MappingReconciler{
-		PrefixSetFactory:        factory,
-		MaxConcurrentReconciles: 5,
+		PrefixSetFactory: factory,
+		AzureReadSem:     make(chan struct{}, 5),
 	}
 
 	targets := map[engine.ASGTarget]struct{}{
@@ -1812,8 +1812,8 @@ func TestListActualForTargets_AggregatedErrorPrefersRetriableCause(t *testing.T)
 	factory := &delayingFakeFactory{client: delayClient}
 
 	r := &MappingReconciler{
-		PrefixSetFactory:        factory,
-		MaxConcurrentReconciles: 5,
+		PrefixSetFactory: factory,
+		AzureReadSem:     make(chan struct{}, 5),
 	}
 
 	targets := map[engine.ASGTarget]struct{}{

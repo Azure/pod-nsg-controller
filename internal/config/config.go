@@ -42,6 +42,9 @@ type Config struct {
 
 	// MaxConcurrentReconciles is the number of concurrent reconcile workers (default: 5).
 	MaxConcurrentReconciles int
+
+	// MaxConcurrentAzureReads is the max parallel ARM GET calls across all reconciles (default: 10).
+	MaxConcurrentAzureReads int
 }
 
 // Load reads configuration from environment variables and validates required fields.
@@ -110,6 +113,21 @@ func Load() (*Config, error) {
 			return nil, fmt.Errorf("MAX_CONCURRENT_RECONCILES must be >= 1, got %d", val)
 		}
 		cfg.MaxConcurrentReconciles = val
+	}
+
+	// Parse max concurrent Azure reads.
+	marStr := os.Getenv("MAX_CONCURRENT_AZURE_READS")
+	if marStr == "" {
+		cfg.MaxConcurrentAzureReads = 10
+	} else {
+		val, err := strconv.Atoi(marStr)
+		if err != nil {
+			return nil, errors.Wrap(err, "MAX_CONCURRENT_AZURE_READS must be a valid integer")
+		}
+		if val < 1 {
+			return nil, fmt.Errorf("MAX_CONCURRENT_AZURE_READS must be >= 1, got %d", val)
+		}
+		cfg.MaxConcurrentAzureReads = val
 	}
 
 	if err := cfg.Validate(); err != nil {

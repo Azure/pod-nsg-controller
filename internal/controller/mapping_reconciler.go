@@ -50,6 +50,11 @@ type MappingReconciler struct {
 	ResyncInterval          time.Duration
 	MaxConcurrentReconciles int
 
+	// AzureReadSem is a shared semaphore that caps total in-flight Azure GET
+	// calls across all concurrent reconciles. Initialised from
+	// config.MaxConcurrentAzureReads in cmd/main.go.
+	AzureReadSem chan struct{}
+
 	PrefixSetFactory azure.AddressPrefixSetClientFactory
 	Executor         Executor
 	StatusUpdater    StatusUpdater
@@ -818,12 +823,9 @@ func (r *MappingReconciler) listActualForTargets(ctx context.Context, targets ma
 		}
 	}
 
-	// Determine concurrency bound.
-	concurrency := r.MaxConcurrentReconciles
-	if concurrency <= 0 {
-		concurrency = 1
-	}
-	sem := make(chan struct{}, concurrency)
+	// Use the shared reconciler-wide semaphore to cap total in-flight Azure
+	// reads across all concurrent reconciles. Fall back to unbounded if not set.
+	sem := r.AzureReadSem
 
 	var (
 		mu       sync.Mutex
@@ -844,19 +846,21 @@ func (r *MappingReconciler) listActualForTargets(ctx context.Context, targets ma
 		go func(t engine.ASGTarget, c azure.AddressPrefixSetAPI) {
 			defer wg.Done()
 
-			// Acquire semaphore with context awareness.
-			select {
-			case sem <- struct{}{}:
-			case <-ctx.Done():
-				mu.Lock()
-				failures = append(failures, listActualTargetError{
-					target: t,
-					err:    pkgerrors.Wrap(ctx.Err(), "context canceled waiting for semaphore"),
-				})
-				mu.Unlock()
-				return
+			// Acquire semaphore with context awareness (skip if no semaphore configured).
+			if sem != nil {
+				select {
+				case sem <- struct{}{}:
+				case <-ctx.Done():
+					mu.Lock()
+					failures = append(failures, listActualTargetError{
+						target: t,
+						err:    pkgerrors.Wrap(ctx.Err(), "context canceled waiting for semaphore"),
+					})
+					mu.Unlock()
+					return
+				}
+				defer func() { <-sem }()
 			}
-			defer func() { <-sem }()
 
 			ps, err := c.Get(ctx, t.SubscriptionID, t.ResourceGroup, t.ASGName, t.PrefixSetName)
 			if err != nil {
