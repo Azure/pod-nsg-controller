@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net"
+	"strings"
 	"testing"
 	"time"
 
@@ -1928,22 +1929,13 @@ func TestPhase7_ListActualState_AggregatedMixedErrors_UsesRetriablePolicy(t *tes
 	// failures in its message. With fail-fast only one is reported.
 	if lastCall.reconcileErr != nil {
 		errMsg := lastCall.reconcileErr.Error()
-		hasForbidden := stringContainsP7(errMsg, "asg-forbidden")
-		hasThrottled := stringContainsP7(errMsg, "asg-throttled")
+		hasForbidden := strings.Contains(errMsg, "asg-forbidden")
+		hasThrottled := strings.Contains(errMsg, "asg-throttled")
 		if !hasForbidden || !hasThrottled {
 			t.Errorf("TestPhase7_ListActualState_AggregatedMixedErrors: expected aggregated error to mention both targets (asg-forbidden=%v, asg-throttled=%v); err=%v",
 				hasForbidden, hasThrottled, lastCall.reconcileErr)
 		}
 	}
-}
-
-func stringContainsP7(s, substr string) bool {
-	for i := 0; i+len(substr) <= len(s); i++ {
-		if s[i:i+len(substr)] == substr {
-			return true
-		}
-	}
-	return false
 }
 
 // ---------------------------------------------------------------------------

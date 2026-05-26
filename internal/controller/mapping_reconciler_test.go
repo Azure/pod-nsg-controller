@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -1834,16 +1835,7 @@ func TestListActualForTargets_AggregatedErrorPrefersRetriableCause(t *testing.T)
 
 	// Error message must include both target failures
 	errMsg := err.Error()
-	if !stringContains(errMsg, "asg1") || !stringContains(errMsg, "asg2") {
+	if !strings.Contains(errMsg, "asg1") || !strings.Contains(errMsg, "asg2") {
 		t.Errorf("TestListActualForTargets_AggregatedErrorPrefersRetriableCause: error message should include both failed targets; got: %s", errMsg)
 	}
-}
-
-func stringContains(s, substr string) bool {
-	for i := 0; i+len(substr) <= len(s); i++ {
-		if s[i:i+len(substr)] == substr {
-			return true
-		}
-	}
-	return false
 }
