@@ -3,7 +3,6 @@ package controller
 import (
 	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"sync"
 	"sync/atomic"
@@ -1855,10 +1854,3 @@ func stringContains(s, substr string) bool {
 	}
 	return false
 }
-
-// Ensure new imports are used.
-var (
-	_ = sync.Mutex{}
-	_ = atomic.AddInt64
-	_ = errors.New
-)
