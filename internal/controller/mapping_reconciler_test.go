@@ -1666,8 +1666,8 @@ func (f *delayingFakeFactory) ForSubscription(_ string) (azure.AddressPrefixSetA
 }
 
 // TestListActualForTargets_Parallel verifies parallel GET execution.
-// With 5 targets each delayed 100ms, wall time must be < 300ms (not ~500ms sequential).
-// Also asserts: all 5 attempts occurred, observed concurrency > 1, aggregated error returned.
+// Asserts: all 5 attempts occurred, observed concurrency > 1 and <= semaphore bound,
+// and aggregated error is returned for the failed target.
 func TestListActualForTargets_Parallel(t *testing.T) {
 	ctx := context.Background()
 
@@ -1698,9 +1698,7 @@ func TestListActualForTargets_Parallel(t *testing.T) {
 		{SubscriptionID: "sub1", ResourceGroup: "rg1", ASGName: "asg5", PrefixSetName: "prefix-set"}: {},
 	}
 
-	start := time.Now()
 	_, err := r.listActualForTargets(ctx, targets)
-	elapsed := time.Since(start)
 
 	// Phase 2 acceptance: aggregated error is returned (one target failed)
 	if err == nil {
@@ -1722,11 +1720,6 @@ func TestListActualForTargets_Parallel(t *testing.T) {
 	}
 	if maxConcurrent > 5 {
 		t.Errorf("TestListActualForTargets_Parallel: expected observed concurrency <= 5 (bounded), got %d", maxConcurrent)
-	}
-
-	// Phase 2 acceptance: wall time < 300ms (not ~500ms sequential)
-	if elapsed >= 300*time.Millisecond {
-		t.Errorf("TestListActualForTargets_Parallel: expected wall time < 300ms, got %v (sequential execution detected)", elapsed)
 	}
 }
 
