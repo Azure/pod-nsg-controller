@@ -792,7 +792,7 @@ func (r *MappingReconciler) listActualForTargets(ctx context.Context, targets ma
 		targetList = append(targetList, t)
 	}
 	sort.Slice(targetList, func(i, j int) bool {
-		return listActualTargetKey(targetList[i]) < listActualTargetKey(targetList[j])
+		return engine.TargetKey(targetList[i]) < engine.TargetKey(targetList[j])
 	})
 
 	// Resolve subscription clients (sequential; typically 1 subscription).
@@ -924,14 +924,14 @@ func aggregateListActualTargetErrors(items []listActualTargetError) error {
 
 	// Sort for deterministic message.
 	sort.Slice(items, func(i, j int) bool {
-		return listActualTargetKey(items[i].target) < listActualTargetKey(items[j].target)
+		return engine.TargetKey(items[i].target) < engine.TargetKey(items[j].target)
 	})
 
 	primary := selectListActualPrimaryCause(items)
 
 	var parts []string
 	for _, item := range items {
-		key := listActualTargetKey(item.target)
+		key := engine.TargetKey(item.target)
 		parts = append(parts, fmt.Sprintf("%s: %v", key, item.err))
 	}
 	msg := "list-actual-state failures: " + strings.Join(parts, "; ")
@@ -955,7 +955,7 @@ func selectListActualPrimaryCause(items []listActualTargetError) error {
 		if azure.IsRetriableARM(items[i].err) {
 			hint := azure.ExtractRetryAfterHint(items[i].err)
 			if bestRetriable == nil || hint > bestRetryAfter ||
-				(hint == bestRetryAfter && listActualTargetKey(items[i].target) < listActualTargetKey(bestRetriable.target)) {
+				(hint == bestRetryAfter && engine.TargetKey(items[i].target) < engine.TargetKey(bestRetriable.target)) {
 				bestRetriable = &items[i]
 				bestRetryAfter = hint
 			}
@@ -967,11 +967,6 @@ func selectListActualPrimaryCause(items []listActualTargetError) error {
 	}
 	// No retriable errors; use first deterministic non-retriable.
 	return items[0].err
-}
-
-// listActualTargetKey returns a stable sort key for an ASGTarget.
-func listActualTargetKey(t engine.ASGTarget) string {
-	return t.SubscriptionID + "/" + t.ResourceGroup + "/" + t.ASGName + "/" + t.PrefixSetName
 }
 
 // aggregateActionFailures combines failures from action results into a single error.
