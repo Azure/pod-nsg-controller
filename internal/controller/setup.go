@@ -98,8 +98,8 @@ func (l *perItemBucketRateLimiter) NumRequeues(_ reconcile.Request) int {
 	return 0
 }
 
-func (l *perItemBucketRateLimiter) Forget(item reconcile.Request) {
-	l.mu.Lock()
-	delete(l.limiters, item)
-	l.mu.Unlock()
-}
+// Forget is a no-op: the per-key token bucket must persist across successful
+// reconciles to enforce the minimum interval between events for the same key.
+// Limiters are lazily created and retained for the controller lifetime (bounded
+// by the number of distinct PodASGMapping keys, typically small).
+func (l *perItemBucketRateLimiter) Forget(_ reconcile.Request) {}
