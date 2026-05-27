@@ -7,7 +7,6 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"testing"
 	"time"
 
@@ -1490,6 +1489,8 @@ func TestPhase5_ParallelReconciliation_DifferentKeysRunConcurrently(t *testing.T
 // Phase 3: TestPhase3_PodBurstDebounce_CoalescesReconcileCycles
 // Deterministic end-to-end burst test: 10 rapid same-key pod IP updates
 // should collapse to 1-2 additional reconcile cycles, preserving final state.
+// Instruments actual Azure GET calls (not executor calls) to prove debounce
+// reduces ARM-read churn even when actions compute to zero.
 // ---------------------------------------------------------------------------
 func TestPhase3_PodBurstDebounce_CoalescesReconcileCycles(t *testing.T) {
 	scheme := integrationScheme(t)
@@ -1514,13 +1515,6 @@ func TestPhase3_PodBurstDebounce_CoalescesReconcileCycles(t *testing.T) {
 	fakeAzClient := fake.NewClient()
 	fakeFactory.RegisterClient("sub1", fakeAzClient)
 
-	// Count executor calls to measure reconcile cycles
-	var executorCallCount int64
-	countingExec := &countingExecutor{
-		inner:     azure.NewExecutor(zapLog, fakeFactory, 2),
-		callCount: &executorCallCount,
-	}
-
 	debounceInterval := 500 * time.Millisecond
 	reconciler := &controller.MappingReconciler{
 		Client:               mgr.GetClient(),
@@ -1529,7 +1523,7 @@ func TestPhase3_PodBurstDebounce_CoalescesReconcileCycles(t *testing.T) {
 		ResyncInterval:       60 * time.Second, // long to avoid resync pollution
 		MinReconcileInterval: debounceInterval,
 		PrefixSetFactory:     fakeFactory,
-		Executor:             countingExec,
+		Executor:             azure.NewExecutor(zapLog, fakeFactory, 2),
 	}
 
 	if err := reconciler.SetupWithManager(mgr); err != nil {
@@ -1594,11 +1588,11 @@ func TestPhase3_PodBurstDebounce_CoalescesReconcileCycles(t *testing.T) {
 
 	ownershipKey := "test-cluster-" + ns.Name + "-burst-mapping"
 	eventually(t, 15*time.Second, 200*time.Millisecond, func() bool {
-		ps, getErr := fakeAzClient.Get(ctx, "sub1", "rg1", "asg1", ownershipKey)
-		if getErr != nil || ps.Properties == nil {
+		ips, ok := fakeAzClient.PeekPrefixes("sub1", "rg1", "asg1", ownershipKey)
+		if !ok {
 			return false
 		}
-		for _, ip := range ps.Properties.AddressPrefixes {
+		for _, ip := range ips {
 			if ip == "10.0.0.1/32" {
 				return true
 			}
@@ -1606,8 +1600,8 @@ func TestPhase3_PodBurstDebounce_CoalescesReconcileCycles(t *testing.T) {
 		return false
 	}, "Phase 3: expected initial IP to converge before burst")
 
-	// Record executor calls at baseline
-	baselineCalls := atomic.LoadInt64(&executorCallCount)
+	// Reset Azure GET counter after baseline convergence.
+	fakeAzClient.ResetGetCallCount()
 
 	// Apply 10 rapid same-key pod IP updates within ~100ms
 	for i := 2; i <= 11; i++ {
@@ -1618,14 +1612,14 @@ func TestPhase3_PodBurstDebounce_CoalescesReconcileCycles(t *testing.T) {
 		time.Sleep(10 * time.Millisecond) // ~100ms total for 10 updates
 	}
 
-	// Wait for final state to converge
+	// Wait for final state to converge using PeekPrefixes (no GET counter inflation).
 	finalIP := "10.0.0.11/32"
 	eventually(t, 15*time.Second, 200*time.Millisecond, func() bool {
-		ps, getErr := fakeAzClient.Get(ctx, "sub1", "rg1", "asg1", ownershipKey)
-		if getErr != nil || ps.Properties == nil {
+		ips, ok := fakeAzClient.PeekPrefixes("sub1", "rg1", "asg1", ownershipKey)
+		if !ok {
 			return false
 		}
-		for _, ip := range ps.Properties.AddressPrefixes {
+		for _, ip := range ips {
 			if ip == finalIP {
 				return true
 			}
@@ -1636,43 +1630,33 @@ func TestPhase3_PodBurstDebounce_CoalescesReconcileCycles(t *testing.T) {
 	// Wait additional time for any trailing reconciles
 	time.Sleep(2 * debounceInterval)
 
-	// Count reconcile cycles after burst
-	burstCycles := atomic.LoadInt64(&executorCallCount) - baselineCalls
+	// Count Azure GET calls during the burst window. Each full reconcile
+	// cycle calls Get once per ASG target, so this directly measures
+	// ARM-read churn (including zero-action reconciles that the executor
+	// counter would miss). PeekPrefixes calls above do not inflate this.
+	burstGets := fakeAzClient.GetCallCount()
 
-	// Assert: only 1-2 additional reconcile cycles (not 10)
-	if burstCycles > 2 {
-		t.Errorf("Phase 3: expected at most 2 reconcile cycles for 10 rapid pod IP updates (debounce should coalesce), got %d", burstCycles)
+	// Assert: at most 2 full reconcile cycles worth of Azure GETs (not 10).
+	// With 1 ASG target, each full cycle = 1 GET, so ≤2 GETs expected.
+	if burstGets > 2 {
+		t.Errorf("Phase 3: expected at most 2 Azure GET calls for 10 rapid pod IP updates (debounce should coalesce), got %d", burstGets)
 	}
-	if burstCycles == 0 {
-		t.Error("Phase 3: expected at least 1 reconcile cycle to process the burst")
+	if burstGets == 0 {
+		t.Error("Phase 3: expected at least 1 Azure GET call to process the burst")
 	}
 
 	// Assert: final Azure state contains the LAST pod IP
-	ps, err := fakeAzClient.Get(ctx, "sub1", "rg1", "asg1", ownershipKey)
-	if err != nil {
-		t.Fatalf("Phase 3: failed to get final prefix set: %v", err)
-	}
-	if ps.Properties == nil {
-		t.Fatal("Phase 3: final prefix set has nil properties")
+	ips, ok := fakeAzClient.PeekPrefixes("sub1", "rg1", "asg1", ownershipKey)
+	if !ok {
+		t.Fatal("Phase 3: final prefix set not found")
 	}
 	hasLastIP := false
-	for _, ip := range ps.Properties.AddressPrefixes {
+	for _, ip := range ips {
 		if ip == finalIP {
 			hasLastIP = true
 		}
 	}
 	if !hasLastIP {
-		t.Errorf("Phase 3: final prefix set does not contain last IP %s; got %v", finalIP, ps.Properties.AddressPrefixes)
+		t.Errorf("Phase 3: final prefix set does not contain last IP %s; got %v", finalIP, ips)
 	}
-}
-
-// countingExecutor wraps an Executor and counts calls.
-type countingExecutor struct {
-	inner     controller.Executor
-	callCount *int64
-}
-
-func (c *countingExecutor) Execute(ctx context.Context, actions []engine.Action) []azure.ActionResult {
-	atomic.AddInt64(c.callCount, 1)
-	return c.inner.Execute(ctx, actions)
 }

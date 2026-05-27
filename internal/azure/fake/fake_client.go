@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"strings"
 	"sync"
+	"sync/atomic"
 
 	"github.com/Azure/pod-nsg-controller/internal/azure"
 )
@@ -51,6 +52,9 @@ type Client struct {
 
 	// Deterministic per-key error injection.
 	injectedErrors map[InjectKey][]error
+
+	// getCallCount tracks the number of Get calls for test observability.
+	getCallCount int64
 }
 
 // NewClient creates a new fake Client.
@@ -78,6 +82,32 @@ func (c *Client) ClearInjectedErrors() {
 	c.injectedErrors = make(map[InjectKey][]error)
 }
 
+// GetCallCount returns the total number of Get calls made to this client.
+func (c *Client) GetCallCount() int64 {
+	return atomic.LoadInt64(&c.getCallCount)
+}
+
+// ResetGetCallCount resets the Get call counter to zero and returns the previous value.
+func (c *Client) ResetGetCallCount() int64 {
+	return atomic.SwapInt64(&c.getCallCount, 0)
+}
+
+// PeekPrefixes returns the stored address prefixes for a resource without
+// incrementing the Get call counter. Useful for test polling assertions
+// that should not inflate the GET metric.
+func (c *Client) PeekPrefixes(subscriptionID, resourceGroup, asgName, prefixSetName string) ([]string, bool) {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	key := resourceKey(subscriptionID, resourceGroup, asgName, prefixSetName)
+	entry, ok := c.store[key]
+	if !ok {
+		return nil, false
+	}
+	ipsCopy := make([]string, len(entry.IPs))
+	copy(ipsCopy, entry.IPs)
+	return ipsCopy, true
+}
+
 // consumeInjectedError pops the first error for a key, if any. Must be called under write lock.
 func (c *Client) consumeInjectedError(key InjectKey) error {
 	errs := c.injectedErrors[key]
@@ -92,6 +122,7 @@ func (c *Client) consumeInjectedError(key InjectKey) error {
 }
 
 func (c *Client) Get(_ context.Context, subscriptionID, resourceGroup, asgName, prefixSetName string) (*azure.AddressPrefixSet, error) {
+	atomic.AddInt64(&c.getCallCount, 1)
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
