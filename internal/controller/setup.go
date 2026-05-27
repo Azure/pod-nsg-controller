@@ -85,12 +85,13 @@ type perItemBucketRateLimiter struct {
 
 func (l *perItemBucketRateLimiter) When(item reconcile.Request) time.Duration {
 	l.mu.Lock()
-	defer l.mu.Unlock()
 	limiter, ok := l.limiters[item]
 	if !ok {
 		limiter = rate.NewLimiter(l.rate, l.burst)
 		l.limiters[item] = limiter
 	}
+	l.mu.Unlock()
+
 	return limiter.Reserve().Delay()
 }
 
