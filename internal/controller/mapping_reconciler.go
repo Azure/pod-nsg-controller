@@ -49,6 +49,7 @@ type MappingReconciler struct {
 	DefaultResourceGroup    string
 	ResyncInterval          time.Duration
 	MaxConcurrentReconciles int
+	MinReconcileInterval    time.Duration
 
 	// AzureReadSem is a shared semaphore that caps total in-flight Azure GET
 	// calls across all concurrent reconciles. Initialised from
@@ -64,6 +65,9 @@ type MappingReconciler struct {
 	PodChurnTracker      *metrics.PodChurnTracker
 	ConvergenceTracker   *metrics.ConvergenceTracker
 	InitialTracker       *metrics.InitialReconcileTracker
+
+	// lastReconcileState tracks per-key debounce state for Phase 3.
+	lastReconcileState sync.Map
 }
 
 const (
@@ -87,6 +91,7 @@ func (r *MappingReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 	var mapping v1alpha1.PodASGMapping
 	if err := r.Get(ctx, req.NamespacedName, &mapping); err != nil {
 		if apierrors.IsNotFound(err) {
+			r.clearDebounceState(req.NamespacedName)
 			r.markInitialTerminal(req.NamespacedName, true)
 			r.cleanupPerMappingMetricState(req.NamespacedName)
 			r.observeReconcile(req, ReconcileStageMappingNotFound, reconcileStart, 0)
@@ -128,15 +133,23 @@ func (r *MappingReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 				r.observeReconcile(req, metricStage, reconcileStart, 0)
 				return result, retErr
 			}
+			r.clearDebounceState(req.NamespacedName)
 			r.markInitialTerminal(req.NamespacedName, true)
 			r.cleanupPerMappingMetricState(req.NamespacedName)
 			r.observeReconcile(req, ReconcileStageDeleteComplete, reconcileStart, 0)
 			return ctrl.Result{}, nil
 		}
+		r.clearDebounceState(req.NamespacedName)
 		r.markInitialTerminal(req.NamespacedName, true)
 		r.cleanupPerMappingMetricState(req.NamespacedName)
 		r.observeReconcile(req, ReconcileStageDeleteComplete, reconcileStart, 0)
 		return ctrl.Result{}, nil
+	}
+
+	// Phase 3: Debounce check — skip expensive work if the same generation
+	// was successfully reconciled recently.
+	if remaining, shouldDebounce := r.debounceRemaining(req.NamespacedName, mapping.Generation, reconcileStart); shouldDebounce {
+		return ctrl.Result{RequeueAfter: remaining}, nil
 	}
 
 	// Ensure finalizer. If added, return immediately with Requeue: true.
@@ -443,6 +456,7 @@ func (r *MappingReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 		}
 	}
 
+	r.markReconcileSuccess(req.NamespacedName, mapping.Generation, time.Now())
 	r.observeReconcile(req, ReconcileStageSteadyStateSuccess, reconcileStart, len(actions))
 	return ctrl.Result{RequeueAfter: r.ResyncInterval}, nil
 }
@@ -1058,4 +1072,52 @@ func aggregateValidationErrors(issues []ValidationIssue) error {
 		parts = append(parts, fmt.Sprintf("mapping[%d].asg[%d] %q: %v", vi.MappingIndex, vi.ASGIndex, vi.ResourceID, vi.Err))
 	}
 	return fmt.Errorf("validation failed: %s", strings.Join(parts, "; "))
+}
+
+// ---------------------------------------------------------------------------
+// Phase 3: Debounce helpers
+// ---------------------------------------------------------------------------
+
+// debounceState holds per-key debounce tracking state.
+type debounceState struct {
+	lastSuccessfulAt time.Time
+	generation       int64
+}
+
+// debounceRemaining returns the remaining time until the next reconcile is allowed
+// for the given key and generation. Returns (0, false) if no debounce is needed.
+func (r *MappingReconciler) debounceRemaining(key types.NamespacedName, generation int64, now time.Time) (time.Duration, bool) {
+	if r.MinReconcileInterval <= 0 {
+		return 0, false
+	}
+	val, ok := r.lastReconcileState.Load(key)
+	if !ok {
+		return 0, false
+	}
+	state := val.(debounceState)
+	if state.generation != generation {
+		return 0, false
+	}
+	elapsed := now.Sub(state.lastSuccessfulAt)
+	remaining := r.MinReconcileInterval - elapsed
+	if remaining <= 0 {
+		return 0, false
+	}
+	return remaining, true
+}
+
+// markReconcileSuccess records a successful reconcile timestamp for debounce tracking.
+func (r *MappingReconciler) markReconcileSuccess(key types.NamespacedName, generation int64, now time.Time) {
+	if r.MinReconcileInterval <= 0 {
+		return
+	}
+	r.lastReconcileState.Store(key, debounceState{
+		lastSuccessfulAt: now,
+		generation:       generation,
+	})
+}
+
+// clearDebounceState removes debounce tracking for a key (on delete/not-found).
+func (r *MappingReconciler) clearDebounceState(key types.NamespacedName) {
+	r.lastReconcileState.Delete(key)
 }

@@ -6,6 +6,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 
 	v1alpha1 "github.com/Azure/pod-nsg-controller/api/v1alpha1"
 	"github.com/Azure/pod-nsg-controller/internal/model"
@@ -24,17 +25,19 @@ import (
 // PodToMappingEventHandler enqueues PodASGMapping reconcile requests
 // when pod events occur.
 type PodToMappingEventHandler struct {
-	Reader client.Reader
-	Logger logr.Logger
+	Reader               client.Reader
+	Logger               logr.Logger
+	MinReconcileInterval time.Duration
 
 	matcherCache *podMappingMatcherCache
 }
 
 // NewPodToMappingEventHandler creates a new event handler.
-func NewPodToMappingEventHandler(reader client.Reader, logger logr.Logger) handler.EventHandler {
+func NewPodToMappingEventHandler(reader client.Reader, logger logr.Logger, minReconcileInterval time.Duration) handler.EventHandler {
 	return &PodToMappingEventHandler{
-		Reader: reader,
-		Logger: logger,
+		Reader:               reader,
+		Logger:               logger,
+		MinReconcileInterval: minReconcileInterval,
 		matcherCache: &podMappingMatcherCache{
 			byNamespace: make(map[string]compiledPodMappingRequests),
 		},
@@ -54,7 +57,7 @@ func (h *PodToMappingEventHandler) Create(ctx context.Context, e event.TypedCrea
 		return
 	}
 	for _, req := range reqs {
-		q.Add(req)
+		h.enqueueRequest(q, req)
 	}
 }
 
@@ -79,7 +82,7 @@ func (h *PodToMappingEventHandler) Update(ctx context.Context, e event.TypedUpda
 
 	union := UnionRequests(oldReqs, newReqs)
 	for _, req := range union {
-		q.Add(req)
+		h.enqueueRequest(q, req)
 	}
 }
 
@@ -96,6 +99,16 @@ func (h *PodToMappingEventHandler) Delete(ctx context.Context, e event.TypedDele
 		return
 	}
 	for _, req := range reqs {
+		h.enqueueRequest(q, req)
+	}
+}
+
+// enqueueRequest adds a reconcile request to the queue, using AddAfter when
+// debounce is enabled to coalesce rapid pod events.
+func (h *PodToMappingEventHandler) enqueueRequest(q workqueue.TypedRateLimitingInterface[reconcile.Request], req reconcile.Request) {
+	if h.MinReconcileInterval > 0 {
+		q.AddAfter(req, h.MinReconcileInterval)
+	} else {
 		q.Add(req)
 	}
 }
