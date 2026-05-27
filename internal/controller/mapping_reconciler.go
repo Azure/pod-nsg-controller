@@ -146,12 +146,6 @@ func (r *MappingReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 		return ctrl.Result{}, nil
 	}
 
-	// Phase 3: Debounce check — skip expensive work if the same generation
-	// was successfully reconciled recently.
-	if remaining, shouldDebounce := r.debounceRemaining(req.NamespacedName, mapping.Generation, reconcileStart); shouldDebounce {
-		return ctrl.Result{RequeueAfter: remaining}, nil
-	}
-
 	// Ensure finalizer. If added, return immediately with Requeue: true.
 	added, err := r.ensureFinalizer(ctx, &mapping)
 	if err != nil {
@@ -162,6 +156,14 @@ func (r *MappingReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 	if added {
 		r.observeReconcile(req, ReconcileStageFinalizerAddEarlyReturn, reconcileStart, 0)
 		return ctrl.Result{Requeue: true}, nil
+	}
+
+	// Phase 3: Debounce check — skip expensive work if the same generation
+	// was successfully reconciled recently. Placed after ensureFinalizer so
+	// that cheap invariants (finalizer presence) are always enforced.
+	if remaining, shouldDebounce := r.debounceRemaining(req.NamespacedName, mapping.Generation, reconcileStart); shouldDebounce {
+		r.observeReconcile(req, ReconcileStageDebounced, reconcileStart, 0)
+		return ctrl.Result{RequeueAfter: remaining}, nil
 	}
 
 	// List pods in mapping namespace.
