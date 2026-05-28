@@ -208,8 +208,8 @@ func TestIntegration_FullPipeline_CreateThenUpdate(t *testing.T) {
 	if len(actions2) != 1 {
 		t.Fatalf("expected 1 update action, got %d", len(actions2))
 	}
-	if actions2[0].Kind != engine.UpdatePrefixSet {
-		t.Fatalf("expected UpdatePrefixSet, got %s", actions2[0].Kind)
+	if actions2[0].Kind != engine.UpdatePrefixSet && actions2[0].Kind != engine.PatchPrefixSet {
+		t.Fatalf("expected UpdatePrefixSet or PatchPrefixSet, got %s", actions2[0].Kind)
 	}
 
 	results2 := executor.Execute(ctx, actions2)
@@ -729,6 +729,20 @@ func (c *concurrencyTrackingClient) List(ctx context.Context, sub, rg, asg strin
 	return c.inner.List(ctx, sub, rg, asg)
 }
 
+func (c *concurrencyTrackingClient) GetWithETag(ctx context.Context, sub, rg, asg, ps string) (*azure.AddressPrefixSet, string, error) {
+	c.trackEnter()
+	defer c.trackExit()
+	time.Sleep(c.delay)
+	return c.inner.GetWithETag(ctx, sub, rg, asg, ps)
+}
+
+func (c *concurrencyTrackingClient) PutWithIfMatch(ctx context.Context, sub, rg, asg, ps string, ips []string, etag string) error {
+	c.trackEnter()
+	defer c.trackExit()
+	time.Sleep(c.delay)
+	return c.inner.PutWithIfMatch(ctx, sub, rg, asg, ps, ips, etag)
+}
+
 // singleClientFactory returns the same client for any subscription.
 type singleClientFactory struct {
 	client azure.AddressPrefixSetAPI
@@ -1032,5 +1046,165 @@ func TestIntegration_FullPipeline_MultipleMappingsSameASG(t *testing.T) {
 	wantIPs2 := []string{"10.0.1.1/32", "10.0.1.2/32"}
 	if fmt.Sprintf("%v", gotIPs2) != fmt.Sprintf("%v", wantIPs2) {
 		t.Errorf("ps2 IPs: got %v, want %v", gotIPs2, wantIPs2)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Phase 4: Small delta → PatchPrefixSet action via ComputeDiff
+// ---------------------------------------------------------------------------
+
+func TestIntegration_FullPipeline_SmallDelta_ProducesPatch(t *testing.T) {
+	log := zaptest.NewLogger(t)
+	ctx := context.Background()
+
+	clusterName := "cluster-patch"
+	sub := "sub-patch"
+	rg := "rg-patch"
+	asgName := "asg-patch"
+
+	fakeClient := fake.NewClient()
+	factory := fake.NewClientFactory()
+	factory.RegisterClient(sub, fakeClient)
+	executor := azure.NewExecutor(log, factory, 2)
+
+	mapping := makeMapping("default", "patch-map", []v1alpha1.Mapping{
+		{
+			PodSelector: v1alpha1.PodSelector{MatchLabels: map[string]string{"app": "web"}},
+			ApplicationSecurityGroups: []v1alpha1.ASGReference{
+				{ResourceID: asgResourceID(sub, rg, asgName)},
+			},
+		},
+	})
+
+	// Round 1: Create with 4 pods
+	pods1 := []corev1.Pod{
+		makePod("default", "w-1", map[string]string{"app": "web"}, "10.0.0.1"),
+		makePod("default", "w-2", map[string]string{"app": "web"}, "10.0.0.2"),
+		makePod("default", "w-3", map[string]string{"app": "web"}, "10.0.0.3"),
+		makePod("default", "w-4", map[string]string{"app": "web"}, "10.0.0.4"),
+	}
+
+	desired1 := engine.ComputeDesiredState(clusterName, []v1alpha1.PodASGMapping{mapping}, pods1)
+	actions1 := engine.ComputeDiff(desired1, nil)
+	results1 := executor.Execute(ctx, actions1)
+	if !results1[0].Success {
+		t.Fatalf("round 1 create failed: %v", results1[0].Err)
+	}
+
+	// Round 2: One pod removed, one pod added → small delta (should produce PatchPrefixSet)
+	pods2 := []corev1.Pod{
+		makePod("default", "w-1", map[string]string{"app": "web"}, "10.0.0.1"),
+		makePod("default", "w-2", map[string]string{"app": "web"}, "10.0.0.2"),
+		makePod("default", "w-3", map[string]string{"app": "web"}, "10.0.0.3"),
+		makePod("default", "w-5", map[string]string{"app": "web"}, "10.0.0.5"), // replaced w-4 with w-5
+	}
+
+	desired2 := engine.ComputeDesiredState(clusterName, []v1alpha1.PodASGMapping{mapping}, pods2)
+
+	// Build actual from what's in the fake
+	var target engine.ASGTarget
+	for t := range desired2 {
+		target = t
+	}
+	got1, _ := fakeClient.Get(ctx, sub, rg, asgName, target.PrefixSetName)
+	ips := make(map[string]struct{})
+	for _, ip := range got1.Properties.AddressPrefixes {
+		ips[ip] = struct{}{}
+	}
+	actualMap := map[engine.ASGTarget]engine.ActualPrefixSet{
+		target: {IPs: ips},
+	}
+
+	actions2 := engine.ComputeDiff(desired2, actualMap)
+	if len(actions2) != 1 {
+		t.Fatalf("expected 1 action, got %d", len(actions2))
+	}
+
+	// With Phase 4 incremental diff, a small delta should produce PatchPrefixSet.
+	// Delta is 2 ops (add 10.0.0.5/32, remove 10.0.0.4/32) vs denominator 8 (4+4).
+	// 100*2 = 200 <= 50*8 = 400 → PatchPrefixSet expected.
+	if actions2[0].Kind != engine.PatchPrefixSet {
+		t.Errorf("expected PatchPrefixSet for small delta, got %s", actions2[0].Kind)
+	}
+
+	// Execute the patch
+	results2 := executor.Execute(ctx, actions2)
+	if !results2[0].Success {
+		t.Fatalf("round 2 patch failed: %v", results2[0].Err)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Phase 4: Large delta → UpdatePrefixSet action (full replace)
+// ---------------------------------------------------------------------------
+
+func TestIntegration_FullPipeline_LargeDelta_ProducesUpdate(t *testing.T) {
+	log := zaptest.NewLogger(t)
+	ctx := context.Background()
+
+	clusterName := "cluster-update"
+	sub := "sub-update"
+	rg := "rg-update"
+	asgName := "asg-update"
+
+	fakeClient := fake.NewClient()
+	factory := fake.NewClientFactory()
+	factory.RegisterClient(sub, fakeClient)
+	executor := azure.NewExecutor(log, factory, 2)
+
+	mapping := makeMapping("default", "update-map", []v1alpha1.Mapping{
+		{
+			PodSelector: v1alpha1.PodSelector{MatchLabels: map[string]string{"app": "api"}},
+			ApplicationSecurityGroups: []v1alpha1.ASGReference{
+				{ResourceID: asgResourceID(sub, rg, asgName)},
+			},
+		},
+	})
+
+	// Round 1: Create with pods 1-3
+	pods1 := []corev1.Pod{
+		makePod("default", "a-1", map[string]string{"app": "api"}, "10.0.0.1"),
+		makePod("default", "a-2", map[string]string{"app": "api"}, "10.0.0.2"),
+		makePod("default", "a-3", map[string]string{"app": "api"}, "10.0.0.3"),
+	}
+
+	desired1 := engine.ComputeDesiredState(clusterName, []v1alpha1.PodASGMapping{mapping}, pods1)
+	actions1 := engine.ComputeDiff(desired1, nil)
+	results1 := executor.Execute(ctx, actions1)
+	if !results1[0].Success {
+		t.Fatalf("round 1 create failed: %v", results1[0].Err)
+	}
+
+	// Round 2: Complete replacement → large delta (should produce UpdatePrefixSet)
+	pods2 := []corev1.Pod{
+		makePod("default", "a-4", map[string]string{"app": "api"}, "10.0.1.1"),
+		makePod("default", "a-5", map[string]string{"app": "api"}, "10.0.1.2"),
+		makePod("default", "a-6", map[string]string{"app": "api"}, "10.0.1.3"),
+	}
+
+	desired2 := engine.ComputeDesiredState(clusterName, []v1alpha1.PodASGMapping{mapping}, pods2)
+
+	var target engine.ASGTarget
+	for t := range desired2 {
+		target = t
+	}
+	got1, _ := fakeClient.Get(ctx, sub, rg, asgName, target.PrefixSetName)
+	ips := make(map[string]struct{})
+	for _, ip := range got1.Properties.AddressPrefixes {
+		ips[ip] = struct{}{}
+	}
+	actualMap := map[engine.ASGTarget]engine.ActualPrefixSet{
+		target: {IPs: ips},
+	}
+
+	actions2 := engine.ComputeDiff(desired2, actualMap)
+	if len(actions2) != 1 {
+		t.Fatalf("expected 1 action, got %d", len(actions2))
+	}
+
+	// Delta is 6 ops (add 3 + remove 3) vs denominator 6 (3+3).
+	// 100*6 = 600 > 50*6 = 300 → UpdatePrefixSet expected.
+	if actions2[0].Kind != engine.UpdatePrefixSet {
+		t.Errorf("expected UpdatePrefixSet for large delta, got %s", actions2[0].Kind)
 	}
 }

@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"sort"
 	"sync"
 	"time"
 
@@ -33,7 +34,7 @@ type executionOutcome struct {
 // armOperation returns the ARM operation for a given action kind.
 func armOperation(kind engine.ActionKind) ARMOperation {
 	switch kind {
-	case engine.CreatePrefixSet, engine.UpdatePrefixSet:
+	case engine.CreatePrefixSet, engine.UpdatePrefixSet, engine.PatchPrefixSet:
 		return ARMOperationPutPrefixSet
 	case engine.DeletePrefixSet:
 		return ARMOperationDeletePrefixSet
@@ -116,11 +117,51 @@ func (e *Executor) executeAction(ctx context.Context, client AddressPrefixSetAPI
 	switch action.Kind {
 	case engine.CreatePrefixSet, engine.UpdatePrefixSet:
 		return client.Put(ctx, t.SubscriptionID, t.ResourceGroup, t.ASGName, t.PrefixSetName, action.DesiredIPs)
+	case engine.PatchPrefixSet:
+		return e.executePatchAction(ctx, client, action)
 	case engine.DeletePrefixSet:
 		return client.Delete(ctx, t.SubscriptionID, t.ResourceGroup, t.ASGName, t.PrefixSetName)
 	default:
 		return fmt.Errorf("unknown action kind: %s", action.Kind)
 	}
+}
+
+// executePatchAction performs a read-modify-write patch: GET current state,
+// apply add/remove delta, then PUT with If-Match for optimistic concurrency.
+func (e *Executor) executePatchAction(ctx context.Context, client AddressPrefixSetAPI, action engine.Action) error {
+	t := action.Target
+	current, etag, err := client.GetWithETag(ctx, t.SubscriptionID, t.ResourceGroup, t.ASGName, t.PrefixSetName)
+	if err != nil {
+		return err
+	}
+
+	var currentIPs []string
+	if current.Properties != nil {
+		currentIPs = current.Properties.AddressPrefixes
+	}
+
+	merged := applyPatchDelta(currentIPs, action.AddIPs, action.RemoveIPs)
+	return client.PutWithIfMatch(ctx, t.SubscriptionID, t.ResourceGroup, t.ASGName, t.PrefixSetName, merged, etag)
+}
+
+// applyPatchDelta applies add/remove operations to current IPs and returns a sorted deduplicated result.
+func applyPatchDelta(current []string, addIPs, removeIPs []string) []string {
+	set := make(map[string]struct{}, len(current)+len(addIPs))
+	for _, ip := range current {
+		set[ip] = struct{}{}
+	}
+	for _, ip := range removeIPs {
+		delete(set, ip)
+	}
+	for _, ip := range addIPs {
+		set[ip] = struct{}{}
+	}
+	result := make([]string, 0, len(set))
+	for ip := range set {
+		result = append(result, ip)
+	}
+	sort.Strings(result)
+	return result
 }
 
 func (e *Executor) executeWithETagRetry(ctx context.Context, client AddressPrefixSetAPI, action engine.Action) executionOutcome {
@@ -136,6 +177,23 @@ func (e *Executor) executeWithETagRetry(ctx context.Context, client AddressPrefi
 		if err == nil {
 			return executionOutcome{finalActionKind: finalKind}
 		}
+
+		// Patch-specific: if GetWithETag returned ErrNotFound, recompute to create/no-op.
+		if action.Kind == engine.PatchPrefixSet && IsNotFound(err) {
+			next, done, recomputeErr := recomputeSingleTargetActionViaDiff(action, nil, ErrNotFound)
+			if recomputeErr != nil {
+				return executionOutcome{err: pkgerrors.Wrap(recomputeErr, "patch recompute after not-found"), finalActionKind: finalKind}
+			}
+			if done {
+				return executionOutcome{noOp: true, finalActionKind: finalKind}
+			}
+			if next != nil {
+				action = *next
+				finalKind = action.Kind
+			}
+			continue
+		}
+
 		if !IsPreconditionFailed(err) {
 			return executionOutcome{err: err, finalActionKind: finalKind}
 		}

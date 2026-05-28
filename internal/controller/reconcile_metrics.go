@@ -77,7 +77,7 @@ func ClassifyCRDResolutionOperation(actions []engine.Action) string {
 		switch a.Kind {
 		case engine.CreatePrefixSet:
 			hasCreate = true
-		case engine.UpdatePrefixSet:
+		case engine.UpdatePrefixSet, engine.PatchPrefixSet:
 			hasUpdate = true
 		case engine.DeletePrefixSet:
 			hasDelete = true

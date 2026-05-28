@@ -10,7 +10,9 @@ import (
 // AddressPrefixSetAPI defines the interface for address prefix set operations.
 type AddressPrefixSetAPI interface {
 	Get(ctx context.Context, subscriptionID, resourceGroup, asgName, prefixSetName string) (*AddressPrefixSet, error)
+	GetWithETag(ctx context.Context, subscriptionID, resourceGroup, asgName, prefixSetName string) (*AddressPrefixSet, string, error)
 	Put(ctx context.Context, subscriptionID, resourceGroup, asgName, prefixSetName string, ips []string) error
+	PutWithIfMatch(ctx context.Context, subscriptionID, resourceGroup, asgName, prefixSetName string, ips []string, etag string) error
 	Delete(ctx context.Context, subscriptionID, resourceGroup, asgName, prefixSetName string) error
 	List(ctx context.Context, subscriptionID, resourceGroup, asgName string) ([]AddressPrefixSet, error)
 }

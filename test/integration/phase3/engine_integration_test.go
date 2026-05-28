@@ -169,8 +169,8 @@ func TestIntegration_FullPipeline_DesiredStateThenDiff(t *testing.T) {
 	actionsScaling := engine.ComputeDiff(newDesired, actual)
 
 	byKind := actionsByKind(actionsScaling)
-	if len(byKind[engine.UpdatePrefixSet]) != 2 {
-		t.Errorf("scaling: expected 2 updates (web gained, db lost), got %d", len(byKind[engine.UpdatePrefixSet]))
+	if len(byKind[engine.UpdatePrefixSet])+len(byKind[engine.PatchPrefixSet]) != 2 {
+		t.Errorf("scaling: expected 2 updates/patches (web gained, db lost), got update=%d patch=%d", len(byKind[engine.UpdatePrefixSet]), len(byKind[engine.PatchPrefixSet]))
 	}
 }
 
@@ -743,8 +743,8 @@ func TestIntegration_ReconciliationLifecycle(t *testing.T) {
 	pods = append(pods, makePod("default", "app-3", map[string]string{"app": "myapp", "version": "v1"}, "10.0.0.3"))
 	desired = engine.ComputeDesiredState(clusterName, baseMappings(map[string]string{"app": "myapp"}), pods)
 	actions = engine.ComputeDiff(desired, actual)
-	if len(actions) != 1 || actions[0].Kind != engine.UpdatePrefixSet {
-		t.Fatalf("step 3: expected 1 update (pod added), got %v", actions)
+	if len(actions) != 1 || (actions[0].Kind != engine.UpdatePrefixSet && actions[0].Kind != engine.PatchPrefixSet) {
+		t.Fatalf("step 3: expected 1 update/patch (pod added), got %v", actions)
 	}
 	if len(actions[0].DesiredIPs) != 3 {
 		t.Errorf("step 3: expected 3 desired IPs, got %d", len(actions[0].DesiredIPs))
@@ -954,8 +954,8 @@ func TestIntegration_MultipleRules_SharedASG_UnionThroughDiff(t *testing.T) {
 	if len(actions) != 1 {
 		t.Fatalf("expected 1 update action, got %d", len(actions))
 	}
-	if actions[0].Kind != engine.UpdatePrefixSet {
-		t.Errorf("expected UpdatePrefixSet, got %s", actions[0].Kind)
+	if actions[0].Kind != engine.UpdatePrefixSet && actions[0].Kind != engine.PatchPrefixSet {
+		t.Errorf("expected UpdatePrefixSet or PatchPrefixSet, got %s", actions[0].Kind)
 	}
 	if len(actions[0].DesiredIPs) != 3 {
 		t.Errorf("expected 3 desired IPs in update, got %d", len(actions[0].DesiredIPs))

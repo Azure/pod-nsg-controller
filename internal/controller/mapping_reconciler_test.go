@@ -2053,6 +2053,14 @@ func (d *delayingFakeClient) List(_ context.Context, _, _, _ string) ([]azure.Ad
 	return nil, nil
 }
 
+func (d *delayingFakeClient) GetWithETag(_ context.Context, _, _, _, _ string) (*azure.AddressPrefixSet, string, error) {
+	return nil, "", nil
+}
+
+func (d *delayingFakeClient) PutWithIfMatch(_ context.Context, _, _, _, _ string, _ []string, _ string) error {
+	return nil
+}
+
 // delayingFakeFactory returns the same delayingFakeClient for any subscription.
 type delayingFakeFactory struct {
 	client *delayingFakeClient

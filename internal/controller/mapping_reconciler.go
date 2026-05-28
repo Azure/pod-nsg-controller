@@ -636,7 +636,7 @@ func (r *MappingReconciler) detectAndRecordDrift(desired map[engine.ASGTarget]en
 	// Build set of targets with correcting actions (Update or Delete).
 	correctedTargets := make(map[engine.ASGTarget]struct{}, len(actions))
 	for _, a := range actions {
-		if a.Kind == engine.UpdatePrefixSet || a.Kind == engine.DeletePrefixSet {
+		if a.Kind == engine.UpdatePrefixSet || a.Kind == engine.PatchPrefixSet || a.Kind == engine.DeletePrefixSet {
 			correctedTargets[a.Target] = struct{}{}
 		}
 	}

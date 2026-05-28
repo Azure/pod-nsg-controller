@@ -376,6 +376,80 @@ func (c *AddressPrefixSetClient) Get(ctx context.Context, subscriptionID, resour
 	return &result, nil
 }
 
+// GetWithETag returns the specified address prefix set and its ETag.
+func (c *AddressPrefixSetClient) GetWithETag(ctx context.Context, subscriptionID, resourceGroup, asgName, prefixSetName string) (*AddressPrefixSet, string, error) {
+	result, err := c.Get(ctx, subscriptionID, resourceGroup, asgName, prefixSetName)
+	if err != nil {
+		return nil, "", err
+	}
+	etag := ""
+	if result.Etag != nil {
+		etag = *result.Etag
+	}
+	return result, etag, nil
+}
+
+// PutWithIfMatch performs a PUT with the supplied ETag as If-Match header (no pre-GET).
+func (c *AddressPrefixSetClient) PutWithIfMatch(ctx context.Context, subscriptionID, resourceGroup, asgName, prefixSetName string, ips []string, etag string) error {
+	reqURL := c.resourceURL(subscriptionID, resourceGroup, asgName, prefixSetName)
+
+	c.log.Debug("PUT (If-Match) AddressPrefixSet",
+		zap.String("subscriptionID", subscriptionID),
+		zap.String("resourceGroup", resourceGroup),
+		zap.String("asgName", asgName),
+		zap.String("prefixSetName", prefixSetName),
+		zap.Int("ipCount", len(ips)),
+		zap.String("etag", etag),
+	)
+
+	if ips == nil {
+		ips = []string{}
+	}
+	payload := AddressPrefixSet{
+		Properties: &AddressPrefixSetProperties{
+			AddressPrefixes: ips,
+		},
+	}
+	bodyBytes, err := json.Marshal(payload)
+	if err != nil {
+		return errors.Wrap(err, "marshaling PUT body")
+	}
+
+	headers := map[string]string{
+		"If-Match": etag,
+	}
+
+	retryCtx := RetryContext{
+		Operation:      ARMOperationPutPrefixSet,
+		Method:         http.MethodPut,
+		URL:            reqURL,
+		SubscriptionID: subscriptionID,
+		ResourceGroup:  resourceGroup,
+		ASGName:        asgName,
+		PrefixSetName:  prefixSetName,
+	}
+
+	resp, err := c.doRequest(ctx, retryCtx, http.MethodPut, reqURL, bodyBytes, headers)
+	if err != nil {
+		return errors.Wrap(err, "PUT (If-Match) AddressPrefixSet")
+	}
+	defer resp.Body.Close()
+
+	// Drain response body
+	io.ReadAll(resp.Body)
+
+	// Handle LRO for 201/202
+	if resp.StatusCode == http.StatusCreated || resp.StatusCode == http.StatusAccepted {
+		if loc := resp.Header.Get("Location"); loc != "" {
+			if err := c.pollLRO(ctx, loc, subscriptionID); err != nil {
+				return errors.Wrap(err, "polling PUT LRO")
+			}
+		}
+	}
+
+	return nil
+}
+
 // Put creates or updates an address prefix set using ETag-based conditional writes.
 func (c *AddressPrefixSetClient) Put(ctx context.Context, subscriptionID, resourceGroup, asgName, prefixSetName string, ips []string) error {
 	reqURL := c.resourceURL(subscriptionID, resourceGroup, asgName, prefixSetName)

@@ -298,3 +298,113 @@ func TestPhase4_FakeClient_ETagVersionAdvancesOnlyOnSuccessfulPut(t *testing.T) 
 		t.Error("ETag should advance after successful Put, but it stayed the same")
 	}
 }
+
+// --- Phase 4: GetWithETag and PutWithIfMatch tests ---
+
+func TestPhase4_FakeClient_GetWithETag_ReturnsResourceAndETag(t *testing.T) {
+	client := NewClient()
+	ctx := context.Background()
+
+	// Put a resource
+	err := client.Put(ctx, "sub1", "rg1", "asg1", "ps1", []string{"10.0.0.1/32"})
+	if err != nil {
+		t.Fatalf("Put failed: %v", err)
+	}
+
+	// GetWithETag should return the resource and its ETag
+	result, etag, err := client.GetWithETag(ctx, "sub1", "rg1", "asg1", "ps1")
+	if err != nil {
+		t.Fatalf("GetWithETag failed: %v", err)
+	}
+	if result == nil {
+		t.Fatal("GetWithETag returned nil result")
+	}
+	if etag == "" {
+		t.Error("GetWithETag returned empty ETag")
+	}
+	if result.Properties == nil || len(result.Properties.AddressPrefixes) != 1 {
+		t.Errorf("expected 1 prefix, got %v", result)
+	}
+}
+
+func TestPhase4_FakeClient_GetWithETag_NotFound(t *testing.T) {
+	client := NewClient()
+	ctx := context.Background()
+
+	_, _, err := client.GetWithETag(ctx, "sub1", "rg1", "asg1", "nonexistent")
+	if !errors.Is(err, azure.ErrNotFound) {
+		t.Errorf("expected ErrNotFound, got: %v", err)
+	}
+}
+
+func TestPhase4_FakeClient_PutWithIfMatch_Success(t *testing.T) {
+	client := NewClient()
+	ctx := context.Background()
+
+	// Create a resource
+	err := client.Put(ctx, "sub1", "rg1", "asg1", "ps1", []string{"10.0.0.1/32"})
+	if err != nil {
+		t.Fatalf("Put failed: %v", err)
+	}
+
+	// Get its ETag
+	_, etag, err := client.GetWithETag(ctx, "sub1", "rg1", "asg1", "ps1")
+	if err != nil {
+		t.Fatalf("GetWithETag failed: %v", err)
+	}
+
+	// PutWithIfMatch with correct ETag should succeed
+	err = client.PutWithIfMatch(ctx, "sub1", "rg1", "asg1", "ps1", []string{"10.0.0.2/32"}, etag)
+	if err != nil {
+		t.Fatalf("PutWithIfMatch should succeed with correct ETag, got: %v", err)
+	}
+
+	// Verify state was updated
+	got, err := client.Get(ctx, "sub1", "rg1", "asg1", "ps1")
+	if err != nil {
+		t.Fatalf("Get after PutWithIfMatch: %v", err)
+	}
+	if got.Properties.AddressPrefixes[0] != "10.0.0.2/32" {
+		t.Errorf("expected IP updated to 10.0.0.2/32, got %v", got.Properties.AddressPrefixes)
+	}
+}
+
+func TestPhase4_FakeClient_PutWithIfMatch_StaleETagReturns412(t *testing.T) {
+	client := NewClient()
+	ctx := context.Background()
+
+	// Create a resource
+	err := client.Put(ctx, "sub1", "rg1", "asg1", "ps1", []string{"10.0.0.1/32"})
+	if err != nil {
+		t.Fatalf("Put failed: %v", err)
+	}
+
+	// PutWithIfMatch with stale ETag should return 412
+	err = client.PutWithIfMatch(ctx, "sub1", "rg1", "asg1", "ps1", []string{"10.0.0.2/32"}, `"stale-etag"`)
+	if err == nil {
+		t.Fatal("expected 412 error with stale ETag, got nil")
+	}
+	if !azure.IsPreconditionFailed(err) {
+		t.Errorf("expected PreconditionFailed error, got: %v", err)
+	}
+
+	// Verify state was NOT updated
+	got, err := client.Get(ctx, "sub1", "rg1", "asg1", "ps1")
+	if err != nil {
+		t.Fatalf("Get after failed PutWithIfMatch: %v", err)
+	}
+	if got.Properties.AddressPrefixes[0] != "10.0.0.1/32" {
+		t.Errorf("state should not change after stale ETag PUT, got %v", got.Properties.AddressPrefixes)
+	}
+}
+
+func TestPhase4_FakeClient_PutWithIfMatch_NotFoundReturnsError(t *testing.T) {
+	client := NewClient()
+	ctx := context.Background()
+
+	// PutWithIfMatch on nonexistent resource should return error
+	err := client.PutWithIfMatch(ctx, "sub1", "rg1", "asg1", "nonexistent", []string{"10.0.0.1/32"}, `"any-etag"`)
+	if err == nil {
+		t.Fatal("expected error for PutWithIfMatch on nonexistent resource, got nil")
+	}
+}
