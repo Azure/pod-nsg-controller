@@ -150,11 +150,11 @@ func main() {
 		PrefixSetFactory:        prefixSetFactory,
 		Executor:                executor,
 		StatusUpdater:           statusUpdater,
-		MetricsRecorder:      rec,
-		PodChurnTracker:      podChurnTracker,
-		ConvergenceTracker:   convergenceTracker,
-		InitialTracker:       initialTracker,
-		PatchThresholdPercent: cfg.PatchThresholdPercent,
+		MetricsRecorder:         rec,
+		PodChurnTracker:         podChurnTracker,
+		ConvergenceTracker:      convergenceTracker,
+		InitialTracker:          initialTracker,
+		PatchThresholdPercent:   cfg.PatchThresholdPercent,
 	}
 
 	if err := reconciler.SetupWithManager(mgr); err != nil {
