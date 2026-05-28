@@ -311,3 +311,81 @@ func TestLoad_MaxConcurrentAzureReads(t *testing.T) {
 		})
 	}
 }
+
+// ---------------------------------------------------------------------------
+// TestLoad_PatchThresholdPercent: table-driven coverage for POD_NSG_PATCH_THRESHOLD_PERCENT
+// Phase 4: Incremental Diff and Patch
+// ---------------------------------------------------------------------------
+func TestLoad_PatchThresholdPercent(t *testing.T) {
+	tests := []struct {
+		name      string
+		envValue  string
+		wantValue int
+		wantErr   bool
+	}{
+		{
+			name:      "explicit value 75",
+			envValue:  "75",
+			wantValue: 75,
+		},
+		{
+			name:      "unset defaults to 50",
+			envValue:  "",
+			wantValue: 50,
+		},
+		{
+			name:      "minimum valid value 1",
+			envValue:  "1",
+			wantValue: 1,
+		},
+		{
+			name:      "maximum valid value 100",
+			envValue:  "100",
+			wantValue: 100,
+		},
+		{
+			name:    "zero is invalid",
+			envValue: "0",
+			wantErr: true,
+		},
+		{
+			name:    "over 100 is invalid",
+			envValue: "101",
+			wantErr: true,
+		},
+		{
+			name:    "negative is invalid",
+			envValue: "-1",
+			wantErr: true,
+		},
+		{
+			name:    "non-integer is invalid",
+			envValue: "abc",
+			wantErr: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Setenv("AZURE_SUBSCRIPTION_ID", "")
+			t.Setenv("AZURE_RESOURCE_GROUP", "")
+			t.Setenv("CLUSTER_NAME", "cluster-a")
+			t.Setenv("RESYNC_INTERVAL_SECONDS", "")
+			t.Setenv("POD_NSG_PATCH_THRESHOLD_PERCENT", tt.envValue)
+
+			cfg, err := Load()
+			if tt.wantErr {
+				if err == nil {
+					t.Fatalf("expected error for POD_NSG_PATCH_THRESHOLD_PERCENT=%q, got nil", tt.envValue)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if cfg.PatchThresholdPercent != tt.wantValue {
+				t.Errorf("PatchThresholdPercent = %d, want %d", cfg.PatchThresholdPercent, tt.wantValue)
+			}
+		})
+	}
+}

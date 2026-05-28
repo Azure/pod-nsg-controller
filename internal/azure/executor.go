@@ -45,11 +45,12 @@ func armOperation(kind engine.ActionKind) ARMOperation {
 
 // Executor runs engine actions against Azure with bounded concurrency and ETag retry.
 type Executor struct {
-	log           *zap.Logger
-	factory       AddressPrefixSetClientFactory
-	maxParallel   int
-	maxRetries    int
-	retryObserver armRetryObserver
+	log                   *zap.Logger
+	factory               AddressPrefixSetClientFactory
+	maxParallel           int
+	maxRetries            int
+	retryObserver         armRetryObserver
+	patchThresholdPercent int
 }
 
 // NewExecutor creates an Executor with the given concurrency bound.
@@ -58,10 +59,11 @@ func NewExecutor(log *zap.Logger, factory AddressPrefixSetClientFactory, maxPara
 		maxParallel = 1
 	}
 	e := &Executor{
-		log:         log,
-		factory:     factory,
-		maxParallel: maxParallel,
-		maxRetries:  3,
+		log:                   log,
+		factory:               factory,
+		maxParallel:           maxParallel,
+		maxRetries:            3,
+		patchThresholdPercent: engine.DefaultPatchThresholdPercent,
 	}
 	for _, opt := range opts {
 		opt(e)
@@ -180,7 +182,7 @@ func (e *Executor) executeWithETagRetry(ctx context.Context, client AddressPrefi
 
 		// Patch-specific: if GetWithETag returned ErrNotFound, recompute to create/no-op.
 		if action.Kind == engine.PatchPrefixSet && IsNotFound(err) {
-			next, done, recomputeErr := recomputeSingleTargetActionViaDiff(action, nil, ErrNotFound)
+			next, done, recomputeErr := e.recomputeSingleTargetActionViaDiff(action, nil, ErrNotFound)
 			if recomputeErr != nil {
 				return executionOutcome{err: pkgerrors.Wrap(recomputeErr, "patch recompute after not-found"), finalActionKind: finalKind}
 			}
@@ -235,7 +237,7 @@ func (e *Executor) executeWithETagRetry(ctx context.Context, client AddressPrefi
 		// with a newer ETag while applying DesiredIPs derived from this slightly
 		// older snapshot. A later reconcile will converge any drift.
 		current, getErr := client.Get(ctx, t.SubscriptionID, t.ResourceGroup, t.ASGName, t.PrefixSetName)
-		next, done, recomputeErr := recomputeSingleTargetActionViaDiff(action, current, getErr)
+		next, done, recomputeErr := e.recomputeSingleTargetActionViaDiff(action, current, getErr)
 		if recomputeErr != nil {
 			return executionOutcome{err: pkgerrors.Wrap(recomputeErr, "recompute after 412"), finalActionKind: finalKind}
 		}
@@ -253,14 +255,14 @@ func (e *Executor) executeWithETagRetry(ctx context.Context, client AddressPrefi
 
 // recomputeSingleTargetActionViaDiff re-GETs the resource and recomputes the diff
 // using engine.ComputeDiff to determine the next action.
-func recomputeSingleTargetActionViaDiff(action engine.Action, current *AddressPrefixSet, getErr error) (next *engine.Action, done bool, err error) {
+func (e *Executor) recomputeSingleTargetActionViaDiff(action engine.Action, current *AddressPrefixSet, getErr error) (next *engine.Action, done bool, err error) {
 	desired := buildSingleTargetDesired(action)
 	actual, err := buildSingleTargetActual(action, current, getErr)
 	if err != nil {
 		return nil, false, pkgerrors.Wrap(err, "building actual state")
 	}
 
-	actions := engine.ComputeDiff(desired, actual)
+	actions := engine.ComputeDiff(desired, actual, e.patchThresholdPercent)
 
 	if len(actions) == 0 {
 		return nil, true, nil

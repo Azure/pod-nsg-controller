@@ -61,7 +61,7 @@ func TestPhase3_T38_DiffUpdateWhenIPsDiffer(t *testing.T) {
 		target: {IPs: ipSet("10.0.0.1")},
 	}
 
-	actions := ComputeDiff(desired, actual)
+	actions := ComputeDiff(desired, actual, DefaultPatchThresholdPercent)
 
 	if len(actions) != 1 {
 		t.Fatalf("T3.8: got %d actions, want 1", len(actions))
@@ -95,7 +95,7 @@ func TestPhase3_T39_DiffNoActionsWhenIPsEqual(t *testing.T) {
 		target: {IPs: ipSet("10.0.0.1")},
 	}
 
-	actions := ComputeDiff(desired, actual)
+	actions := ComputeDiff(desired, actual, DefaultPatchThresholdPercent)
 
 	// Must return a non-nil empty slice, not nil.
 	if actions == nil {
@@ -115,7 +115,7 @@ func TestPhase3_T310_DiffDeleteWhenOnlyActualExists(t *testing.T) {
 		target: {IPs: ipSet("10.0.0.1")},
 	}
 
-	actions := ComputeDiff(desired, actual)
+	actions := ComputeDiff(desired, actual, DefaultPatchThresholdPercent)
 
 	if len(actions) != 1 {
 		t.Fatalf("T3.10: got %d actions, want 1", len(actions))
@@ -137,7 +137,7 @@ func TestPhase3_T311_DiffCreateWhenOnlyDesiredExists(t *testing.T) {
 	}
 	actual := map[ASGTarget]ActualPrefixSet{}
 
-	actions := ComputeDiff(desired, actual)
+	actions := ComputeDiff(desired, actual, DefaultPatchThresholdPercent)
 
 	if len(actions) != 1 {
 		t.Fatalf("T3.11: got %d actions, want 1", len(actions))
@@ -165,7 +165,7 @@ func TestPhase3_T312_DiffMixedUpdateCreateDelete(t *testing.T) {
 		targetC: {IPs: ipSet("10.0.0.4")},             // no desired => Delete
 	}
 
-	actions := ComputeDiff(desired, actual)
+	actions := ComputeDiff(desired, actual, DefaultPatchThresholdPercent)
 
 	if len(actions) != 3 {
 		t.Fatalf("T3.12: got %d actions, want 3 (update + create + delete)", len(actions))
@@ -202,7 +202,7 @@ func TestPhase3_Diff_DeterministicOrdering(t *testing.T) {
 	// Run multiple times to verify ordering is deterministic.
 	var firstRun []string
 	for i := 0; i < 5; i++ {
-		actions := ComputeDiff(desired, actual)
+		actions := ComputeDiff(desired, actual, DefaultPatchThresholdPercent)
 		if len(actions) != 3 {
 			t.Fatalf("DeterministicOrdering: run %d got %d actions, want 3", i, len(actions))
 		}
@@ -239,7 +239,7 @@ func TestPhase3_Diff_DeterministicOrdering(t *testing.T) {
 // --- Extra: Nil inputs handled as empty ---
 func TestPhase3_Diff_NilInputsHandledAsEmpty(t *testing.T) {
 	t.Run("both nil", func(t *testing.T) {
-		actions := ComputeDiff(nil, nil)
+		actions := ComputeDiff(nil, nil, DefaultPatchThresholdPercent)
 		// Must return a non-nil empty slice, not nil.
 		if actions == nil {
 			t.Fatal("both nil: ComputeDiff returned nil, want non-nil empty slice")
@@ -254,7 +254,7 @@ func TestPhase3_Diff_NilInputsHandledAsEmpty(t *testing.T) {
 		actual := map[ASGTarget]ActualPrefixSet{
 			target: {IPs: ipSet("10.0.0.1")},
 		}
-		actions := ComputeDiff(nil, actual)
+		actions := ComputeDiff(nil, actual, DefaultPatchThresholdPercent)
 		if len(actions) != 1 {
 			t.Fatalf("desired nil: got %d actions, want 1 (delete)", len(actions))
 		}
@@ -268,7 +268,7 @@ func TestPhase3_Diff_NilInputsHandledAsEmpty(t *testing.T) {
 		desired := map[ASGTarget]DesiredPrefixSet{
 			target: {IPs: ipSet("10.0.0.1")},
 		}
-		actions := ComputeDiff(desired, nil)
+		actions := ComputeDiff(desired, nil, DefaultPatchThresholdPercent)
 		if len(actions) != 1 {
 			t.Fatalf("actual nil: got %d actions, want 1 (create)", len(actions))
 		}
@@ -294,7 +294,7 @@ func TestPhase3_Diff_CaseInsensitiveResourceGroupMatch(t *testing.T) {
 		target2: {IPs: ipSet("10.0.0.1")},
 	}
 
-	actions := ComputeDiff(desired, actual)
+	actions := ComputeDiff(desired, actual, DefaultPatchThresholdPercent)
 
 	// Case-insensitive identity matching means these two targets resolve to the same key.
 	// IPs are identical, so no actions should be produced.
@@ -319,7 +319,7 @@ func TestPhase3_Diff_EmptyDesiredIPSet(t *testing.T) {
 		target: {IPs: ipSet("10.0.0.1")}, // has an IP
 	}
 
-	actions := ComputeDiff(desired, actual)
+	actions := ComputeDiff(desired, actual, DefaultPatchThresholdPercent)
 
 	// Should produce Update action to empty the prefix set
 	if len(actions) != 1 {
@@ -344,7 +344,7 @@ func TestPhase3_Diff_NilIPMap(t *testing.T) {
 		target: {IPs: ipSet("10.0.0.1")},
 	}
 
-	actions := ComputeDiff(desired, actual)
+	actions := ComputeDiff(desired, actual, DefaultPatchThresholdPercent)
 
 	// nil map should be treated as empty
 	if len(actions) != 1 {
@@ -387,7 +387,7 @@ func TestPhase3_Diff_CaseInsensitiveTargetIdentity(t *testing.T) {
 				tc.actual: {IPs: ipSet("10.0.0.1")},
 			}
 
-			actions := ComputeDiff(desired, actual)
+			actions := ComputeDiff(desired, actual, DefaultPatchThresholdPercent)
 			if len(actions) != 0 {
 				t.Errorf("got %d actions, want 0 for case-insensitive target identity", len(actions))
 			}
@@ -421,7 +421,7 @@ func TestPhase3_Diff_ClusterNameCaseOnlyDifferenceConverges(t *testing.T) {
 		t.Fatalf("upperDesired has %d targets, want 1", len(upperDesired))
 	}
 
-	actions := ComputeDiff(lowerDesired, desiredToActual(upperDesired))
+	actions := ComputeDiff(lowerDesired, desiredToActual(upperDesired), DefaultPatchThresholdPercent)
 	if len(actions) != 0 {
 		t.Errorf("got %d actions, want 0 when cluster names differ only by case", len(actions))
 	}
@@ -444,7 +444,7 @@ func TestPhase3_Diff_TargetIdentityFallsBackWithoutFullResourceID(t *testing.T) 
 			actualTarget: {IPs: ipSet("10.0.0.1")},
 		}
 
-		actions := ComputeDiff(desired, actual)
+		actions := ComputeDiff(desired, actual, DefaultPatchThresholdPercent)
 		if len(actions) != 0 {
 			t.Errorf("actual target without full resource id: got %d actions, want 0", len(actions))
 		}
@@ -464,7 +464,7 @@ func TestPhase3_Diff_TargetIdentityFallsBackWithoutFullResourceID(t *testing.T) 
 			actualTarget: {IPs: ipSet("10.0.0.1")},
 		}
 
-		actions := ComputeDiff(desired, actual)
+		actions := ComputeDiff(desired, actual, DefaultPatchThresholdPercent)
 		if len(actions) != 1 {
 			t.Fatalf("desired target without full resource id: got %d actions, want 1", len(actions))
 		}
@@ -498,7 +498,7 @@ func TestComputeDiff_IncrementalPatch(t *testing.T) {
 		target: {IPs: ipSet("10.0.0.1", "10.0.0.2", "10.0.0.5")},
 	}
 
-	actions := ComputeDiff(desired, actual)
+	actions := ComputeDiff(desired, actual, DefaultPatchThresholdPercent)
 
 	if len(actions) != 1 {
 		t.Fatalf("TestComputeDiff_IncrementalPatch: got %d actions, want 1", len(actions))
@@ -555,7 +555,7 @@ func TestComputeDiff_FallbackToFullReplace(t *testing.T) {
 		target: {IPs: ipSet("10.0.2.1", "10.0.2.2", "10.0.2.3")},
 	}
 
-	actions := ComputeDiff(desired, actual)
+	actions := ComputeDiff(desired, actual, DefaultPatchThresholdPercent)
 
 	if len(actions) != 1 {
 		t.Fatalf("TestComputeDiff_FallbackToFullReplace: got %d actions, want 1", len(actions))
@@ -588,16 +588,16 @@ func TestComputeDiff_NoDiffNoPatch(t *testing.T) {
 		target: {IPs: ipSet("10.0.0.1", "10.0.0.2", "10.0.0.3")},
 	}
 
-	actions := ComputeDiff(desired, actual)
+	actions := ComputeDiff(desired, actual, DefaultPatchThresholdPercent)
 
 	if len(actions) != 0 {
 		t.Errorf("TestComputeDiff_NoDiffNoPatch: got %d actions, want 0 (no diff should produce no action)", len(actions))
 	}
 }
 
-// TestComputeDiff_PatchThreshold_ConfigurableViaEnv verifies that the threshold
-// can be configured via environment variable POD_NSG_PATCH_THRESHOLD_PERCENT.
-func TestComputeDiff_PatchThreshold_ConfigurableViaEnv(t *testing.T) {
+// TestComputeDiff_PatchThreshold_Configurable verifies that the threshold parameter
+// directly controls patch vs full-update behavior.
+func TestComputeDiff_PatchThreshold_Configurable(t *testing.T) {
 	target := makeTarget("sub-1", "rg-1", "asg-a", "cluster-default-mapping")
 
 	// Delta: add 2, remove 1 = 3 ops. Denominator: desired 4 + actual 3 = 7.
@@ -611,8 +611,7 @@ func TestComputeDiff_PatchThreshold_ConfigurableViaEnv(t *testing.T) {
 	}
 
 	t.Run("default threshold produces patch", func(t *testing.T) {
-		t.Setenv("POD_NSG_PATCH_THRESHOLD_PERCENT", "")
-		actions := ComputeDiff(desired, actual)
+		actions := ComputeDiff(desired, actual, DefaultPatchThresholdPercent)
 		if len(actions) != 1 {
 			t.Fatalf("got %d actions, want 1", len(actions))
 		}
@@ -622,8 +621,7 @@ func TestComputeDiff_PatchThreshold_ConfigurableViaEnv(t *testing.T) {
 	})
 
 	t.Run("low threshold forces full update", func(t *testing.T) {
-		t.Setenv("POD_NSG_PATCH_THRESHOLD_PERCENT", "40")
-		actions := ComputeDiff(desired, actual)
+		actions := ComputeDiff(desired, actual, 40)
 		if len(actions) != 1 {
 			t.Fatalf("got %d actions, want 1", len(actions))
 		}
@@ -633,15 +631,14 @@ func TestComputeDiff_PatchThreshold_ConfigurableViaEnv(t *testing.T) {
 		}
 	})
 
-	t.Run("invalid env falls back to default 50", func(t *testing.T) {
-		t.Setenv("POD_NSG_PATCH_THRESHOLD_PERCENT", "invalid")
-		actions := ComputeDiff(desired, actual)
+	t.Run("invalid threshold falls back to default 50", func(t *testing.T) {
+		actions := ComputeDiff(desired, actual, 0)
 		if len(actions) != 1 {
 			t.Fatalf("got %d actions, want 1", len(actions))
 		}
-		// Same as default, should produce patch
+		// 0 is outside valid range, clamped to default 50 → patch
 		if actions[0].Kind != PatchPrefixSet {
-			t.Errorf("invalid env: action kind = %q, want %q (should use default threshold)",
+			t.Errorf("invalid threshold (0): action kind = %q, want %q (should use default threshold)",
 				actions[0].Kind, PatchPrefixSet)
 		}
 	})

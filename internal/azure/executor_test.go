@@ -1045,6 +1045,7 @@ func (c *noOpAfterConflictClient) PutWithIfMatch(_ context.Context, _, _, _, _ s
 
 // --- T4.Recompute: recomputeSingleTargetActionViaDiff uses engine.ComputeDiff ---
 func TestPhase4_Executor_RecomputeSingleTargetActionViaDiff_UsesComputeDiff(t *testing.T) {
+	helperExec := &Executor{patchThresholdPercent: engine.DefaultPatchThresholdPercent}
 	// Test that recompute delegates to engine.ComputeDiff for proper diff-based retry
 	action := engine.Action{
 		Kind: engine.UpdatePrefixSet,
@@ -1068,7 +1069,7 @@ func TestPhase4_Executor_RecomputeSingleTargetActionViaDiff_UsesComputeDiff(t *t
 		},
 	}
 
-	next, done, err := recomputeSingleTargetActionViaDiff(action, current, nil)
+	next, done, err := helperExec.recomputeSingleTargetActionViaDiff(action, current, nil)
 	if err != nil {
 		t.Fatalf("recompute returned unexpected error: %v", err)
 	}
@@ -1095,7 +1096,7 @@ func TestPhase4_Executor_RecomputeSingleTargetActionViaDiff_UsesComputeDiff(t *t
 			AddressPrefixes: []string{"10.0.0.1/32", "10.0.0.2/32"},
 		},
 	}
-	_, doneMatch, errMatch := recomputeSingleTargetActionViaDiff(action, currentMatching, nil)
+	_, doneMatch, errMatch := helperExec.recomputeSingleTargetActionViaDiff(action, currentMatching, nil)
 	if errMatch != nil {
 		t.Fatalf("recompute on matching state returned error: %v", errMatch)
 	}
@@ -1104,7 +1105,7 @@ func TestPhase4_Executor_RecomputeSingleTargetActionViaDiff_UsesComputeDiff(t *t
 	}
 
 	// Test: when Get returns ErrNotFound, recompute should return CreatePrefixSet
-	nextCreate, doneCreate, errCreate := recomputeSingleTargetActionViaDiff(action, nil, ErrNotFound)
+	nextCreate, doneCreate, errCreate := helperExec.recomputeSingleTargetActionViaDiff(action, nil, ErrNotFound)
 	if errCreate != nil {
 		t.Fatalf("recompute with ErrNotFound returned error: %v", errCreate)
 	}
@@ -1123,6 +1124,7 @@ func TestPhase4_Executor_RecomputeSingleTargetActionViaDiff_UsesComputeDiff(t *t
 // recomputed after a 412 retry still produces a DeletePrefixSet action
 // (not an UpdatePrefixSet) when the resource still exists.
 func TestDeleteActionRecomputePreservesKind(t *testing.T) {
+	helperExec := &Executor{patchThresholdPercent: engine.DefaultPatchThresholdPercent}
 	action := engine.Action{
 		Kind: engine.DeletePrefixSet,
 		Target: engine.ASGTarget{
@@ -1141,7 +1143,7 @@ func TestDeleteActionRecomputePreservesKind(t *testing.T) {
 		},
 	}
 
-	next, done, err := recomputeSingleTargetActionViaDiff(action, current, nil)
+	next, done, err := helperExec.recomputeSingleTargetActionViaDiff(action, current, nil)
 	if err != nil {
 		t.Fatalf("recompute failed: %v", err)
 	}
@@ -1200,6 +1202,7 @@ func TestPhase4_Executor_Final412LogDoesNotClaimRetry(t *testing.T) {
 }
 
 func TestPhase4_BuildSingleTargetActual_NilCurrentTreatsResourceAsAbsent(t *testing.T) {
+	helperExec := &Executor{patchThresholdPercent: engine.DefaultPatchThresholdPercent}
 	action := engine.Action{
 		Kind: engine.UpdatePrefixSet,
 		Target: engine.ASGTarget{
@@ -1219,7 +1222,7 @@ func TestPhase4_BuildSingleTargetActual_NilCurrentTreatsResourceAsAbsent(t *test
 		t.Fatalf("expected nil current without error to be treated as absent, got %#v", actual)
 	}
 
-	next, done, err := recomputeSingleTargetActionViaDiff(action, nil, nil)
+	next, done, err := helperExec.recomputeSingleTargetActionViaDiff(action, nil, nil)
 	if err != nil {
 		t.Fatalf("recompute returned error: %v", err)
 	}

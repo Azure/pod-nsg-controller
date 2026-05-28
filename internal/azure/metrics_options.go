@@ -61,6 +61,14 @@ func WithExecutorRetryMetrics(obs metrics.ARMRetryObserver) ExecutorOption {
 	}
 }
 
+// WithPatchThresholdPercent overrides the default patch threshold used by the
+// executor's 412-retry recompute path (ComputeDiff). Valid range: 1..100.
+func WithPatchThresholdPercent(pct int) ExecutorOption {
+	return func(e *Executor) {
+		e.patchThresholdPercent = pct
+	}
+}
+
 // WithRateLimitMetrics adds rate-limit delay metrics to the ARMRateLimiter.
 // Emits only when delay > 0.
 func WithRateLimitMetrics(obs metrics.ARMRateLimitObserver) ARMRateLimiterOption {

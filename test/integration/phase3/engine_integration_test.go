@@ -139,7 +139,7 @@ func TestIntegration_FullPipeline_DesiredStateThenDiff(t *testing.T) {
 	}
 
 	// Step 2: Diff against empty actual (simulates first reconciliation).
-	actionsFirstSync := engine.ComputeDiff(desired, nil)
+	actionsFirstSync := engine.ComputeDiff(desired, nil, engine.DefaultPatchThresholdPercent)
 	if len(actionsFirstSync) != 3 {
 		t.Fatalf("first sync: got %d actions, want 3 creates", len(actionsFirstSync))
 	}
@@ -151,7 +151,7 @@ func TestIntegration_FullPipeline_DesiredStateThenDiff(t *testing.T) {
 
 	// Step 3: Diff against identical actual (simulates steady state).
 	actual := desiredToActual(desired)
-	actionsNoOp := engine.ComputeDiff(desired, actual)
+	actionsNoOp := engine.ComputeDiff(desired, actual, engine.DefaultPatchThresholdPercent)
 	if len(actionsNoOp) != 0 {
 		t.Errorf("steady state: got %d actions, want 0", len(actionsNoOp))
 	}
@@ -166,7 +166,7 @@ func TestIntegration_FullPipeline_DesiredStateThenDiff(t *testing.T) {
 		// db-2 removed
 	}
 	newDesired := engine.ComputeDesiredState(clusterName, mappings, pods)
-	actionsScaling := engine.ComputeDiff(newDesired, actual)
+	actionsScaling := engine.ComputeDiff(newDesired, actual, engine.DefaultPatchThresholdPercent)
 
 	byKind := actionsByKind(actionsScaling)
 	if len(byKind[engine.UpdatePrefixSet])+len(byKind[engine.PatchPrefixSet]) != 2 {
@@ -304,7 +304,7 @@ func TestIntegration_DeepCopiedCRDs_ProduceIdenticalDesiredState(t *testing.T) {
 	}
 
 	// Diff between original and copy should produce zero actions.
-	actions := engine.ComputeDiff(origDesired, desiredToActual(copyDesired))
+	actions := engine.ComputeDiff(origDesired, desiredToActual(copyDesired), engine.DefaultPatchThresholdPercent)
 	if len(actions) != 0 {
 		t.Errorf("diff between original and DeepCopy produced %d actions, want 0", len(actions))
 	}
@@ -425,7 +425,7 @@ func TestIntegration_MultiNamespace_FullPipeline(t *testing.T) {
 	}
 
 	// Full pipeline: diff against empty → all creates, namespaces remain isolated.
-	actions := engine.ComputeDiff(desired, nil)
+	actions := engine.ComputeDiff(desired, nil, engine.DefaultPatchThresholdPercent)
 	if len(actions) != 2 {
 		t.Fatalf("expected 2 create actions, got %d", len(actions))
 	}
@@ -486,7 +486,7 @@ func TestIntegration_CrossSubscription_DesiredStateToDiff(t *testing.T) {
 		}
 	}
 
-	actions := engine.ComputeDiff(desired, partialActual)
+	actions := engine.ComputeDiff(desired, partialActual, engine.DefaultPatchThresholdPercent)
 	if len(actions) != 1 {
 		t.Fatalf("expected 1 action (create sub-beta), got %d", len(actions))
 	}
@@ -545,7 +545,7 @@ func TestIntegration_MappingDeletion_ProducesDeleteActions(t *testing.T) {
 		t.Fatalf("after deletion: expected 1 target, got %d", len(newDesired))
 	}
 
-	actions := engine.ComputeDiff(newDesired, actual)
+	actions := engine.ComputeDiff(newDesired, actual, engine.DefaultPatchThresholdPercent)
 	byKind := actionsByKind(actions)
 
 	if len(byKind[engine.DeletePrefixSet]) != 1 {
@@ -685,7 +685,7 @@ func TestIntegration_InvalidResourceID_SkippedGracefully(t *testing.T) {
 			}
 
 			// Diff should work normally with the valid target.
-			actions := engine.ComputeDiff(desired, nil)
+			actions := engine.ComputeDiff(desired, nil, engine.DefaultPatchThresholdPercent)
 			if len(actions) != 1 {
 				t.Errorf("expected 1 create action, got %d", len(actions))
 			}
@@ -726,7 +726,7 @@ func TestIntegration_ReconciliationLifecycle(t *testing.T) {
 		makePod("default", "app-2", map[string]string{"app": "myapp", "version": "v1"}, "10.0.0.2"),
 	}
 	desired := engine.ComputeDesiredState(clusterName, baseMappings(map[string]string{"app": "myapp"}), pods)
-	actions := engine.ComputeDiff(desired, nil)
+	actions := engine.ComputeDiff(desired, nil, engine.DefaultPatchThresholdPercent)
 	if len(actions) != 1 || actions[0].Kind != engine.CreatePrefixSet {
 		t.Fatalf("step 1: expected 1 create, got %v", actions)
 	}
@@ -734,7 +734,7 @@ func TestIntegration_ReconciliationLifecycle(t *testing.T) {
 
 	// Step 2: Steady state
 	desired = engine.ComputeDesiredState(clusterName, baseMappings(map[string]string{"app": "myapp"}), pods)
-	actions = engine.ComputeDiff(desired, actual)
+	actions = engine.ComputeDiff(desired, actual, engine.DefaultPatchThresholdPercent)
 	if len(actions) != 0 {
 		t.Fatalf("step 2: expected 0 actions (steady state), got %d", len(actions))
 	}
@@ -742,7 +742,7 @@ func TestIntegration_ReconciliationLifecycle(t *testing.T) {
 	// Step 3: Pod scaling — add a pod
 	pods = append(pods, makePod("default", "app-3", map[string]string{"app": "myapp", "version": "v1"}, "10.0.0.3"))
 	desired = engine.ComputeDesiredState(clusterName, baseMappings(map[string]string{"app": "myapp"}), pods)
-	actions = engine.ComputeDiff(desired, actual)
+	actions = engine.ComputeDiff(desired, actual, engine.DefaultPatchThresholdPercent)
 	if len(actions) != 1 || (actions[0].Kind != engine.UpdatePrefixSet && actions[0].Kind != engine.PatchPrefixSet) {
 		t.Fatalf("step 3: expected 1 update/patch (pod added), got %v", actions)
 	}
@@ -754,7 +754,7 @@ func TestIntegration_ReconciliationLifecycle(t *testing.T) {
 	// Step 4: Selector change — now select only v2 pods
 	pods = append(pods, makePod("default", "app-4", map[string]string{"app": "myapp", "version": "v2"}, "10.0.0.4"))
 	desired = engine.ComputeDesiredState(clusterName, baseMappings(map[string]string{"version": "v2"}), pods)
-	actions = engine.ComputeDiff(desired, actual)
+	actions = engine.ComputeDiff(desired, actual, engine.DefaultPatchThresholdPercent)
 	if len(actions) != 1 || actions[0].Kind != engine.UpdatePrefixSet {
 		t.Fatalf("step 4: expected 1 update (selector change), got %v", actions)
 	}
@@ -765,7 +765,7 @@ func TestIntegration_ReconciliationLifecycle(t *testing.T) {
 
 	// Step 5: Full cleanup — all mappings removed
 	desired = engine.ComputeDesiredState(clusterName, nil, pods)
-	actions = engine.ComputeDiff(desired, actual)
+	actions = engine.ComputeDiff(desired, actual, engine.DefaultPatchThresholdPercent)
 	if len(actions) != 1 || actions[0].Kind != engine.DeletePrefixSet {
 		t.Fatalf("step 5: expected 1 delete (all mappings removed), got %v", actions)
 	}
@@ -817,14 +817,14 @@ func TestIntegration_LargeScale_ManyMappingsAndPods(t *testing.T) {
 	}
 
 	// First sync: all creates
-	actions := engine.ComputeDiff(desired, nil)
+	actions := engine.ComputeDiff(desired, nil, engine.DefaultPatchThresholdPercent)
 	if len(actions) != numMappings {
 		t.Fatalf("expected %d create actions, got %d", numMappings, len(actions))
 	}
 
 	// Steady state: no actions
 	actual := desiredToActual(desired)
-	actions = engine.ComputeDiff(desired, actual)
+	actions = engine.ComputeDiff(desired, actual, engine.DefaultPatchThresholdPercent)
 	if len(actions) != 0 {
 		t.Errorf("steady state: expected 0 actions, got %d", len(actions))
 	}
@@ -865,7 +865,7 @@ func TestIntegration_EmptyDesiredPrefixSet_CreateAction(t *testing.T) {
 	}
 
 	// Diff against nil actual → CreatePrefixSet with empty IPs.
-	actions := engine.ComputeDiff(desired, nil)
+	actions := engine.ComputeDiff(desired, nil, engine.DefaultPatchThresholdPercent)
 	if len(actions) != 1 {
 		t.Fatalf("expected 1 action, got %d", len(actions))
 	}
@@ -880,7 +880,7 @@ func TestIntegration_EmptyDesiredPrefixSet_CreateAction(t *testing.T) {
 	actualWithIPs := map[engine.ASGTarget]engine.ActualPrefixSet{
 		actions[0].Target: {IPs: ipSet("10.0.0.99/32")},
 	}
-	actions = engine.ComputeDiff(desired, actualWithIPs)
+	actions = engine.ComputeDiff(desired, actualWithIPs, engine.DefaultPatchThresholdPercent)
 	if len(actions) != 1 {
 		t.Fatalf("expected 1 action, got %d", len(actions))
 	}
@@ -950,7 +950,7 @@ func TestIntegration_MultipleRules_SharedASG_UnionThroughDiff(t *testing.T) {
 		target: {IPs: ipSet("10.0.0.1/32", "10.0.0.2/32")},
 	}
 
-	actions := engine.ComputeDiff(desired, partialActual)
+	actions := engine.ComputeDiff(desired, partialActual, engine.DefaultPatchThresholdPercent)
 	if len(actions) != 1 {
 		t.Fatalf("expected 1 update action, got %d", len(actions))
 	}
@@ -1072,12 +1072,12 @@ func TestIntegration_WildcardSelector_MatchesAllNamespacePods(t *testing.T) {
 	}
 
 	// Full pipeline: diff creates, then no-op.
-	actions := engine.ComputeDiff(desired, nil)
+	actions := engine.ComputeDiff(desired, nil, engine.DefaultPatchThresholdPercent)
 	if len(actions) != 1 || actions[0].Kind != engine.CreatePrefixSet {
 		t.Errorf("expected 1 create action, got %v", actions)
 	}
 	actual := desiredToActual(desired)
-	actions = engine.ComputeDiff(desired, actual)
+	actions = engine.ComputeDiff(desired, actual, engine.DefaultPatchThresholdPercent)
 	if len(actions) != 0 {
 		t.Errorf("expected 0 actions (steady state), got %d", len(actions))
 	}
@@ -1111,7 +1111,7 @@ func TestIntegration_DiffDesiredIPs_SortedFromPipeline(t *testing.T) {
 	}
 
 	desired := engine.ComputeDesiredState(clusterName, []v1alpha1.PodASGMapping{mapping}, pods)
-	actions := engine.ComputeDiff(desired, nil)
+	actions := engine.ComputeDiff(desired, nil, engine.DefaultPatchThresholdPercent)
 	if len(actions) != 1 {
 		t.Fatalf("expected 1 action, got %d", len(actions))
 	}
@@ -1186,7 +1186,7 @@ func TestIntegration_ComputeDesiredState_Idempotent(t *testing.T) {
 	}
 
 	// Diff between two identical desired states should produce no actions.
-	actions := engine.ComputeDiff(result1, desiredToActual(result2))
+	actions := engine.ComputeDiff(result1, desiredToActual(result2), engine.DefaultPatchThresholdPercent)
 	if len(actions) != 0 {
 		t.Errorf("diff between two identical ComputeDesiredState results: got %d actions, want 0", len(actions))
 	}
@@ -1261,7 +1261,7 @@ func TestIntegration_SameASG_DifferentNamespaces_DistinctTargets(t *testing.T) {
 	partialActual := map[engine.ASGTarget]engine.ActualPrefixSet{
 		*targetA: {IPs: psA.IPs},
 	}
-	actions := engine.ComputeDiff(desired, partialActual)
+	actions := engine.ComputeDiff(desired, partialActual, engine.DefaultPatchThresholdPercent)
 	if len(actions) != 1 {
 		t.Fatalf("expected 1 action (create team-b), got %d", len(actions))
 	}

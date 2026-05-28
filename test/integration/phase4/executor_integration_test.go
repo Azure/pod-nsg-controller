@@ -95,7 +95,7 @@ func TestIntegration_FullPipeline_DesiredState_Diff_Execute(t *testing.T) {
 
 	// Phase 3: Compute diff (actual is empty → creates)
 	actual := map[engine.ASGTarget]engine.ActualPrefixSet{}
-	actions := engine.ComputeDiff(desired, actual)
+	actions := engine.ComputeDiff(desired, actual, engine.DefaultPatchThresholdPercent)
 	if len(actions) != 1 {
 		t.Fatalf("expected 1 action, got %d", len(actions))
 	}
@@ -158,7 +158,7 @@ func TestIntegration_FullPipeline_CreateThenUpdate(t *testing.T) {
 	}
 
 	desired1 := engine.ComputeDesiredState(clusterName, []v1alpha1.PodASGMapping{mapping}, pods1)
-	actions1 := engine.ComputeDiff(desired1, nil)
+	actions1 := engine.ComputeDiff(desired1, nil, engine.DefaultPatchThresholdPercent)
 	results1 := executor.Execute(ctx, actions1)
 	for _, r := range results1 {
 		if !r.Success {
@@ -204,7 +204,7 @@ func TestIntegration_FullPipeline_CreateThenUpdate(t *testing.T) {
 		}
 	}
 
-	actions2 := engine.ComputeDiff(desired2, actualMap)
+	actions2 := engine.ComputeDiff(desired2, actualMap, engine.DefaultPatchThresholdPercent)
 	if len(actions2) != 1 {
 		t.Fatalf("expected 1 update action, got %d", len(actions2))
 	}
@@ -259,7 +259,7 @@ func TestIntegration_FullPipeline_CreateThenDelete(t *testing.T) {
 	pods := []corev1.Pod{makePod("ns1", "p1", map[string]string{"x": "y"}, "10.0.0.1")}
 
 	desired1 := engine.ComputeDesiredState(clusterName, []v1alpha1.PodASGMapping{mapping}, pods)
-	actions1 := engine.ComputeDiff(desired1, nil)
+	actions1 := engine.ComputeDiff(desired1, nil, engine.DefaultPatchThresholdPercent)
 	results1 := executor.Execute(ctx, actions1)
 	if !results1[0].Success {
 		t.Fatalf("create failed: %v", results1[0].Err)
@@ -285,7 +285,7 @@ func TestIntegration_FullPipeline_CreateThenDelete(t *testing.T) {
 		target: {IPs: ips},
 	}
 
-	actions2 := engine.ComputeDiff(desired2, actualMap)
+	actions2 := engine.ComputeDiff(desired2, actualMap, engine.DefaultPatchThresholdPercent)
 	if len(actions2) != 1 || actions2[0].Kind != engine.DeletePrefixSet {
 		t.Fatalf("expected 1 DeletePrefixSet action, got %v", actions2)
 	}
@@ -337,7 +337,7 @@ func TestIntegration_Executor_CrossSubscriptionRouting(t *testing.T) {
 	}
 
 	desired := engine.ComputeDesiredState(clusterName, []v1alpha1.PodASGMapping{mapping}, pods)
-	actions := engine.ComputeDiff(desired, nil)
+	actions := engine.ComputeDiff(desired, nil, engine.DefaultPatchThresholdPercent)
 	if len(actions) != 2 {
 		t.Fatalf("expected 2 actions for 2 subscriptions, got %d", len(actions))
 	}
@@ -1014,7 +1014,7 @@ func TestIntegration_FullPipeline_MultipleMappingsSameASG(t *testing.T) {
 		t.Fatalf("expected 2 desired targets (one per mapping), got %d", len(desired))
 	}
 
-	actions := engine.ComputeDiff(desired, nil)
+	actions := engine.ComputeDiff(desired, nil, engine.DefaultPatchThresholdPercent)
 	if len(actions) != 2 {
 		t.Fatalf("expected 2 create actions, got %d", len(actions))
 	}
@@ -1085,7 +1085,7 @@ func TestIntegration_FullPipeline_SmallDelta_ProducesPatch(t *testing.T) {
 	}
 
 	desired1 := engine.ComputeDesiredState(clusterName, []v1alpha1.PodASGMapping{mapping}, pods1)
-	actions1 := engine.ComputeDiff(desired1, nil)
+	actions1 := engine.ComputeDiff(desired1, nil, engine.DefaultPatchThresholdPercent)
 	results1 := executor.Execute(ctx, actions1)
 	if !results1[0].Success {
 		t.Fatalf("round 1 create failed: %v", results1[0].Err)
@@ -1115,7 +1115,7 @@ func TestIntegration_FullPipeline_SmallDelta_ProducesPatch(t *testing.T) {
 		target: {IPs: ips},
 	}
 
-	actions2 := engine.ComputeDiff(desired2, actualMap)
+	actions2 := engine.ComputeDiff(desired2, actualMap, engine.DefaultPatchThresholdPercent)
 	if len(actions2) != 1 {
 		t.Fatalf("expected 1 action, got %d", len(actions2))
 	}
@@ -1169,7 +1169,7 @@ func TestIntegration_FullPipeline_LargeDelta_ProducesUpdate(t *testing.T) {
 	}
 
 	desired1 := engine.ComputeDesiredState(clusterName, []v1alpha1.PodASGMapping{mapping}, pods1)
-	actions1 := engine.ComputeDiff(desired1, nil)
+	actions1 := engine.ComputeDiff(desired1, nil, engine.DefaultPatchThresholdPercent)
 	results1 := executor.Execute(ctx, actions1)
 	if !results1[0].Success {
 		t.Fatalf("round 1 create failed: %v", results1[0].Err)
@@ -1197,7 +1197,7 @@ func TestIntegration_FullPipeline_LargeDelta_ProducesUpdate(t *testing.T) {
 		target: {IPs: ips},
 	}
 
-	actions2 := engine.ComputeDiff(desired2, actualMap)
+	actions2 := engine.ComputeDiff(desired2, actualMap, engine.DefaultPatchThresholdPercent)
 	if len(actions2) != 1 {
 		t.Fatalf("expected 1 action, got %d", len(actions2))
 	}

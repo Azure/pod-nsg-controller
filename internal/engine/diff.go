@@ -1,16 +1,20 @@
 package engine
 
 import (
-	"os"
 	"sort"
-	"strconv"
 )
 
+// DefaultPatchThresholdPercent is the default threshold for patch vs full-update.
+const DefaultPatchThresholdPercent = 50
+
 // ComputeDiff computes the list of create/update/delete actions needed
-// to reconcile desired state with actual state.
+// to reconcile desired state with actual state. patchThresholdPercent
+// controls when a small delta uses PatchPrefixSet instead of UpdatePrefixSet
+// (valid range 1..100; values outside that range are clamped to the default).
 func ComputeDiff(
 	desired map[ASGTarget]DesiredPrefixSet,
 	actual map[ASGTarget]ActualPrefixSet,
+	patchThresholdPercent int,
 ) []Action {
 	if desired == nil {
 		desired = make(map[ASGTarget]DesiredPrefixSet)
@@ -41,7 +45,10 @@ func ComputeDiff(
 
 	actions := make([]Action, 0)
 
-	thresholdPercent := patchThresholdPercentFromEnv()
+	thresholdPercent := patchThresholdPercent
+	if thresholdPercent < 1 || thresholdPercent > 100 {
+		thresholdPercent = DefaultPatchThresholdPercent
+	}
 
 	for key, de := range desiredByKey {
 		if ae, exists := actualByKey[key]; exists {
@@ -161,19 +168,4 @@ func shouldUsePatch(addCount, removeCount, desiredCount, actualCount, thresholdP
 		return false
 	}
 	return 100*deltaOps <= thresholdPercent*denominator
-}
-
-// patchThresholdPercentFromEnv reads the patch threshold from environment.
-// Default is 50. Valid range: 1..100; invalid/missing → 50.
-func patchThresholdPercentFromEnv() int {
-	const defaultThreshold = 50
-	val := os.Getenv("POD_NSG_PATCH_THRESHOLD_PERCENT")
-	if val == "" {
-		return defaultThreshold
-	}
-	v, err := strconv.Atoi(val)
-	if err != nil || v < 1 || v > 100 {
-		return defaultThreshold
-	}
-	return v
 }
