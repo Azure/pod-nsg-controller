@@ -706,6 +706,67 @@ func TestReconcile_DebounceStateClearedOnNotFoundAndDelete(t *testing.T) {
 			t.Error("Phase 3: debounce state should be cleared after mapping not-found")
 		}
 	})
+
+	// Test ErrStatusObjectNotFound from UpdatePending clears debounce state.
+	// Scenario: mapping deleted during reconcile after prior success → debounce
+	// state must be cleared so a quickly re-created mapping with the same
+	// generation is not incorrectly debounced.
+	t.Run("ErrStatusObjectNotFound from UpdatePending clears debounce state", func(t *testing.T) {
+		mapping := newTestMapping(ns, "pending-gone", []v1alpha1.Mapping{
+			{
+				PodSelector: v1alpha1.PodSelector{
+					MatchLabels: map[string]string{"app": "web"},
+				},
+				ApplicationSecurityGroups: []v1alpha1.ASGReference{
+					{ResourceID: asgResourceID("sub1", "rg1", "asg1")},
+				},
+			},
+		})
+		mapping.Finalizers = []string{CleanupFinalizer}
+
+		fakeClient := fakeclient.NewClientBuilder().
+			WithScheme(scheme).
+			WithObjects(mapping).
+			Build()
+
+		fakeFactory := fake.NewClientFactory()
+		fakeFactory.RegisterClient("sub1", fake.NewClient())
+		exec := &stubExecutor{}
+
+		// StatusUpdater that returns ErrStatusObjectNotFound on UpdatePending,
+		// simulating a mapping deleted between ensureFinalizer and status write.
+		statusStub := &stubStatusUpdaterP7{pendingErr: ErrStatusObjectNotFound}
+
+		r := &MappingReconciler{
+			Client:               fakeClient,
+			Scheme:               scheme,
+			ClusterName:          "test-cluster",
+			ResyncInterval:       60 * time.Second,
+			MinReconcileInterval: 5 * time.Second,
+			PrefixSetFactory:     fakeFactory,
+			Executor:             exec,
+			StatusUpdater:        statusStub,
+		}
+
+		key := types.NamespacedName{Name: "pending-gone", Namespace: ns}
+
+		// Simulate prior debounce state from a successful reconcile, but
+		// old enough that the debounce window has expired so the reconcile
+		// proceeds past the debounce check to the UpdatePending call.
+		r.markReconcileSuccess(key, mapping.Generation, time.Now().Add(-10*time.Second))
+
+		// Reconcile — UpdatePending returns ErrStatusObjectNotFound
+		_, err := r.Reconcile(ctx, ctrl.Request{NamespacedName: key})
+		if err != nil {
+			t.Fatalf("reconcile error: %v", err)
+		}
+
+		// Debounce state must be cleared so a re-created mapping is not skipped
+		_, shouldDebounce := r.debounceRemaining(key, mapping.Generation, time.Now())
+		if shouldDebounce {
+			t.Error("Phase 3: debounce state should be cleared after ErrStatusObjectNotFound from UpdatePending")
+		}
+	})
 }
 
 // ---------------------------------------------------------------------------

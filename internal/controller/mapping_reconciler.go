@@ -91,7 +91,6 @@ func (r *MappingReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 	var mapping v1alpha1.PodASGMapping
 	if err := r.Get(ctx, req.NamespacedName, &mapping); err != nil {
 		if apierrors.IsNotFound(err) {
-			r.clearDebounceState(req.NamespacedName)
 			r.markInitialTerminal(req.NamespacedName, true)
 			r.cleanupPerMappingMetricState(req.NamespacedName)
 			r.observeReconcile(req, ReconcileStageMappingNotFound, reconcileStart, 0)
@@ -133,13 +132,11 @@ func (r *MappingReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 				r.observeReconcile(req, metricStage, reconcileStart, 0)
 				return result, retErr
 			}
-			r.clearDebounceState(req.NamespacedName)
 			r.markInitialTerminal(req.NamespacedName, true)
 			r.cleanupPerMappingMetricState(req.NamespacedName)
 			r.observeReconcile(req, ReconcileStageDeleteComplete, reconcileStart, 0)
 			return ctrl.Result{}, nil
 		}
-		r.clearDebounceState(req.NamespacedName)
 		r.markInitialTerminal(req.NamespacedName, true)
 		r.cleanupPerMappingMetricState(req.NamespacedName)
 		r.observeReconcile(req, ReconcileStageDeleteComplete, reconcileStart, 0)
@@ -506,10 +503,12 @@ func (r *MappingReconciler) ensureInitialTrackerFallback() {
 	_ = r.InitialTracker.EnsureInitialized(context.Background(), listFn)
 }
 
-// cleanupPerMappingMetricState removes all per-mapping metric state on terminal cleanup.
-// This deletes all per-key time series to prevent unbounded cardinality growth
+// cleanupPerMappingMetricState removes all per-mapping state on terminal cleanup:
+// debounce tracking, convergence trackers, pod churn windows, and per-key time
+// series. This prevents unbounded cardinality growth and stale debounce state
 // when PodASGMapping resources are deleted.
 func (r *MappingReconciler) cleanupPerMappingMetricState(key types.NamespacedName) {
+	r.clearDebounceState(key)
 	if r.ConvergenceTracker != nil {
 		r.ConvergenceTracker.Forget(key)
 	}
