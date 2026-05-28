@@ -45,6 +45,9 @@ type Config struct {
 
 	// MaxConcurrentAzureReads is the max parallel ARM GET calls across all reconciles (default: 10).
 	MaxConcurrentAzureReads int
+
+	// MinReconcileIntervalMs is the minimum interval between reconciles for the same key (default: 2000, 0 disables).
+	MinReconcileIntervalMs int
 }
 
 // Load reads configuration from environment variables and validates required fields.
@@ -128,6 +131,21 @@ func Load() (*Config, error) {
 			return nil, fmt.Errorf("MAX_CONCURRENT_AZURE_READS must be >= 1, got %d", val)
 		}
 		cfg.MaxConcurrentAzureReads = val
+	}
+
+	// Parse min reconcile interval.
+	mriStr := os.Getenv("MIN_RECONCILE_INTERVAL_MS")
+	if mriStr == "" {
+		cfg.MinReconcileIntervalMs = 2000
+	} else {
+		val, err := strconv.Atoi(mriStr)
+		if err != nil {
+			return nil, errors.Wrap(err, "MIN_RECONCILE_INTERVAL_MS must be a valid integer")
+		}
+		if val < 0 {
+			return nil, fmt.Errorf("MIN_RECONCILE_INTERVAL_MS must be >= 0, got %d", val)
+		}
+		cfg.MinReconcileIntervalMs = val
 	}
 
 	if err := cfg.Validate(); err != nil {

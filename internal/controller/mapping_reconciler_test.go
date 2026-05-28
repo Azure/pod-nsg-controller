@@ -374,6 +374,402 @@ func TestReconcile_AddsFinalizerAndReturnsEarly(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
+// Phase 3: TestReconcile_Debounce - same generation inside interval returns RequeueAfter
+// ---------------------------------------------------------------------------
+func TestReconcile_Debounce(t *testing.T) {
+	ctx := context.Background()
+	scheme := testScheme(t)
+	ns := "test-ns"
+
+	mapping := newTestMapping(ns, "my-mapping", []v1alpha1.Mapping{
+		{
+			PodSelector: v1alpha1.PodSelector{
+				MatchLabels: map[string]string{"app": "web"},
+			},
+			ApplicationSecurityGroups: []v1alpha1.ASGReference{
+				{ResourceID: asgResourceID("sub1", "rg1", "asg1")},
+			},
+		},
+	})
+	mapping.Finalizers = []string{CleanupFinalizer}
+	mapping.Generation = 1
+
+	pod := newTestPod(ns, "pod-1", "10.0.0.1", map[string]string{"app": "web"})
+
+	fakeClient := fakeclient.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(mapping, pod).
+		Build()
+
+	fakeFactory := fake.NewClientFactory()
+	fakeAzClient := fake.NewClient()
+	fakeFactory.RegisterClient("sub1", fakeAzClient)
+
+	exec := &stubExecutor{}
+	debounceInterval := 2 * time.Second
+
+	r := &MappingReconciler{
+		Client:               fakeClient,
+		Scheme:               scheme,
+		ClusterName:          "test-cluster",
+		ResyncInterval:       60 * time.Second,
+		MinReconcileInterval: debounceInterval,
+		PrefixSetFactory:     fakeFactory,
+		Executor:             exec,
+	}
+
+	// First reconcile should proceed normally
+	result1, err := r.Reconcile(ctx, ctrl.Request{
+		NamespacedName: types.NamespacedName{Name: "my-mapping", Namespace: ns},
+	})
+	if err != nil {
+		t.Fatalf("first reconcile error: %v", err)
+	}
+	if len(exec.calls) == 0 {
+		t.Fatal("Phase 3: first reconcile should execute actions")
+	}
+
+	// Second reconcile immediately after should be debounced (same generation)
+	result2, err := r.Reconcile(ctx, ctrl.Request{
+		NamespacedName: types.NamespacedName{Name: "my-mapping", Namespace: ns},
+	})
+	if err != nil {
+		t.Fatalf("second reconcile error: %v", err)
+	}
+
+	// The second reconcile should return RequeueAfter with remaining time
+	if result2.RequeueAfter <= 0 || result2.RequeueAfter > debounceInterval {
+		t.Errorf("Phase 3: second reconcile within debounce interval should return RequeueAfter in (0, %v], got %v (result1=%v)",
+			debounceInterval, result2.RequeueAfter, result1)
+	}
+
+	// Executor should NOT have been called again
+	if len(exec.calls) > 1 {
+		t.Errorf("Phase 3: second reconcile within debounce interval should NOT execute actions again, got %d total calls", len(exec.calls))
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Phase 3: TestReconcile_DebounceDoesNotDelayInitial
+// First reconcile for a mapping key is never delayed.
+// ---------------------------------------------------------------------------
+func TestReconcile_DebounceDoesNotDelayInitial(t *testing.T) {
+	ctx := context.Background()
+	scheme := testScheme(t)
+	ns := "test-ns"
+
+	mapping := newTestMapping(ns, "initial-mapping", []v1alpha1.Mapping{
+		{
+			PodSelector: v1alpha1.PodSelector{
+				MatchLabels: map[string]string{"app": "web"},
+			},
+			ApplicationSecurityGroups: []v1alpha1.ASGReference{
+				{ResourceID: asgResourceID("sub1", "rg1", "asg1")},
+			},
+		},
+	})
+	mapping.Finalizers = []string{CleanupFinalizer}
+	mapping.Generation = 1
+
+	pod := newTestPod(ns, "pod-1", "10.0.0.1", map[string]string{"app": "web"})
+
+	fakeClient := fakeclient.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(mapping, pod).
+		Build()
+
+	fakeFactory := fake.NewClientFactory()
+	fakeAzClient := fake.NewClient()
+	fakeFactory.RegisterClient("sub1", fakeAzClient)
+
+	exec := &stubExecutor{}
+
+	r := &MappingReconciler{
+		Client:               fakeClient,
+		Scheme:               scheme,
+		ClusterName:          "test-cluster",
+		ResyncInterval:       60 * time.Second,
+		MinReconcileInterval: 5 * time.Second,
+		PrefixSetFactory:     fakeFactory,
+		Executor:             exec,
+	}
+
+	result, err := r.Reconcile(ctx, ctrl.Request{
+		NamespacedName: types.NamespacedName{Name: "initial-mapping", Namespace: ns},
+	})
+	if err != nil {
+		t.Fatalf("unexpected reconcile error: %v", err)
+	}
+
+	// First reconcile must NOT be debounced
+	if len(exec.calls) == 0 {
+		t.Error("Phase 3: first reconcile for a new key should NOT be debounced; expected executor calls")
+	}
+
+	// Should return normal resync
+	if result.RequeueAfter != 60*time.Second {
+		t.Errorf("Phase 3: first reconcile should return resync interval, got %v", result.RequeueAfter)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Phase 3: TestReconcile_DebounceBypassesNewGeneration
+// A new generation (spec change) bypasses debounce immediately.
+// ---------------------------------------------------------------------------
+func TestReconcile_DebounceBypassesNewGeneration(t *testing.T) {
+	ctx := context.Background()
+	scheme := testScheme(t)
+	ns := "test-ns"
+
+	mapping := newTestMapping(ns, "gen-mapping", []v1alpha1.Mapping{
+		{
+			PodSelector: v1alpha1.PodSelector{
+				MatchLabels: map[string]string{"app": "web"},
+			},
+			ApplicationSecurityGroups: []v1alpha1.ASGReference{
+				{ResourceID: asgResourceID("sub1", "rg1", "asg1")},
+			},
+		},
+	})
+	mapping.Finalizers = []string{CleanupFinalizer}
+	mapping.Generation = 1
+
+	pod := newTestPod(ns, "pod-1", "10.0.0.1", map[string]string{"app": "web"})
+
+	fakeClient := fakeclient.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(mapping, pod).
+		Build()
+
+	fakeFactory := fake.NewClientFactory()
+	fakeAzClient := fake.NewClient()
+	fakeFactory.RegisterClient("sub1", fakeAzClient)
+
+	exec := &stubExecutor{}
+
+	r := &MappingReconciler{
+		Client:               fakeClient,
+		Scheme:               scheme,
+		ClusterName:          "test-cluster",
+		ResyncInterval:       60 * time.Second,
+		MinReconcileInterval: 10 * time.Second,
+		PrefixSetFactory:     fakeFactory,
+		Executor:             exec,
+	}
+
+	// First reconcile establishes debounce state
+	_, err := r.Reconcile(ctx, ctrl.Request{
+		NamespacedName: types.NamespacedName{Name: "gen-mapping", Namespace: ns},
+	})
+	if err != nil {
+		t.Fatalf("first reconcile error: %v", err)
+	}
+	firstCallCount := len(exec.calls)
+
+	// Simulate generation bump by updating the mapping
+	var current v1alpha1.PodASGMapping
+	if err := fakeClient.Get(ctx, types.NamespacedName{Name: "gen-mapping", Namespace: ns}, &current); err != nil {
+		t.Fatalf("failed to get mapping: %v", err)
+	}
+	current.Generation = 2
+	if err := fakeClient.Update(ctx, &current); err != nil {
+		t.Fatalf("failed to bump generation: %v", err)
+	}
+
+	// Second reconcile should NOT be debounced because generation changed
+	_, err = r.Reconcile(ctx, ctrl.Request{
+		NamespacedName: types.NamespacedName{Name: "gen-mapping", Namespace: ns},
+	})
+	if err != nil {
+		t.Fatalf("second reconcile error: %v", err)
+	}
+
+	if len(exec.calls) <= firstCallCount {
+		t.Error("Phase 3: reconcile with new generation should bypass debounce; expected additional executor calls")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Phase 3: TestReconcile_DebounceDisabledWithZeroInterval
+// MIN_RECONCILE_INTERVAL_MS=0 disables debounce entirely.
+// ---------------------------------------------------------------------------
+func TestReconcile_DebounceDisabledWithZeroInterval(t *testing.T) {
+	ctx := context.Background()
+	scheme := testScheme(t)
+	ns := "test-ns"
+
+	mapping := newTestMapping(ns, "no-debounce", []v1alpha1.Mapping{
+		{
+			PodSelector: v1alpha1.PodSelector{
+				MatchLabels: map[string]string{"app": "web"},
+			},
+			ApplicationSecurityGroups: []v1alpha1.ASGReference{
+				{ResourceID: asgResourceID("sub1", "rg1", "asg1")},
+			},
+		},
+	})
+	mapping.Finalizers = []string{CleanupFinalizer}
+	mapping.Generation = 1
+
+	pod := newTestPod(ns, "pod-1", "10.0.0.1", map[string]string{"app": "web"})
+
+	fakeClient := fakeclient.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(mapping, pod).
+		Build()
+
+	fakeFactory := fake.NewClientFactory()
+	fakeAzClient := fake.NewClient()
+	fakeFactory.RegisterClient("sub1", fakeAzClient)
+
+	exec := &stubExecutor{}
+
+	r := &MappingReconciler{
+		Client:               fakeClient,
+		Scheme:               scheme,
+		ClusterName:          "test-cluster",
+		ResyncInterval:       60 * time.Second,
+		MinReconcileInterval: 0, // debounce disabled
+		PrefixSetFactory:     fakeFactory,
+		Executor:             exec,
+	}
+
+	// First reconcile
+	_, err := r.Reconcile(ctx, ctrl.Request{
+		NamespacedName: types.NamespacedName{Name: "no-debounce", Namespace: ns},
+	})
+	if err != nil {
+		t.Fatalf("first reconcile error: %v", err)
+	}
+
+	// Second reconcile immediately (same generation)
+	result, err := r.Reconcile(ctx, ctrl.Request{
+		NamespacedName: types.NamespacedName{Name: "no-debounce", Namespace: ns},
+	})
+	if err != nil {
+		t.Fatalf("second reconcile error: %v", err)
+	}
+
+	// With debounce disabled, second reconcile should proceed normally (not short-circuit)
+	if len(exec.calls) < 2 {
+		t.Errorf("Phase 3: with debounce disabled (interval=0), both reconciles should execute; got %d calls", len(exec.calls))
+	}
+
+	// Should return normal resync interval, not a debounce-specific RequeueAfter
+	if result.RequeueAfter != 60*time.Second {
+		t.Errorf("Phase 3: with debounce disabled, should return resync interval; got %v", result.RequeueAfter)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Phase 3: TestReconcile_DebounceStateClearedOnNotFoundAndDelete
+// Debounce state is cleaned up on mapping not-found and deletion paths.
+// ---------------------------------------------------------------------------
+func TestReconcile_DebounceStateClearedOnNotFoundAndDelete(t *testing.T) {
+	ctx := context.Background()
+	scheme := testScheme(t)
+	ns := "test-ns"
+
+	// Test not-found clears state
+	t.Run("not-found clears debounce state", func(t *testing.T) {
+		fakeClient := fakeclient.NewClientBuilder().
+			WithScheme(scheme).
+			Build()
+
+		fakeFactory := fake.NewClientFactory()
+		exec := &stubExecutor{}
+
+		r := &MappingReconciler{
+			Client:               fakeClient,
+			Scheme:               scheme,
+			ClusterName:          "test-cluster",
+			ResyncInterval:       60 * time.Second,
+			MinReconcileInterval: 5 * time.Second,
+			PrefixSetFactory:     fakeFactory,
+			Executor:             exec,
+		}
+
+		key := types.NamespacedName{Name: "gone-mapping", Namespace: ns}
+
+		// Simulate prior debounce state by marking a success
+		r.markReconcileSuccess(key, 1, time.Now())
+
+		// Reconcile a non-existent mapping
+		_, err := r.Reconcile(ctx, ctrl.Request{NamespacedName: key})
+		if err != nil {
+			t.Fatalf("reconcile error: %v", err)
+		}
+
+		// Verify debounce state is cleared
+		_, shouldDebounce := r.debounceRemaining(key, 1, time.Now())
+		if shouldDebounce {
+			t.Error("Phase 3: debounce state should be cleared after mapping not-found")
+		}
+	})
+
+	// Test ErrStatusObjectNotFound from UpdatePending clears debounce state.
+	// Scenario: mapping deleted during reconcile after prior success → debounce
+	// state must be cleared so a quickly re-created mapping with the same
+	// generation is not incorrectly debounced.
+	t.Run("ErrStatusObjectNotFound from UpdatePending clears debounce state", func(t *testing.T) {
+		mapping := newTestMapping(ns, "pending-gone", []v1alpha1.Mapping{
+			{
+				PodSelector: v1alpha1.PodSelector{
+					MatchLabels: map[string]string{"app": "web"},
+				},
+				ApplicationSecurityGroups: []v1alpha1.ASGReference{
+					{ResourceID: asgResourceID("sub1", "rg1", "asg1")},
+				},
+			},
+		})
+		mapping.Finalizers = []string{CleanupFinalizer}
+
+		fakeClient := fakeclient.NewClientBuilder().
+			WithScheme(scheme).
+			WithObjects(mapping).
+			Build()
+
+		fakeFactory := fake.NewClientFactory()
+		fakeFactory.RegisterClient("sub1", fake.NewClient())
+		exec := &stubExecutor{}
+
+		// StatusUpdater that returns ErrStatusObjectNotFound on UpdatePending,
+		// simulating a mapping deleted between ensureFinalizer and status write.
+		statusStub := &stubStatusUpdaterP7{pendingErr: ErrStatusObjectNotFound}
+
+		r := &MappingReconciler{
+			Client:               fakeClient,
+			Scheme:               scheme,
+			ClusterName:          "test-cluster",
+			ResyncInterval:       60 * time.Second,
+			MinReconcileInterval: 5 * time.Second,
+			PrefixSetFactory:     fakeFactory,
+			Executor:             exec,
+			StatusUpdater:        statusStub,
+		}
+
+		key := types.NamespacedName{Name: "pending-gone", Namespace: ns}
+
+		// Simulate prior debounce state from a successful reconcile, but
+		// old enough that the debounce window has expired so the reconcile
+		// proceeds past the debounce check to the UpdatePending call.
+		r.markReconcileSuccess(key, mapping.Generation, time.Now().Add(-10*time.Second))
+
+		// Reconcile — UpdatePending returns ErrStatusObjectNotFound
+		_, err := r.Reconcile(ctx, ctrl.Request{NamespacedName: key})
+		if err != nil {
+			t.Fatalf("reconcile error: %v", err)
+		}
+
+		// Debounce state must be cleared so a re-created mapping is not skipped
+		_, shouldDebounce := r.debounceRemaining(key, mapping.Generation, time.Now())
+		if shouldDebounce {
+			t.Error("Phase 3: debounce state should be cleared after ErrStatusObjectNotFound from UpdatePending")
+		}
+	})
+}
+
+// ---------------------------------------------------------------------------
 // T5.7: TestReconcile_DeletePath_CleansOwnedPrefixSetsAndRemovesFinalizer
 // Spec: PodASGMapping deleted → finalizer triggers cleanup → all owned prefix sets deleted
 // ---------------------------------------------------------------------------

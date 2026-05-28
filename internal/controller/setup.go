@@ -22,11 +22,19 @@ func (r *MappingReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	podHandler := NewPodToMappingEventHandler(
 		mgr.GetClient(),
 		ctrl.Log.WithName("pod-handler"),
+		r.MinReconcileInterval,
 	)
 
 	name := fmt.Sprintf("podasgmapping-%d", atomic.AddInt64(&controllerSeq, 1))
 
 	opts := ctrlcontroller.Options{MaxConcurrentReconciles: r.MaxConcurrentReconciles}
+
+	// Rate limiting for the controller queue uses the default controller-runtime
+	// limiter (exponential backoff + shared bucket), which governs failure
+	// retries via AddRateLimited. Pod event throughput is capped separately:
+	// the pod handler uses AddAfter (queue-level coalescing) and the reconciler
+	// applies debounceRemaining (reconcile-level rate limiting). Neither path
+	// calls AddRateLimited, so a custom queue-level rate limiter is unnecessary.
 
 	// Wire instrumented queue factory if metrics are available.
 	if r.MetricsRecorder != nil {
@@ -40,3 +48,4 @@ func (r *MappingReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		Watches(&corev1.Pod{}, podHandler, builder.WithPredicates(PodPredicate())).
 		Complete(r)
 }
+

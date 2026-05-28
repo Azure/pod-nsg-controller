@@ -7,13 +7,24 @@ import (
 	"github.com/Azure/pod-nsg-controller/internal/metrics"
 )
 
-// TestPhase8_ReconcileResultClassification_FinalizerPathIsRequeue
-// The finalizer-add early return path should be classified as "requeue".
-func TestPhase8_ReconcileResultClassification_FinalizerPathIsRequeue(t *testing.T) {
-	result := ClassifyReconcileMetricResult(ReconcileStageFinalizerAddEarlyReturn)
-	if result != metrics.ReconcileResultRequeue {
-		t.Errorf("ClassifyReconcileMetricResult(%q) = %q, want %q",
-			ReconcileStageFinalizerAddEarlyReturn, result, metrics.ReconcileResultRequeue)
+// TestPhase8_ReconcileResultClassification_RequeuePaths
+// Both finalizer-add early return and debounced paths should be classified as "requeue".
+func TestPhase8_ReconcileResultClassification_RequeuePaths(t *testing.T) {
+	tests := []struct {
+		name  string
+		stage ReconcileMetricStage
+	}{
+		{"finalizer-add-early-return", ReconcileStageFinalizerAddEarlyReturn},
+		{"debounced", ReconcileStageDebounced},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			result := ClassifyReconcileMetricResult(tc.stage)
+			if result != metrics.ReconcileResultRequeue {
+				t.Errorf("ClassifyReconcileMetricResult(%q) = %q, want %q",
+					tc.stage, result, metrics.ReconcileResultRequeue)
+			}
+		})
 	}
 }
 

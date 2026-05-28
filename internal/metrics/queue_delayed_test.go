@@ -150,3 +150,53 @@ func TestPhase8_QueueDepth_AddAfterZeroDelay_ImmediatelyReflected(t *testing.T) 
 		t.Errorf("after AddAfter(0): queue_depth = %v, want 1 (zero delay = immediate)", depth)
 	}
 }
+
+// ---------------------------------------------------------------------------
+// Phase 3: TestPhase3_QueueDepth_BurstAddAfterSameKey_CoalescesToSingleItem
+// Burst AddAfter of identical request coalesces to one ready item.
+// ---------------------------------------------------------------------------
+func TestPhase3_QueueDepth_BurstAddAfterSameKey_CoalescesToSingleItem(t *testing.T) {
+	ResetForTesting()
+	defer ResetForTesting()
+	rec, _ := Register()
+
+	factory := NewInstrumentedQueueFactory(rec.Reconcile)
+	rateLimiter := workqueue.DefaultTypedControllerRateLimiter[reconcile.Request]()
+	queue := factory("test-burst-coalesce", rateLimiter)
+	defer queue.ShutDown()
+
+	// Burst 10 AddAfter calls with the same key and short delay
+	sameReq := reconcile.Request{NamespacedName: types.NamespacedName{Namespace: "ns", Name: "burst-key"}}
+	for i := 0; i < 10; i++ {
+		queue.AddAfter(sameReq, 50*time.Millisecond)
+	}
+
+	// Immediately after burst, depth should be 0 (all delayed)
+	immediateDepth := getQueueDepthGauge(t, rec.Reconcile)
+	if immediateDepth != 0 {
+		t.Errorf("Phase 3: immediately after burst AddAfter, queue_depth = %v, want 0 (items are delayed)", immediateDepth)
+	}
+
+	// Wait for delay to expire
+	readyDepth := pollGaugeUntil(t, rec.Reconcile, 1, 2*time.Second)
+	if readyDepth != 1 {
+		t.Errorf("Phase 3: after delay expires, burst of same key should coalesce to 1 ready item, got queue_depth = %v", readyDepth)
+	}
+
+	// Drain and verify only 1 item is available
+	item, shutdown := queue.Get()
+	if shutdown {
+		t.Fatal("unexpected shutdown")
+	}
+	queue.Done(item)
+
+	if item.NamespacedName != sameReq.NamespacedName {
+		t.Errorf("Phase 3: drained item = %v, want %v", item.NamespacedName, sameReq.NamespacedName)
+	}
+
+	// Queue should now be empty
+	finalDepth := getQueueDepthGauge(t, rec.Reconcile)
+	if finalDepth != 0 {
+		t.Errorf("Phase 3: after draining single coalesced item, queue_depth = %v, want 0", finalDepth)
+	}
+}

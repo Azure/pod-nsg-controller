@@ -171,6 +171,69 @@ func TestLoad_MaxConcurrentReconciles(t *testing.T) {
 	}
 }
 
+// ---------------------------------------------------------------------------
+// TestLoad_MinReconcileInterval: table-driven coverage for MIN_RECONCILE_INTERVAL_MS
+// Phase 3: Pod Event Debouncing
+// ---------------------------------------------------------------------------
+func TestLoad_MinReconcileInterval(t *testing.T) {
+	tests := []struct {
+		name      string
+		envValue  string
+		wantValue int
+		wantErr   bool
+	}{
+		{
+			name:      "explicit value 500",
+			envValue:  "500",
+			wantValue: 500,
+		},
+		{
+			name:      "unset defaults to 2000",
+			envValue:  "",
+			wantValue: 2000,
+		},
+		{
+			name:      "zero disables debounce",
+			envValue:  "0",
+			wantValue: 0,
+		},
+		{
+			name:    "negative is invalid",
+			envValue: "-1",
+			wantErr: true,
+		},
+		{
+			name:    "non-integer is invalid",
+			envValue: "abc",
+			wantErr: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Setenv("AZURE_SUBSCRIPTION_ID", "")
+			t.Setenv("AZURE_RESOURCE_GROUP", "")
+			t.Setenv("CLUSTER_NAME", "cluster-a")
+			t.Setenv("RESYNC_INTERVAL_SECONDS", "")
+			t.Setenv("MIN_RECONCILE_INTERVAL_MS", tt.envValue)
+
+			cfg, err := Load()
+			if tt.wantErr {
+				if err == nil {
+					t.Fatalf("expected error for MIN_RECONCILE_INTERVAL_MS=%q, got nil", tt.envValue)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if cfg.MinReconcileIntervalMs != tt.wantValue {
+				t.Errorf("MinReconcileIntervalMs = %d, want %d", cfg.MinReconcileIntervalMs, tt.wantValue)
+			}
+		})
+	}
+}
+
 func TestLoad_AZURENSGNAMEIgnored(t *testing.T) {
 	t.Setenv("AZURE_SUBSCRIPTION_ID", "sub-123")
 	t.Setenv("AZURE_RESOURCE_GROUP", "rg-test")

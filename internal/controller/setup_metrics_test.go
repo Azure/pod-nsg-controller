@@ -41,3 +41,30 @@ func TestPhase8_SetupWithManager_PreservesInstrumentedQueueFactory(t *testing.T)
 		t.Error("NewInstrumentedQueueFactory returned nil; setup would not wire queue metrics")
 	}
 }
+
+// ---------------------------------------------------------------------------
+// Phase 3: TestPhase3_SetupWithManager_MetricsQueueWithDefaultLimiter
+// Validates that instrumented queue factory remains constructible with the
+// default controller-runtime rate limiter (no custom per-key limiter needed;
+// pod event debounce is handled by AddAfter + debounceRemaining).
+// ---------------------------------------------------------------------------
+func TestPhase3_SetupWithManager_MetricsQueueWithDefaultLimiter(t *testing.T) {
+	metrics.ResetForTesting()
+	defer metrics.ResetForTesting()
+	rec, err := metrics.Register()
+	if err != nil {
+		t.Fatalf("Register() error: %v", err)
+	}
+
+	factory := metrics.NewInstrumentedQueueFactory(rec.Reconcile)
+	if factory == nil {
+		t.Fatal("Phase 3: instrumented queue factory is nil")
+	}
+
+	// The factory should produce a working queue with a nil limiter (uses default).
+	queue := factory("test-phase3", nil)
+	if queue == nil {
+		t.Fatal("Phase 3: instrumented queue factory produced nil queue with default limiter")
+	}
+	defer queue.ShutDown()
+}

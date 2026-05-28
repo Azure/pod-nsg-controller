@@ -1484,3 +1484,179 @@ func TestPhase5_ParallelReconciliation_DifferentKeysRunConcurrently(t *testing.T
 	// Release all blocked goroutines
 	close(blockExec.releaseCh)
 }
+
+// ---------------------------------------------------------------------------
+// Phase 3: TestPhase3_PodBurstDebounce_CoalescesReconcileCycles
+// Deterministic end-to-end burst test: 10 rapid same-key pod IP updates
+// should collapse to 1-2 additional reconcile cycles, preserving final state.
+// Instruments actual Azure GET calls (not executor calls) to prove debounce
+// reduces ARM-read churn even when actions compute to zero.
+// ---------------------------------------------------------------------------
+func TestPhase3_PodBurstDebounce_CoalescesReconcileCycles(t *testing.T) {
+	scheme := integrationScheme(t)
+	zapLog := zaptest.NewLogger(t)
+
+	env := &envtest.Environment{
+		CRDDirectoryPaths: []string{"../../../config/crd"},
+		Scheme:            scheme,
+	}
+
+	cfg, err := env.Start()
+	if err != nil {
+		t.Fatalf("failed to start envtest: %v", err)
+	}
+	defer env.Stop()
+
+	ctrl.SetLogger(zapr.NewLogger(zapLog))
+
+	mgr := testutil.NewEnvtestManager(t, cfg, scheme)
+
+	fakeFactory := fake.NewClientFactory()
+	fakeAzClient := fake.NewClient()
+	fakeFactory.RegisterClient("sub1", fakeAzClient)
+
+	debounceInterval := 500 * time.Millisecond
+	reconciler := &controller.MappingReconciler{
+		Client:               mgr.GetClient(),
+		Scheme:               scheme,
+		ClusterName:          "test-cluster",
+		ResyncInterval:       60 * time.Second, // long to avoid resync pollution
+		MinReconcileInterval: debounceInterval,
+		PrefixSetFactory:     fakeFactory,
+		Executor:             azure.NewExecutor(zapLog, fakeFactory, 2),
+	}
+
+	if err := reconciler.SetupWithManager(mgr); err != nil {
+		t.Fatalf("failed to setup reconciler: %v", err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	go func() {
+		if mgrErr := mgr.Start(ctx); mgrErr != nil {
+			t.Errorf("manager exited with error: %v", mgrErr)
+		}
+	}()
+
+	if !mgr.GetCache().WaitForCacheSync(ctx) {
+		t.Fatal("cache sync failed")
+	}
+
+	k8sClient := mgr.GetClient()
+	ns := &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: "test-burst-debounce"}}
+	if err := k8sClient.Create(ctx, ns); err != nil {
+		t.Fatalf("failed to create namespace: %v", err)
+	}
+
+	mapping := &v1alpha1.PodASGMapping{
+		ObjectMeta: metav1.ObjectMeta{Name: "burst-mapping", Namespace: ns.Name},
+		Spec: v1alpha1.PodASGMappingSpec{
+			Mappings: []v1alpha1.Mapping{
+				{
+					PodSelector: v1alpha1.PodSelector{MatchLabels: map[string]string{"app": "burst"}},
+					ApplicationSecurityGroups: []v1alpha1.ASGReference{
+						{ResourceID: asgResourceID("sub1", "rg1", "asg1")},
+					},
+				},
+			},
+		},
+	}
+	if err := k8sClient.Create(ctx, mapping); err != nil {
+		t.Fatalf("failed to create mapping: %v", err)
+	}
+
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "burst-pod",
+			Namespace: ns.Name,
+			Labels:    map[string]string{"app": "burst"},
+		},
+		Spec: corev1.PodSpec{
+			Containers: []corev1.Container{{Name: "app", Image: "nginx"}},
+		},
+	}
+	if err := k8sClient.Create(ctx, pod); err != nil {
+		t.Fatalf("failed to create pod: %v", err)
+	}
+
+	// Set initial IP and wait for baseline convergence
+	pod.Status.PodIP = "10.0.0.1"
+	if err := k8sClient.Status().Update(ctx, pod); err != nil {
+		t.Fatalf("failed to set initial pod IP: %v", err)
+	}
+
+	ownershipKey := "test-cluster-" + ns.Name + "-burst-mapping"
+	eventually(t, 15*time.Second, 200*time.Millisecond, func() bool {
+		ips, ok := fakeAzClient.PeekPrefixes("sub1", "rg1", "asg1", ownershipKey)
+		if !ok {
+			return false
+		}
+		for _, ip := range ips {
+			if ip == "10.0.0.1/32" {
+				return true
+			}
+		}
+		return false
+	}, "Phase 3: expected initial IP to converge before burst")
+
+	// Reset Azure GET counter after baseline convergence.
+	fakeAzClient.ResetGetCallCount()
+
+	// Apply 10 rapid same-key pod IP updates within ~100ms
+	for i := 2; i <= 11; i++ {
+		pod.Status.PodIP = fmt.Sprintf("10.0.0.%d", i)
+		if err := k8sClient.Status().Update(ctx, pod); err != nil {
+			t.Fatalf("failed to update pod IP to 10.0.0.%d: %v", i, err)
+		}
+		time.Sleep(10 * time.Millisecond) // ~100ms total for 10 updates
+	}
+
+	// Wait for final state to converge using PeekPrefixes (no GET counter inflation).
+	finalIP := "10.0.0.11/32"
+	eventually(t, 15*time.Second, 200*time.Millisecond, func() bool {
+		ips, ok := fakeAzClient.PeekPrefixes("sub1", "rg1", "asg1", ownershipKey)
+		if !ok {
+			return false
+		}
+		for _, ip := range ips {
+			if ip == finalIP {
+				return true
+			}
+		}
+		return false
+	}, "Phase 3: expected final IP 10.0.0.11 to converge after burst")
+
+	// Wait additional time for any trailing reconciles
+	time.Sleep(2 * debounceInterval)
+
+	// Count Azure GET calls during the burst window. Each full reconcile
+	// cycle calls Get once per ASG target, so this directly measures
+	// ARM-read churn (including zero-action reconciles that the executor
+	// counter would miss). PeekPrefixes calls above do not inflate this.
+	burstGets := fakeAzClient.GetCallCount()
+
+	// Assert: at most 2 full reconcile cycles worth of Azure GETs (not 10).
+	// With 1 ASG target, each full cycle = 1 GET, so ≤2 GETs expected.
+	if burstGets > 2 {
+		t.Errorf("Phase 3: expected at most 2 Azure GET calls for 10 rapid pod IP updates (debounce should coalesce), got %d", burstGets)
+	}
+	if burstGets == 0 {
+		t.Error("Phase 3: expected at least 1 Azure GET call to process the burst")
+	}
+
+	// Assert: final Azure state contains the LAST pod IP
+	ips, ok := fakeAzClient.PeekPrefixes("sub1", "rg1", "asg1", ownershipKey)
+	if !ok {
+		t.Fatal("Phase 3: final prefix set not found")
+	}
+	hasLastIP := false
+	for _, ip := range ips {
+		if ip == finalIP {
+			hasLastIP = true
+		}
+	}
+	if !hasLastIP {
+		t.Errorf("Phase 3: final prefix set does not contain last IP %s; got %v", finalIP, ips)
+	}
+}

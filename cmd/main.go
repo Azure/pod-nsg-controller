@@ -143,6 +143,7 @@ func main() {
 		DefaultSubscription:     cfg.SubscriptionID,
 		DefaultResourceGroup:    cfg.ResourceGroup,
 		ResyncInterval:          cfg.ResyncInterval,
+		MinReconcileInterval:    time.Duration(cfg.MinReconcileIntervalMs) * time.Millisecond,
 		MaxConcurrentReconciles: cfg.MaxConcurrentReconciles,
 		AzureReadSem:            make(chan struct{}, cfg.MaxConcurrentAzureReads),
 		PrefixSetFactory:        prefixSetFactory,
@@ -183,6 +184,7 @@ func main() {
 	startupFields := []interface{}{
 		"clusterName", cfg.ClusterName,
 		"resyncIntervalSeconds", int(cfg.ResyncInterval.Seconds()),
+		"minReconcileIntervalMs", cfg.MinReconcileIntervalMs,
 	}
 	if cfg.SubscriptionID != "" {
 		startupFields = append(startupFields, "subscriptionID", cfg.SubscriptionID)

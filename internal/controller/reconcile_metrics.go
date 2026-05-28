@@ -10,6 +10,7 @@ type ReconcileMetricStage string
 
 const (
 	ReconcileStageFinalizerAddEarlyReturn ReconcileMetricStage = "finalizer-add-early-return"
+	ReconcileStageDebounced               ReconcileMetricStage = "debounced"
 	ReconcileStageValidationTerminal      ReconcileMetricStage = "validation-terminal"
 	ReconcileStageSteadyStateSuccess      ReconcileMetricStage = "steady-state-success"
 	ReconcileStageActionMixedFailure      ReconcileMetricStage = "action-mixed-failure"
@@ -36,7 +37,8 @@ const (
 // ClassifyReconcileMetricResult maps a reconcile exit stage to its metric result label.
 func ClassifyReconcileMetricResult(stage ReconcileMetricStage) metrics.ReconcileResult {
 	switch stage {
-	case ReconcileStageFinalizerAddEarlyReturn:
+	case ReconcileStageFinalizerAddEarlyReturn,
+		ReconcileStageDebounced:
 		return metrics.ReconcileResultRequeue
 	case ReconcileStageValidationTerminal,
 		ReconcileStageSteadyStateSuccess,

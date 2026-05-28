@@ -4,6 +4,7 @@ import (
 	"context"
 	"strings"
 	"testing"
+	"time"
 
 	v1alpha1 "github.com/Azure/pod-nsg-controller/api/v1alpha1"
 	"github.com/go-logr/zapr"
@@ -393,7 +394,7 @@ func TestNewPodToMappingEventHandler_ReturnsNonNil(t *testing.T) {
 		Build()
 
 	logger := zapr.NewLogger(zaptest.NewLogger(t))
-	h := NewPodToMappingEventHandler(fakeReader, logger)
+	h := NewPodToMappingEventHandler(fakeReader, logger, 0)
 	if h == nil {
 		t.Error("NewPodToMappingEventHandler returned nil, expected a valid handler.EventHandler")
 	}
@@ -421,7 +422,7 @@ func TestPodToMappingEventHandler_EnqueueLifecycleEvents(t *testing.T) {
 		Build()
 
 	logger := zapr.NewLogger(zaptest.NewLogger(t))
-	handler, ok := NewPodToMappingEventHandler(fakeReader, logger).(*PodToMappingEventHandler)
+	handler, ok := NewPodToMappingEventHandler(fakeReader, logger, 0).(*PodToMappingEventHandler)
 	if !ok {
 		t.Fatal("expected *PodToMappingEventHandler")
 	}
@@ -498,7 +499,7 @@ func TestPodToMappingEventHandler_EnqueueLifecycleEvents(t *testing.T) {
 func TestPodToMappingEventHandler_ListError_DoesNotEnqueue(t *testing.T) {
 	ctx := context.Background()
 	logger := zapr.NewLogger(zaptest.NewLogger(t))
-	handler, ok := NewPodToMappingEventHandler(failingListReader{}, logger).(*PodToMappingEventHandler)
+	handler, ok := NewPodToMappingEventHandler(failingListReader{}, logger, 0).(*PodToMappingEventHandler)
 	if !ok {
 		t.Fatal("expected *PodToMappingEventHandler")
 	}
@@ -700,6 +701,177 @@ func TestMatchingMappingsForPod_PodWithNoLabels_ReturnsEmpty(t *testing.T) {
 		t.Errorf("expected 0 requests for pod with nil labels, got %d: %+v", len(reqs), reqs)
 	}
 }
+
+// ---------------------------------------------------------------------------
+// Phase 3: TestPodToMappingEventHandler_DebounceEnabled_UsesAddAfter
+// When MinReconcileInterval > 0, all lifecycle events use AddAfter.
+// ---------------------------------------------------------------------------
+func TestPodToMappingEventHandler_DebounceEnabled_UsesAddAfter(t *testing.T) {
+	ctx := context.Background()
+	scheme := podHandlerTestScheme(t)
+	ns := "default"
+
+	mapping := makeMapping(ns, "web-mapping",
+		map[string]string{"app": "web"},
+		handlerASGResourceID("sub1", "rg1", "asg1"))
+
+	fakeReader := fakeclient.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(mapping).
+		Build()
+
+	logger := zapr.NewLogger(zaptest.NewLogger(t))
+	debounceInterval := 2 * time.Second
+	h := NewPodToMappingEventHandler(fakeReader, logger, debounceInterval)
+	handler, ok := h.(*PodToMappingEventHandler)
+	if !ok {
+		t.Fatal("expected *PodToMappingEventHandler")
+	}
+
+	spy := &queueSpy{}
+
+	t.Run("create uses AddAfter", func(t *testing.T) {
+		spy.reset()
+		pod := makePod(ns, "web-pod-1", map[string]string{"app": "web"}, "10.0.0.1")
+		handler.Create(ctx, event.TypedCreateEvent[ctrlclient.Object]{Object: pod}, spy)
+
+		if spy.addAfterCount == 0 {
+			t.Error("Phase 3: Create with debounce enabled should use AddAfter, but got 0 AddAfter calls")
+		}
+		if spy.addCount > 0 {
+			t.Error("Phase 3: Create with debounce enabled should NOT use Add")
+		}
+	})
+
+	t.Run("update uses AddAfter", func(t *testing.T) {
+		spy.reset()
+		oldPod := makePod(ns, "web-pod-1", map[string]string{"app": "web"}, "10.0.0.1")
+		newPod := makePod(ns, "web-pod-1", map[string]string{"app": "web"}, "10.0.0.2")
+		handler.Update(ctx, event.TypedUpdateEvent[ctrlclient.Object]{ObjectOld: oldPod, ObjectNew: newPod}, spy)
+
+		if spy.addAfterCount == 0 {
+			t.Error("Phase 3: Update with debounce enabled should use AddAfter, but got 0 AddAfter calls")
+		}
+		if spy.addCount > 0 {
+			t.Error("Phase 3: Update with debounce enabled should NOT use Add")
+		}
+	})
+
+	t.Run("delete uses AddAfter", func(t *testing.T) {
+		spy.reset()
+		pod := makePod(ns, "web-pod-1", map[string]string{"app": "web"}, "10.0.0.1")
+		handler.Delete(ctx, event.TypedDeleteEvent[ctrlclient.Object]{Object: pod}, spy)
+
+		if spy.addAfterCount == 0 {
+			t.Error("Phase 3: Delete with debounce enabled should use AddAfter, but got 0 AddAfter calls")
+		}
+		if spy.addCount > 0 {
+			t.Error("Phase 3: Delete with debounce enabled should NOT use Add")
+		}
+	})
+}
+
+// ---------------------------------------------------------------------------
+// Phase 3: TestPodToMappingEventHandler_DebounceDisabled_UsesAdd
+// When MinReconcileInterval == 0, all lifecycle events use plain Add.
+// ---------------------------------------------------------------------------
+func TestPodToMappingEventHandler_DebounceDisabled_UsesAdd(t *testing.T) {
+	ctx := context.Background()
+	scheme := podHandlerTestScheme(t)
+	ns := "default"
+
+	mapping := makeMapping(ns, "web-mapping",
+		map[string]string{"app": "web"},
+		handlerASGResourceID("sub1", "rg1", "asg1"))
+
+	fakeReader := fakeclient.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(mapping).
+		Build()
+
+	logger := zapr.NewLogger(zaptest.NewLogger(t))
+	h := NewPodToMappingEventHandler(fakeReader, logger, 0) // debounce disabled
+	handler, ok := h.(*PodToMappingEventHandler)
+	if !ok {
+		t.Fatal("expected *PodToMappingEventHandler")
+	}
+
+	spy := &queueSpy{}
+
+	t.Run("create uses Add", func(t *testing.T) {
+		spy.reset()
+		pod := makePod(ns, "web-pod-1", map[string]string{"app": "web"}, "10.0.0.1")
+		handler.Create(ctx, event.TypedCreateEvent[ctrlclient.Object]{Object: pod}, spy)
+
+		if spy.addCount == 0 {
+			t.Error("Phase 3: Create with debounce disabled should use Add, but got 0 Add calls")
+		}
+		if spy.addAfterCount > 0 {
+			t.Error("Phase 3: Create with debounce disabled should NOT use AddAfter")
+		}
+	})
+
+	t.Run("update uses Add", func(t *testing.T) {
+		spy.reset()
+		oldPod := makePod(ns, "web-pod-1", map[string]string{"app": "web"}, "10.0.0.1")
+		newPod := makePod(ns, "web-pod-1", map[string]string{"app": "web"}, "10.0.0.2")
+		handler.Update(ctx, event.TypedUpdateEvent[ctrlclient.Object]{ObjectOld: oldPod, ObjectNew: newPod}, spy)
+
+		if spy.addCount == 0 {
+			t.Error("Phase 3: Update with debounce disabled should use Add, but got 0 Add calls")
+		}
+		if spy.addAfterCount > 0 {
+			t.Error("Phase 3: Update with debounce disabled should NOT use AddAfter")
+		}
+	})
+
+	t.Run("delete uses Add", func(t *testing.T) {
+		spy.reset()
+		pod := makePod(ns, "web-pod-1", map[string]string{"app": "web"}, "10.0.0.1")
+		handler.Delete(ctx, event.TypedDeleteEvent[ctrlclient.Object]{Object: pod}, spy)
+
+		if spy.addCount == 0 {
+			t.Error("Phase 3: Delete with debounce disabled should use Add, but got 0 Add calls")
+		}
+		if spy.addAfterCount > 0 {
+			t.Error("Phase 3: Delete with debounce disabled should NOT use AddAfter")
+		}
+	})
+}
+
+// queueSpy implements workqueue.TypedRateLimitingInterface[reconcile.Request] and
+// records which method (Add vs AddAfter) was called.
+type queueSpy struct {
+	addCount      int
+	addAfterCount int
+	items         []reconcile.Request
+}
+
+func (q *queueSpy) reset() {
+	q.addCount = 0
+	q.addAfterCount = 0
+	q.items = nil
+}
+
+func (q *queueSpy) Add(item reconcile.Request) {
+	q.addCount++
+	q.items = append(q.items, item)
+}
+
+func (q *queueSpy) AddAfter(item reconcile.Request, _ time.Duration) {
+	q.addAfterCount++
+	q.items = append(q.items, item)
+}
+
+func (q *queueSpy) AddRateLimited(item reconcile.Request)               {}
+func (q *queueSpy) Forget(item reconcile.Request)                       {}
+func (q *queueSpy) NumRequeues(item reconcile.Request) int              { return 0 }
+func (q *queueSpy) Len() int                                            { return len(q.items) }
+func (q *queueSpy) Get() (reconcile.Request, bool)                      { return reconcile.Request{}, false }
+func (q *queueSpy) Done(item reconcile.Request)                         {}
+func (q *queueSpy) ShutDown()                                           {}
+func (q *queueSpy) ShutDownWithDrain()                                  {}
+func (q *queueSpy) ShuttingDown() bool                                  { return false }
 
 // ---------------------------------------------------------------------------
 // TestMatchingMappingsForPod_CrossNamespaceIsolation
