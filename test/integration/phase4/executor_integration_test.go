@@ -1102,9 +1102,12 @@ func TestIntegration_FullPipeline_SmallDelta_ProducesPatch(t *testing.T) {
 	desired2 := engine.ComputeDesiredState(clusterName, []v1alpha1.PodASGMapping{mapping}, pods2)
 
 	// Build actual from what's in the fake
+	if len(desired2) != 1 {
+		t.Fatalf("expected exactly 1 target in desired2, got %d", len(desired2))
+	}
 	var target engine.ASGTarget
-	for t := range desired2 {
-		target = t
+	for tgt := range desired2 {
+		target = tgt
 	}
 	got1, _ := fakeClient.Get(ctx, sub, rg, asgName, target.PrefixSetName)
 	ips := make(map[string]struct{})
@@ -1184,9 +1187,12 @@ func TestIntegration_FullPipeline_LargeDelta_ProducesUpdate(t *testing.T) {
 
 	desired2 := engine.ComputeDesiredState(clusterName, []v1alpha1.PodASGMapping{mapping}, pods2)
 
+	if len(desired2) != 1 {
+		t.Fatalf("expected exactly 1 target in desired2, got %d", len(desired2))
+	}
 	var target engine.ASGTarget
-	for t := range desired2 {
-		target = t
+	for tgt := range desired2 {
+		target = tgt
 	}
 	got1, _ := fakeClient.Get(ctx, sub, rg, asgName, target.PrefixSetName)
 	ips := make(map[string]struct{})

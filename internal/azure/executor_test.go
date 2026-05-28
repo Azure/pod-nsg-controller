@@ -1642,6 +1642,72 @@ func TestExecutor_PatchPrefixSet(t *testing.T) {
 	}
 }
 
+// TestExecutor_PatchPrefixSet_NilCurrentTreatedAsNotFound verifies that when
+// GetWithETag returns (nil, "", nil) — a violated client contract — the patch
+// path treats it as not-found and recomputes to CreatePrefixSet.
+func TestExecutor_PatchPrefixSet_NilCurrentTreatedAsNotFound(t *testing.T) {
+	log := zaptest.NewLogger(t)
+
+	// Client that returns (nil, "", nil) on GetWithETag to simulate the
+	// violated contract. After the recompute fallback to Create, Put succeeds.
+	client := &nilGetWithETagClient{store: make(map[string][]string)}
+	factory := newStubFactory()
+	factory.Register("sub1", client)
+
+	executor := NewExecutor(log, factory, 1)
+	actions := []engine.Action{
+		{
+			Kind: engine.PatchPrefixSet,
+			Target: engine.ASGTarget{
+				SubscriptionID: "sub1",
+				ResourceGroup:  "rg1",
+				ASGName:        "asg1",
+				PrefixSetName:  "ps1",
+			},
+			DesiredIPs: []string{"10.0.0.1/32", "10.0.0.2/32"},
+			AddIPs:     []string{"10.0.0.2/32"},
+			RemoveIPs:  []string{"10.0.0.5/32"},
+		},
+	}
+
+	results := executor.Execute(context.Background(), actions)
+	if len(results) != 1 {
+		t.Fatalf("expected 1 result, got %d", len(results))
+	}
+	if !results[0].Success {
+		t.Fatalf("expected action to succeed via not-found recompute, got error: %v", results[0].Err)
+	}
+	// The recompute should have fallen back to CreatePrefixSet.
+	if results[0].FinalActionKind != engine.CreatePrefixSet {
+		t.Errorf("expected final action kind CreatePrefixSet, got %s", results[0].FinalActionKind)
+	}
+}
+
+// nilGetWithETagClient returns (nil, "", nil) from GetWithETag to simulate
+// a client contract violation. Get returns ErrNotFound. Put always succeeds.
+type nilGetWithETagClient struct {
+	store map[string][]string
+}
+
+func (c *nilGetWithETagClient) Get(_ context.Context, sub, rg, asg, ps string) (*AddressPrefixSet, error) {
+	return nil, ErrNotFound
+}
+func (c *nilGetWithETagClient) GetWithETag(_ context.Context, _, _, _, _ string) (*AddressPrefixSet, string, error) {
+	return nil, "", nil // violated contract: no error, no resource
+}
+func (c *nilGetWithETagClient) Put(_ context.Context, sub, rg, asg, ps string, ips []string) error {
+	c.store[stubKey(sub, rg, asg, ps)] = ips
+	return nil
+}
+func (c *nilGetWithETagClient) PutWithIfMatch(_ context.Context, sub, rg, asg, ps string, ips []string, _ string) error {
+	c.store[stubKey(sub, rg, asg, ps)] = ips
+	return nil
+}
+func (c *nilGetWithETagClient) Delete(_ context.Context, _, _, _, _ string) error { return nil }
+func (c *nilGetWithETagClient) List(_ context.Context, _, _, _ string) ([]AddressPrefixSet, error) {
+	return nil, nil
+}
+
 // TestExecutor_PatchETagConflictRetry verifies that a 412 on patch triggers
 // recompute and retry with fresh state.
 func TestExecutor_PatchETagConflictRetry(t *testing.T) {

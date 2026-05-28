@@ -136,6 +136,11 @@ func (e *Executor) executePatchAction(ctx context.Context, client AddressPrefixS
 	if err != nil {
 		return err
 	}
+	if current == nil {
+		// Client returned (nil, _, nil) — treat as not-found so the retry
+		// loop can recompute to a CreatePrefixSet action.
+		return ErrNotFound
+	}
 
 	var currentIPs []string
 	if current.Properties != nil {
