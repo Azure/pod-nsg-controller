@@ -51,6 +51,10 @@ type MappingReconciler struct {
 	MaxConcurrentReconciles int
 	MinReconcileInterval    time.Duration
 
+	// PatchThresholdPercent controls when ComputeDiff emits PatchPrefixSet
+	// instead of UpdatePrefixSet. Wired from config.PatchThresholdPercent.
+	PatchThresholdPercent int
+
 	// AzureReadSem is a shared semaphore that caps total in-flight Azure GET
 	// calls across all concurrent reconciles. Initialised from
 	// config.MaxConcurrentAzureReads in cmd/main.go.
@@ -289,7 +293,7 @@ func (r *MappingReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 	logger.V(1).Info("fetched actual state", "actualTargetCount", len(actual))
 
 	// Compute diff and execute.
-	actions := engine.ComputeDiff(desired, actual)
+	actions := engine.ComputeDiff(desired, actual, r.PatchThresholdPercent)
 
 	// Record CRD resolution metric with the pre-Azure-read duration.
 	if r.MetricsRecorder != nil {
@@ -585,7 +589,7 @@ func actionKindToOperationLabel(kind engine.ActionKind) string {
 	switch kind {
 	case engine.CreatePrefixSet:
 		return "create"
-	case engine.UpdatePrefixSet:
+	case engine.UpdatePrefixSet, engine.PatchPrefixSet:
 		return "update"
 	case engine.DeletePrefixSet:
 		return "delete"
@@ -636,7 +640,7 @@ func (r *MappingReconciler) detectAndRecordDrift(desired map[engine.ASGTarget]en
 	// Build set of targets with correcting actions (Update or Delete).
 	correctedTargets := make(map[engine.ASGTarget]struct{}, len(actions))
 	for _, a := range actions {
-		if a.Kind == engine.UpdatePrefixSet || a.Kind == engine.DeletePrefixSet {
+		if a.Kind == engine.UpdatePrefixSet || a.Kind == engine.PatchPrefixSet || a.Kind == engine.DeletePrefixSet {
 			correctedTargets[a.Target] = struct{}{}
 		}
 	}

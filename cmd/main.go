@@ -100,6 +100,7 @@ func main() {
 		prefixSetFactory,
 		cfg.MaxConcurrentActions,
 		azure.WithExecutorRetryMetrics(rec.ARM),
+		azure.WithPatchThresholdPercent(cfg.PatchThresholdPercent),
 	)
 
 	statusUpdater := controller.NewMappingStatusUpdater(mgr.GetClient(), ctrl.Log.WithName("status-updater"))
@@ -149,10 +150,11 @@ func main() {
 		PrefixSetFactory:        prefixSetFactory,
 		Executor:                executor,
 		StatusUpdater:           statusUpdater,
-		MetricsRecorder:      rec,
-		PodChurnTracker:      podChurnTracker,
-		ConvergenceTracker:   convergenceTracker,
-		InitialTracker:       initialTracker,
+		MetricsRecorder:         rec,
+		PodChurnTracker:         podChurnTracker,
+		ConvergenceTracker:      convergenceTracker,
+		InitialTracker:          initialTracker,
+		PatchThresholdPercent:   cfg.PatchThresholdPercent,
 	}
 
 	if err := reconciler.SetupWithManager(mgr); err != nil {

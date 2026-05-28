@@ -148,3 +148,44 @@ func TestPhase8_CRDResolutionClassification_NoActionsDefaultsUpdate(t *testing.T
 		t.Errorf("ClassifyCRDResolutionOperation(empty) = %q, want %q", op, "update")
 	}
 }
+
+// --- Phase 4: PatchPrefixSet Classification Tests ---
+
+// TestPhase4_CRDResolutionClassification_PatchIsUpdate verifies that
+// PatchPrefixSet is classified as "update" in CRD resolution metrics.
+func TestPhase4_CRDResolutionClassification_PatchIsUpdate(t *testing.T) {
+	actions := []engine.Action{
+		{Kind: engine.PatchPrefixSet},
+	}
+	op := ClassifyCRDResolutionOperation(actions)
+	if op != "update" {
+		t.Errorf("ClassifyCRDResolutionOperation(PatchPrefixSet) = %q, want %q", op, "update")
+	}
+}
+
+// TestPhase4_CRDResolutionClassification_PatchWithCreateIsUpdate verifies that
+// PatchPrefixSet combined with CreatePrefixSet is classified as "update".
+func TestPhase4_CRDResolutionClassification_PatchWithCreateIsUpdate(t *testing.T) {
+	actions := []engine.Action{
+		{Kind: engine.CreatePrefixSet},
+		{Kind: engine.PatchPrefixSet},
+	}
+	op := ClassifyCRDResolutionOperation(actions)
+	if op != "update" {
+		t.Errorf("ClassifyCRDResolutionOperation(create+patch) = %q, want %q", op, "update")
+	}
+}
+
+// TestPhase4_CRDResolutionClassification_PatchOnlyNeverProducesUnknown verifies
+// that PatchPrefixSet never produces an "unknown" label (regression guard).
+func TestPhase4_CRDResolutionClassification_PatchOnlyNeverProducesUnknown(t *testing.T) {
+	actions := []engine.Action{
+		{Kind: engine.PatchPrefixSet},
+		{Kind: engine.PatchPrefixSet},
+	}
+	op := ClassifyCRDResolutionOperation(actions)
+	validLabels := map[string]bool{"add": true, "update": true, "delete": true}
+	if !validLabels[op] {
+		t.Errorf("ClassifyCRDResolutionOperation(patches-only) = %q, want one of add|update|delete", op)
+	}
+}

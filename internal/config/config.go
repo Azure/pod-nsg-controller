@@ -48,6 +48,12 @@ type Config struct {
 
 	// MinReconcileIntervalMs is the minimum interval between reconciles for the same key (default: 2000, 0 disables).
 	MinReconcileIntervalMs int
+
+	// PatchThresholdPercent controls when ComputeDiff emits PatchPrefixSet vs
+	// UpdatePrefixSet. When the delta (added + removed IPs) as a percentage of
+	// the set size is at or below this threshold, a patch is used. Valid range:
+	// 1..100 (default: 50).
+	PatchThresholdPercent int
 }
 
 // Load reads configuration from environment variables and validates required fields.
@@ -146,6 +152,21 @@ func Load() (*Config, error) {
 			return nil, fmt.Errorf("MIN_RECONCILE_INTERVAL_MS must be >= 0, got %d", val)
 		}
 		cfg.MinReconcileIntervalMs = val
+	}
+
+	// Parse patch threshold percent.
+	ptpStr := os.Getenv("POD_NSG_PATCH_THRESHOLD_PERCENT")
+	if ptpStr == "" {
+		cfg.PatchThresholdPercent = 50
+	} else {
+		val, err := strconv.Atoi(ptpStr)
+		if err != nil {
+			return nil, errors.Wrap(err, "POD_NSG_PATCH_THRESHOLD_PERCENT must be a valid integer")
+		}
+		if val < 1 || val > 100 {
+			return nil, fmt.Errorf("POD_NSG_PATCH_THRESHOLD_PERCENT must be between 1 and 100, got %d", val)
+		}
+		cfg.PatchThresholdPercent = val
 	}
 
 	if err := cfg.Validate(); err != nil {

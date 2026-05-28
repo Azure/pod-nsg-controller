@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"sort"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -73,6 +74,22 @@ func (s *stubClient) Delete(ctx context.Context, subscriptionID, resourceGroup, 
 
 func (s *stubClient) List(ctx context.Context, subscriptionID, resourceGroup, asgName string) ([]AddressPrefixSet, error) {
 	return nil, nil
+}
+
+func (s *stubClient) GetWithETag(ctx context.Context, subscriptionID, resourceGroup, asgName, prefixSetName string) (*AddressPrefixSet, string, error) {
+	result, err := s.Get(ctx, subscriptionID, resourceGroup, asgName, prefixSetName)
+	if err != nil {
+		return nil, "", err
+	}
+	etag := ""
+	if result.Etag != nil {
+		etag = *result.Etag
+	}
+	return result, etag, nil
+}
+
+func (s *stubClient) PutWithIfMatch(ctx context.Context, subscriptionID, resourceGroup, asgName, prefixSetName string, ips []string, etag string) error {
+	return s.Put(ctx, subscriptionID, resourceGroup, asgName, prefixSetName, ips)
 }
 
 // stubFactory routes subscriptionID -> AddressPrefixSetAPI
@@ -530,6 +547,14 @@ func (c *concurrencyTrackingClient) List(ctx context.Context, subscriptionID, re
 	return c.inner.List(ctx, subscriptionID, resourceGroup, asgName)
 }
 
+func (c *concurrencyTrackingClient) GetWithETag(ctx context.Context, subscriptionID, resourceGroup, asgName, prefixSetName string) (*AddressPrefixSet, string, error) {
+	return c.inner.GetWithETag(ctx, subscriptionID, resourceGroup, asgName, prefixSetName)
+}
+
+func (c *concurrencyTrackingClient) PutWithIfMatch(ctx context.Context, subscriptionID, resourceGroup, asgName, prefixSetName string, ips []string, etag string) error {
+	return c.inner.PutWithIfMatch(ctx, subscriptionID, resourceGroup, asgName, prefixSetName, ips, etag)
+}
+
 // --- T4.8: One action fails, others succeed ---
 func TestPhase4_T48_OneActionFailsOthersSucceed(t *testing.T) {
 	log := zaptest.NewLogger(t)
@@ -783,6 +808,9 @@ type blockingClient struct {
 func (b *blockingClient) Get(_ context.Context, _, _, _, _ string) (*AddressPrefixSet, error) {
 	return nil, ErrNotFound
 }
+func (b *blockingClient) GetWithETag(_ context.Context, _, _, _, _ string) (*AddressPrefixSet, string, error) {
+	return nil, "", ErrNotFound
+}
 func (b *blockingClient) Put(ctx context.Context, _, _, _, _ string, _ []string) error {
 	select {
 	case <-b.blockCh:
@@ -790,6 +818,9 @@ func (b *blockingClient) Put(ctx context.Context, _, _, _, _ string, _ []string)
 	case <-ctx.Done():
 		return ctx.Err()
 	}
+}
+func (b *blockingClient) PutWithIfMatch(ctx context.Context, _, _, _, _ string, _ []string, _ string) error {
+	return b.Put(ctx, "", "", "", "", nil)
 }
 func (b *blockingClient) Delete(_ context.Context, _, _, _, _ string) error { return nil }
 func (b *blockingClient) List(_ context.Context, _, _, _ string) ([]AddressPrefixSet, error) {
@@ -861,6 +892,20 @@ func (a *always412Client) Get(_ context.Context, _, _, _, prefixSetName string) 
 func (a *always412Client) Put(_ context.Context, _, _, _, _ string, _ []string) error {
 	return &ARMStatusError{StatusCode: 412, ARMCode: "PreconditionFailed", Message: "always conflict"}
 }
+func (a *always412Client) PutWithIfMatch(_ context.Context, _, _, _, _ string, _ []string, _ string) error {
+	return &ARMStatusError{StatusCode: 412, ARMCode: "PreconditionFailed", Message: "always conflict"}
+}
+func (a *always412Client) GetWithETag(_ context.Context, _, _, _, prefixSetName string) (*AddressPrefixSet, string, error) {
+	name := prefixSetName
+	etag := `"etag-existing"`
+	return &AddressPrefixSet{
+		Name: &name,
+		Etag: &etag,
+		Properties: &AddressPrefixSetProperties{
+			AddressPrefixes: []string{"10.0.0.0/32"},
+		},
+	}, etag, nil
+}
 func (a *always412Client) Delete(_ context.Context, _, _, _, _ string) error { return nil }
 func (a *always412Client) List(_ context.Context, _, _, _ string) ([]AddressPrefixSet, error) {
 	return nil, nil
@@ -912,6 +957,30 @@ func (c *deleteRetryClient) List(_ context.Context, _, _, _ string) ([]AddressPr
 	return nil, nil
 }
 
+func (c *deleteRetryClient) GetWithETag(_ context.Context, _, _, _, prefixSetName string) (*AddressPrefixSet, string, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if !c.exists {
+		return nil, "", ErrNotFound
+	}
+	name := prefixSetName
+	etag := `"etag-existing"`
+	return &AddressPrefixSet{
+		Name: &name,
+		Etag: &etag,
+		Properties: &AddressPrefixSetProperties{
+			AddressPrefixes: []string{"10.0.0.1/32"},
+		},
+	}, etag, nil
+}
+
+func (c *deleteRetryClient) PutWithIfMatch(_ context.Context, _, _, _, _ string, _ []string, _ string) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.putCalls++
+	return nil
+}
+
 type noOpAfterConflictClient struct {
 	mu         sync.Mutex
 	putCalls   int
@@ -949,8 +1018,34 @@ func (c *noOpAfterConflictClient) List(_ context.Context, _, _, _ string) ([]Add
 	return nil, nil
 }
 
+func (c *noOpAfterConflictClient) GetWithETag(_ context.Context, _, _, _, prefixSetName string) (*AddressPrefixSet, string, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	name := prefixSetName
+	etag := `"etag-updated"`
+	ips := append([]string(nil), c.desiredIPs...)
+	return &AddressPrefixSet{
+		Name: &name,
+		Etag: &etag,
+		Properties: &AddressPrefixSetProperties{
+			AddressPrefixes: ips,
+		},
+	}, etag, nil
+}
+
+func (c *noOpAfterConflictClient) PutWithIfMatch(_ context.Context, _, _, _, _ string, _ []string, _ string) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.putCalls++
+	if c.putCalls == 1 {
+		return &ARMStatusError{StatusCode: 412, ARMCode: "PreconditionFailed", Message: "etag mismatch"}
+	}
+	return fmt.Errorf("unexpected second PUT after recompute no-op")
+}
+
 // --- T4.Recompute: recomputeSingleTargetActionViaDiff uses engine.ComputeDiff ---
 func TestPhase4_Executor_RecomputeSingleTargetActionViaDiff_UsesComputeDiff(t *testing.T) {
+	helperExec := &Executor{patchThresholdPercent: engine.DefaultPatchThresholdPercent}
 	// Test that recompute delegates to engine.ComputeDiff for proper diff-based retry
 	action := engine.Action{
 		Kind: engine.UpdatePrefixSet,
@@ -974,7 +1069,7 @@ func TestPhase4_Executor_RecomputeSingleTargetActionViaDiff_UsesComputeDiff(t *t
 		},
 	}
 
-	next, done, err := recomputeSingleTargetActionViaDiff(action, current, nil)
+	next, done, err := helperExec.recomputeSingleTargetActionViaDiff(action, current, nil)
 	if err != nil {
 		t.Fatalf("recompute returned unexpected error: %v", err)
 	}
@@ -986,8 +1081,8 @@ func TestPhase4_Executor_RecomputeSingleTargetActionViaDiff_UsesComputeDiff(t *t
 	}
 
 	// The recomputed action should have the full desired IPs (sorted)
-	if next.Kind != engine.UpdatePrefixSet {
-		t.Errorf("expected UpdatePrefixSet, got %s", next.Kind)
+	if next.Kind != engine.UpdatePrefixSet && next.Kind != engine.PatchPrefixSet {
+		t.Errorf("expected UpdatePrefixSet or PatchPrefixSet, got %s", next.Kind)
 	}
 	if len(next.DesiredIPs) != 2 {
 		t.Errorf("expected 2 desired IPs, got %d: %v", len(next.DesiredIPs), next.DesiredIPs)
@@ -1001,7 +1096,7 @@ func TestPhase4_Executor_RecomputeSingleTargetActionViaDiff_UsesComputeDiff(t *t
 			AddressPrefixes: []string{"10.0.0.1/32", "10.0.0.2/32"},
 		},
 	}
-	_, doneMatch, errMatch := recomputeSingleTargetActionViaDiff(action, currentMatching, nil)
+	_, doneMatch, errMatch := helperExec.recomputeSingleTargetActionViaDiff(action, currentMatching, nil)
 	if errMatch != nil {
 		t.Fatalf("recompute on matching state returned error: %v", errMatch)
 	}
@@ -1010,7 +1105,7 @@ func TestPhase4_Executor_RecomputeSingleTargetActionViaDiff_UsesComputeDiff(t *t
 	}
 
 	// Test: when Get returns ErrNotFound, recompute should return CreatePrefixSet
-	nextCreate, doneCreate, errCreate := recomputeSingleTargetActionViaDiff(action, nil, ErrNotFound)
+	nextCreate, doneCreate, errCreate := helperExec.recomputeSingleTargetActionViaDiff(action, nil, ErrNotFound)
 	if errCreate != nil {
 		t.Fatalf("recompute with ErrNotFound returned error: %v", errCreate)
 	}
@@ -1029,6 +1124,7 @@ func TestPhase4_Executor_RecomputeSingleTargetActionViaDiff_UsesComputeDiff(t *t
 // recomputed after a 412 retry still produces a DeletePrefixSet action
 // (not an UpdatePrefixSet) when the resource still exists.
 func TestDeleteActionRecomputePreservesKind(t *testing.T) {
+	helperExec := &Executor{patchThresholdPercent: engine.DefaultPatchThresholdPercent}
 	action := engine.Action{
 		Kind: engine.DeletePrefixSet,
 		Target: engine.ASGTarget{
@@ -1047,7 +1143,7 @@ func TestDeleteActionRecomputePreservesKind(t *testing.T) {
 		},
 	}
 
-	next, done, err := recomputeSingleTargetActionViaDiff(action, current, nil)
+	next, done, err := helperExec.recomputeSingleTargetActionViaDiff(action, current, nil)
 	if err != nil {
 		t.Fatalf("recompute failed: %v", err)
 	}
@@ -1106,6 +1202,7 @@ func TestPhase4_Executor_Final412LogDoesNotClaimRetry(t *testing.T) {
 }
 
 func TestPhase4_BuildSingleTargetActual_NilCurrentTreatsResourceAsAbsent(t *testing.T) {
+	helperExec := &Executor{patchThresholdPercent: engine.DefaultPatchThresholdPercent}
 	action := engine.Action{
 		Kind: engine.UpdatePrefixSet,
 		Target: engine.ASGTarget{
@@ -1125,7 +1222,7 @@ func TestPhase4_BuildSingleTargetActual_NilCurrentTreatsResourceAsAbsent(t *test
 		t.Fatalf("expected nil current without error to be treated as absent, got %#v", actual)
 	}
 
-	next, done, err := recomputeSingleTargetActionViaDiff(action, nil, nil)
+	next, done, err := helperExec.recomputeSingleTargetActionViaDiff(action, nil, nil)
 	if err != nil {
 		t.Fatalf("recompute returned error: %v", err)
 	}
@@ -1473,4 +1570,260 @@ func (s *selectiveFailClient) Put(_ context.Context, sub, rg, asg, ps string, ip
 func (s *selectiveFailClient) Delete(_ context.Context, _, _, _, _ string) error { return nil }
 func (s *selectiveFailClient) List(_ context.Context, _, _, _ string) ([]AddressPrefixSet, error) {
 	return nil, nil
+}
+func (s *selectiveFailClient) GetWithETag(_ context.Context, sub, rg, asg, ps string) (*AddressPrefixSet, string, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	k := stubKey(sub, rg, asg, ps)
+	ips, ok := s.store[k]
+	if !ok {
+		return nil, "", ErrNotFound
+	}
+	name := ps
+	etag := `"etag-` + k + `"`
+	return &AddressPrefixSet{Name: &name, Etag: &etag, Properties: &AddressPrefixSetProperties{AddressPrefixes: ips}}, etag, nil
+}
+func (s *selectiveFailClient) PutWithIfMatch(_ context.Context, sub, rg, asg, ps string, ips []string, _ string) error {
+	return s.Put(context.Background(), sub, rg, asg, ps, ips)
+}
+
+// --- Phase 4: Incremental Diff and Patch — Executor Tests ---
+
+// TestExecutor_PatchPrefixSet verifies the patch execution path:
+// GET → merge AddIPs/RemoveIPs → PUT with If-Match.
+func TestExecutor_PatchPrefixSet(t *testing.T) {
+	log := zaptest.NewLogger(t)
+	client := newStubClient()
+	factory := newStubFactory()
+	factory.Register("sub1", client)
+
+	// Pre-populate with existing state {A, B, E}
+	client.store[stubKey("sub1", "rg1", "asg1", "ps1")] = []string{"10.0.0.1/32", "10.0.0.2/32", "10.0.0.5/32"}
+
+	executor := NewExecutor(log, factory, 1)
+	actions := []engine.Action{
+		{
+			Kind: engine.PatchPrefixSet,
+			Target: engine.ASGTarget{
+				SubscriptionID: "sub1",
+				ResourceGroup:  "rg1",
+				ASGName:        "asg1",
+				PrefixSetName:  "ps1",
+			},
+			DesiredIPs: []string{"10.0.0.1/32", "10.0.0.2/32", "10.0.0.3/32", "10.0.0.4/32"},
+			AddIPs:     []string{"10.0.0.3/32", "10.0.0.4/32"},
+			RemoveIPs:  []string{"10.0.0.5/32"},
+		},
+	}
+
+	results := executor.Execute(context.Background(), actions)
+	if len(results) != 1 {
+		t.Fatalf("expected 1 result, got %d", len(results))
+	}
+	if !results[0].Success {
+		t.Fatalf("TestExecutor_PatchPrefixSet: expected action to succeed, got error: %v", results[0].Err)
+	}
+
+	// Verify the resulting state is {A, B, C, D} — E removed, C and D added
+	got, err := client.Get(context.Background(), "sub1", "rg1", "asg1", "ps1")
+	if err != nil {
+		t.Fatalf("Get after patch: %v", err)
+	}
+	wantIPs := []string{"10.0.0.1/32", "10.0.0.2/32", "10.0.0.3/32", "10.0.0.4/32"}
+	gotIPs := got.Properties.AddressPrefixes
+	sort.Strings(gotIPs)
+	if len(gotIPs) != len(wantIPs) {
+		t.Fatalf("expected %d IPs, got %d: %v", len(wantIPs), len(gotIPs), gotIPs)
+	}
+	for i, ip := range gotIPs {
+		if ip != wantIPs[i] {
+			t.Errorf("IP[%d] = %q, want %q", i, ip, wantIPs[i])
+		}
+	}
+}
+
+// TestExecutor_PatchPrefixSet_NilCurrentTreatedAsNotFound verifies that when
+// GetWithETag returns (nil, "", nil) — a violated client contract — the patch
+// path treats it as not-found and recomputes to CreatePrefixSet.
+func TestExecutor_PatchPrefixSet_NilCurrentTreatedAsNotFound(t *testing.T) {
+	log := zaptest.NewLogger(t)
+
+	// Client that returns (nil, "", nil) on GetWithETag to simulate the
+	// violated contract. After the recompute fallback to Create, Put succeeds.
+	client := &nilGetWithETagClient{store: make(map[string][]string)}
+	factory := newStubFactory()
+	factory.Register("sub1", client)
+
+	executor := NewExecutor(log, factory, 1)
+	actions := []engine.Action{
+		{
+			Kind: engine.PatchPrefixSet,
+			Target: engine.ASGTarget{
+				SubscriptionID: "sub1",
+				ResourceGroup:  "rg1",
+				ASGName:        "asg1",
+				PrefixSetName:  "ps1",
+			},
+			DesiredIPs: []string{"10.0.0.1/32", "10.0.0.2/32"},
+			AddIPs:     []string{"10.0.0.2/32"},
+			RemoveIPs:  []string{"10.0.0.5/32"},
+		},
+	}
+
+	results := executor.Execute(context.Background(), actions)
+	if len(results) != 1 {
+		t.Fatalf("expected 1 result, got %d", len(results))
+	}
+	if !results[0].Success {
+		t.Fatalf("expected action to succeed via not-found recompute, got error: %v", results[0].Err)
+	}
+	// The recompute should have fallen back to CreatePrefixSet.
+	if results[0].FinalActionKind != engine.CreatePrefixSet {
+		t.Errorf("expected final action kind CreatePrefixSet, got %s", results[0].FinalActionKind)
+	}
+}
+
+// nilGetWithETagClient returns (nil, "", nil) from GetWithETag to simulate
+// a client contract violation. Get returns ErrNotFound. Put always succeeds.
+type nilGetWithETagClient struct {
+	store map[string][]string
+}
+
+func (c *nilGetWithETagClient) Get(_ context.Context, sub, rg, asg, ps string) (*AddressPrefixSet, error) {
+	return nil, ErrNotFound
+}
+func (c *nilGetWithETagClient) GetWithETag(_ context.Context, _, _, _, _ string) (*AddressPrefixSet, string, error) {
+	return nil, "", nil // violated contract: no error, no resource
+}
+func (c *nilGetWithETagClient) Put(_ context.Context, sub, rg, asg, ps string, ips []string) error {
+	c.store[stubKey(sub, rg, asg, ps)] = ips
+	return nil
+}
+func (c *nilGetWithETagClient) PutWithIfMatch(_ context.Context, sub, rg, asg, ps string, ips []string, _ string) error {
+	c.store[stubKey(sub, rg, asg, ps)] = ips
+	return nil
+}
+func (c *nilGetWithETagClient) Delete(_ context.Context, _, _, _, _ string) error { return nil }
+func (c *nilGetWithETagClient) List(_ context.Context, _, _, _ string) ([]AddressPrefixSet, error) {
+	return nil, nil
+}
+
+// TestExecutor_PatchETagConflictRetry verifies that a 412 on patch triggers
+// recompute and retry with fresh state.
+func TestExecutor_PatchETagConflictRetry(t *testing.T) {
+	log := zaptest.NewLogger(t)
+	client := newStubClient()
+	client.fail412Count = 1 // first PUT returns 412, second succeeds
+	factory := newStubFactory()
+	factory.Register("sub1", client)
+
+	// Pre-populate
+	client.store[stubKey("sub1", "rg1", "asg1", "ps1")] = []string{"10.0.0.1/32", "10.0.0.2/32"}
+
+	executor := NewExecutor(log, factory, 1)
+	actions := []engine.Action{
+		{
+			Kind: engine.PatchPrefixSet,
+			Target: engine.ASGTarget{
+				SubscriptionID: "sub1",
+				ResourceGroup:  "rg1",
+				ASGName:        "asg1",
+				PrefixSetName:  "ps1",
+			},
+			DesiredIPs: []string{"10.0.0.1/32", "10.0.0.2/32", "10.0.0.3/32"},
+			AddIPs:     []string{"10.0.0.3/32"},
+			RemoveIPs:  []string{},
+		},
+	}
+
+	results := executor.Execute(context.Background(), actions)
+	if len(results) != 1 {
+		t.Fatalf("expected 1 result, got %d", len(results))
+	}
+	if !results[0].Success {
+		t.Fatalf("TestExecutor_PatchETagConflictRetry: expected retry to succeed, got error: %v", results[0].Err)
+	}
+}
+
+// TestExecutor_PatchGetNotFound_RecomputeToCreateOrNoOp verifies that when
+// a PatchPrefixSet target disappears between diff and execute, the executor
+// recomputes to create/update/no-op instead of terminal failure.
+func TestExecutor_PatchGetNotFound_RecomputeToCreateOrNoOp(t *testing.T) {
+	log := zaptest.NewLogger(t)
+
+	t.Run("not_found_recomputes_to_create", func(t *testing.T) {
+		// Client returns ErrNotFound for Get (resource disappeared)
+		client := newStubClient()
+		// Don't pre-populate — Get will return ErrNotFound
+		factory := newStubFactory()
+		factory.Register("sub1", client)
+
+		executor := NewExecutor(log, factory, 1)
+		actions := []engine.Action{
+			{
+				Kind: engine.PatchPrefixSet,
+				Target: engine.ASGTarget{
+					SubscriptionID: "sub1",
+					ResourceGroup:  "rg1",
+					ASGName:        "asg1",
+					PrefixSetName:  "ps1",
+				},
+				DesiredIPs: []string{"10.0.0.1/32", "10.0.0.2/32"},
+				AddIPs:     []string{"10.0.0.2/32"},
+				RemoveIPs:  []string{},
+			},
+		}
+
+		results := executor.Execute(context.Background(), actions)
+		if len(results) != 1 {
+			t.Fatalf("expected 1 result, got %d", len(results))
+		}
+		// Should succeed by recomputing to a create
+		if !results[0].Success {
+			t.Errorf("expected success after recompute to create, got error: %v", results[0].Err)
+		}
+	})
+
+	t.Run("not_found_with_no_desired_is_noop", func(t *testing.T) {
+		// PatchPrefixSet with empty desired IPs + target not found = no-op
+		client := newStubClient()
+		factory := newStubFactory()
+		factory.Register("sub1", client)
+
+		executor := NewExecutor(log, factory, 1)
+		actions := []engine.Action{
+			{
+				Kind: engine.PatchPrefixSet,
+				Target: engine.ASGTarget{
+					SubscriptionID: "sub1",
+					ResourceGroup:  "rg1",
+					ASGName:        "asg1",
+					PrefixSetName:  "ps1",
+				},
+				DesiredIPs: []string{},
+				AddIPs:     []string{},
+				RemoveIPs:  []string{"10.0.0.1/32"},
+			},
+		}
+
+		results := executor.Execute(context.Background(), actions)
+		if len(results) != 1 {
+			t.Fatalf("expected 1 result, got %d", len(results))
+		}
+		// With empty desired and resource not found, should be no-op success
+		if !results[0].Success {
+			t.Errorf("expected no-op success, got error: %v", results[0].Err)
+		}
+		// Verify no PUT was issued — the executor must not create an empty prefix set.
+		client.mu.Lock()
+		puts := client.putCalls
+		storeLen := len(client.store)
+		client.mu.Unlock()
+		if puts != 0 {
+			t.Errorf("expected 0 PUT calls (no-op), got %d", puts)
+		}
+		if storeLen != 0 {
+			t.Errorf("expected empty store (no prefix set created), got %d entries", storeLen)
+		}
+	})
 }

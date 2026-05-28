@@ -1002,3 +1002,110 @@ func TestPhase8_ReconcilerWiring_InitialReconcile_FallbackAfterStartupFailure(t 
 		t.Error("tracker should be complete after successful reconcile via fallback")
 	}
 }
+
+// --- Phase 4: PatchPrefixSet metrics integration ---
+
+// TestPhase4_ReconcilerWiring_PatchActionEmitsUpdateLabel verifies that
+// PatchPrefixSet actions emit only valid operation labels (add|update|delete),
+// mapping PatchPrefixSet to "update".
+func TestPhase4_ReconcilerWiring_PatchActionEmitsUpdateLabel(t *testing.T) {
+	metrics.ResetForTesting()
+	defer metrics.ResetForTesting()
+
+	reg := prometheus.NewRegistry()
+	rec, err := metrics.RegisterWith(reg)
+	if err != nil {
+		t.Fatalf("RegisterWith failed: %v", err)
+	}
+
+	ctx := context.Background()
+	scheme := testScheme(t)
+	ns := "patch-metrics-ns"
+
+	mapping := newTestMapping(ns, "patch-metrics-mapping", []v1alpha1.Mapping{
+		{
+			PodSelector: v1alpha1.PodSelector{
+				MatchLabels: map[string]string{"app": "patch"},
+			},
+			ApplicationSecurityGroups: []v1alpha1.ASGReference{
+				{ResourceID: asgResourceID("sub1", "rg1", "asg-patch")},
+			},
+		},
+	})
+	mapping.Finalizers = []string{CleanupFinalizer}
+
+	pod := newTestPod(ns, "pod-patch", "10.0.0.1", map[string]string{"app": "patch"})
+
+	fakeClient := fakeclient.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(mapping, pod).
+		WithStatusSubresource(mapping).
+		Build()
+
+	fakeFactory := fake.NewClientFactory()
+	fakeAzClient := fake.NewClient()
+	fakeFactory.RegisterClient("sub1", fakeAzClient)
+
+	// Stub executor returns PatchPrefixSet result
+	exec := &stubExecutor{
+		results: []azure.ActionResult{
+			{
+				Action: engine.Action{
+					Kind: engine.PatchPrefixSet,
+					Target: engine.ASGTarget{
+						SubscriptionID: "sub1",
+						ResourceGroup:  "rg1",
+						ASGName:        "asg-patch",
+						PrefixSetName:  "test-cluster-patch-metrics-ns-patch-metrics-mapping",
+					},
+					DesiredIPs: []string{"10.0.0.1/32"},
+					AddIPs:     []string{"10.0.0.1/32"},
+				},
+				Success:         true,
+				FinalActionKind: engine.PatchPrefixSet,
+			},
+		},
+	}
+
+	r := &MappingReconciler{
+		Client:             fakeClient,
+		Scheme:             scheme,
+		ClusterName:        "test-cluster",
+		ResyncInterval:     60 * time.Second,
+		PrefixSetFactory:   fakeFactory,
+		Executor:           exec,
+		StatusUpdater:      NewMappingStatusUpdater(fakeClient, ctrl.Log.WithName("test-status")),
+		MetricsRecorder:    rec,
+		PodChurnTracker:    metrics.NewPodChurnTracker(),
+		ConvergenceTracker: metrics.NewConvergenceTracker(),
+		InitialTracker:     metrics.NewInitialReconcileTracker(time.Now()),
+	}
+
+	_, reconcileErr := r.Reconcile(ctx, ctrl.Request{
+		NamespacedName: types.NamespacedName{Name: "patch-metrics-mapping", Namespace: ns},
+	})
+	if reconcileErr != nil {
+		t.Fatalf("Reconcile failed: %v", reconcileErr)
+	}
+
+	// Verify CRD resolution emits only valid labels
+	mfs, gatherErr := reg.Gather()
+	if gatherErr != nil {
+		t.Fatalf("Gather failed: %v", gatherErr)
+	}
+
+	for _, mf := range mfs {
+		if mf.GetName() == "pod_nsg_controller_crd_resolution_duration_seconds" {
+			for _, m := range mf.GetMetric() {
+				for _, lp := range m.GetLabel() {
+					if lp.GetName() == "operation" {
+						op := lp.GetValue()
+						if op != "add" && op != "update" && op != "delete" {
+							t.Errorf("unexpected CRD resolution operation label %q for PatchPrefixSet (want add|update|delete)", op)
+						}
+					}
+				}
+			}
+		}
+	}
+}

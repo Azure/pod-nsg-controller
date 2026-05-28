@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"sort"
 	"sync"
 	"time"
 
@@ -33,7 +34,7 @@ type executionOutcome struct {
 // armOperation returns the ARM operation for a given action kind.
 func armOperation(kind engine.ActionKind) ARMOperation {
 	switch kind {
-	case engine.CreatePrefixSet, engine.UpdatePrefixSet:
+	case engine.CreatePrefixSet, engine.UpdatePrefixSet, engine.PatchPrefixSet:
 		return ARMOperationPutPrefixSet
 	case engine.DeletePrefixSet:
 		return ARMOperationDeletePrefixSet
@@ -44,11 +45,12 @@ func armOperation(kind engine.ActionKind) ARMOperation {
 
 // Executor runs engine actions against Azure with bounded concurrency and ETag retry.
 type Executor struct {
-	log           *zap.Logger
-	factory       AddressPrefixSetClientFactory
-	maxParallel   int
-	maxRetries    int
-	retryObserver armRetryObserver
+	log                   *zap.Logger
+	factory               AddressPrefixSetClientFactory
+	maxParallel           int
+	maxRetries            int
+	retryObserver         armRetryObserver
+	patchThresholdPercent int
 }
 
 // NewExecutor creates an Executor with the given concurrency bound.
@@ -57,10 +59,11 @@ func NewExecutor(log *zap.Logger, factory AddressPrefixSetClientFactory, maxPara
 		maxParallel = 1
 	}
 	e := &Executor{
-		log:         log,
-		factory:     factory,
-		maxParallel: maxParallel,
-		maxRetries:  3,
+		log:                   log,
+		factory:               factory,
+		maxParallel:           maxParallel,
+		maxRetries:            3,
+		patchThresholdPercent: engine.DefaultPatchThresholdPercent,
 	}
 	for _, opt := range opts {
 		opt(e)
@@ -116,11 +119,56 @@ func (e *Executor) executeAction(ctx context.Context, client AddressPrefixSetAPI
 	switch action.Kind {
 	case engine.CreatePrefixSet, engine.UpdatePrefixSet:
 		return client.Put(ctx, t.SubscriptionID, t.ResourceGroup, t.ASGName, t.PrefixSetName, action.DesiredIPs)
+	case engine.PatchPrefixSet:
+		return e.executePatchAction(ctx, client, action)
 	case engine.DeletePrefixSet:
 		return client.Delete(ctx, t.SubscriptionID, t.ResourceGroup, t.ASGName, t.PrefixSetName)
 	default:
 		return fmt.Errorf("unknown action kind: %s", action.Kind)
 	}
+}
+
+// executePatchAction performs a read-modify-write patch: GET current state,
+// apply add/remove delta, then PUT with If-Match for optimistic concurrency.
+func (e *Executor) executePatchAction(ctx context.Context, client AddressPrefixSetAPI, action engine.Action) error {
+	t := action.Target
+	current, etag, err := client.GetWithETag(ctx, t.SubscriptionID, t.ResourceGroup, t.ASGName, t.PrefixSetName)
+	if err != nil {
+		return err
+	}
+	if current == nil {
+		// Client returned (nil, _, nil) — treat as not-found so the retry
+		// loop can recompute to a CreatePrefixSet action.
+		return ErrNotFound
+	}
+
+	var currentIPs []string
+	if current.Properties != nil {
+		currentIPs = current.Properties.AddressPrefixes
+	}
+
+	merged := applyPatchDelta(currentIPs, action.AddIPs, action.RemoveIPs)
+	return client.PutWithIfMatch(ctx, t.SubscriptionID, t.ResourceGroup, t.ASGName, t.PrefixSetName, merged, etag)
+}
+
+// applyPatchDelta applies add/remove operations to current IPs and returns a sorted deduplicated result.
+func applyPatchDelta(current []string, addIPs, removeIPs []string) []string {
+	set := make(map[string]struct{}, len(current)+len(addIPs))
+	for _, ip := range current {
+		set[ip] = struct{}{}
+	}
+	for _, ip := range removeIPs {
+		delete(set, ip)
+	}
+	for _, ip := range addIPs {
+		set[ip] = struct{}{}
+	}
+	result := make([]string, 0, len(set))
+	for ip := range set {
+		result = append(result, ip)
+	}
+	sort.Strings(result)
+	return result
 }
 
 func (e *Executor) executeWithETagRetry(ctx context.Context, client AddressPrefixSetAPI, action engine.Action) executionOutcome {
@@ -136,6 +184,23 @@ func (e *Executor) executeWithETagRetry(ctx context.Context, client AddressPrefi
 		if err == nil {
 			return executionOutcome{finalActionKind: finalKind}
 		}
+
+		// Patch-specific: if GetWithETag returned ErrNotFound, recompute to create/no-op.
+		if action.Kind == engine.PatchPrefixSet && IsNotFound(err) {
+			next, done, recomputeErr := e.recomputeSingleTargetActionViaDiff(action, nil, ErrNotFound)
+			if recomputeErr != nil {
+				return executionOutcome{err: pkgerrors.Wrap(recomputeErr, "patch recompute after not-found"), finalActionKind: finalKind}
+			}
+			if done {
+				return executionOutcome{noOp: true, finalActionKind: finalKind}
+			}
+			if next != nil {
+				action = *next
+				finalKind = action.Kind
+			}
+			continue
+		}
+
 		if !IsPreconditionFailed(err) {
 			return executionOutcome{err: err, finalActionKind: finalKind}
 		}
@@ -177,7 +242,7 @@ func (e *Executor) executeWithETagRetry(ctx context.Context, client AddressPrefi
 		// with a newer ETag while applying DesiredIPs derived from this slightly
 		// older snapshot. A later reconcile will converge any drift.
 		current, getErr := client.Get(ctx, t.SubscriptionID, t.ResourceGroup, t.ASGName, t.PrefixSetName)
-		next, done, recomputeErr := recomputeSingleTargetActionViaDiff(action, current, getErr)
+		next, done, recomputeErr := e.recomputeSingleTargetActionViaDiff(action, current, getErr)
 		if recomputeErr != nil {
 			return executionOutcome{err: pkgerrors.Wrap(recomputeErr, "recompute after 412"), finalActionKind: finalKind}
 		}
@@ -195,14 +260,14 @@ func (e *Executor) executeWithETagRetry(ctx context.Context, client AddressPrefi
 
 // recomputeSingleTargetActionViaDiff re-GETs the resource and recomputes the diff
 // using engine.ComputeDiff to determine the next action.
-func recomputeSingleTargetActionViaDiff(action engine.Action, current *AddressPrefixSet, getErr error) (next *engine.Action, done bool, err error) {
+func (e *Executor) recomputeSingleTargetActionViaDiff(action engine.Action, current *AddressPrefixSet, getErr error) (next *engine.Action, done bool, err error) {
 	desired := buildSingleTargetDesired(action)
 	actual, err := buildSingleTargetActual(action, current, getErr)
 	if err != nil {
 		return nil, false, pkgerrors.Wrap(err, "building actual state")
 	}
 
-	actions := engine.ComputeDiff(desired, actual)
+	actions := engine.ComputeDiff(desired, actual, e.patchThresholdPercent)
 
 	if len(actions) == 0 {
 		return nil, true, nil
@@ -215,9 +280,13 @@ func recomputeSingleTargetActionViaDiff(action engine.Action, current *AddressPr
 }
 
 // buildSingleTargetDesired builds a single-entry desired map for diff recomputation.
-// For DELETE actions, returns an empty map so ComputeDiff produces DeletePrefixSet.
+// For DELETE actions or PatchPrefixSet with empty DesiredIPs, returns an empty map
+// so ComputeDiff converges to no-op when the resource doesn't exist.
 func buildSingleTargetDesired(action engine.Action) map[engine.ASGTarget]engine.DesiredPrefixSet {
 	if action.Kind == engine.DeletePrefixSet {
+		return map[engine.ASGTarget]engine.DesiredPrefixSet{}
+	}
+	if action.Kind == engine.PatchPrefixSet && len(action.DesiredIPs) == 0 {
 		return map[engine.ASGTarget]engine.DesiredPrefixSet{}
 	}
 	ips := make(map[string]struct{}, len(action.DesiredIPs))

@@ -27,12 +27,15 @@ type ActionKind string
 const (
 	CreatePrefixSet ActionKind = "CreatePrefixSet"
 	UpdatePrefixSet ActionKind = "UpdatePrefixSet"
+	PatchPrefixSet  ActionKind = "PatchPrefixSet"
 	DeletePrefixSet ActionKind = "DeletePrefixSet"
 )
 
-// Action represents a single create/update/delete operation on a prefix set.
+// Action represents a single create/update/delete/patch operation on a prefix set.
 type Action struct {
 	Kind       ActionKind
 	Target     ASGTarget
 	DesiredIPs []string // sorted; nil for delete
+	AddIPs     []string // patch-only: IPs to add
+	RemoveIPs  []string // patch-only: IPs to remove
 }

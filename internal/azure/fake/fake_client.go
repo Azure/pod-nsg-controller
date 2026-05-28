@@ -253,6 +253,49 @@ func (c *Client) List(_ context.Context, subscriptionID, resourceGroup, asgName 
 	return result, nil
 }
 
+// GetWithETag returns the resource and its ETag.
+func (c *Client) GetWithETag(ctx context.Context, subscriptionID, resourceGroup, asgName, prefixSetName string) (*azure.AddressPrefixSet, string, error) {
+	result, err := c.Get(ctx, subscriptionID, resourceGroup, asgName, prefixSetName)
+	if err != nil {
+		return nil, "", err
+	}
+	etag := ""
+	if result.Etag != nil {
+		etag = *result.Etag
+	}
+	return result, etag, nil
+}
+
+// PutWithIfMatch validates the provided ETag against stored ETag and returns 412 on mismatch.
+func (c *Client) PutWithIfMatch(_ context.Context, subscriptionID, resourceGroup, asgName, prefixSetName string, ips []string, etag string) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	key := resourceKey(subscriptionID, resourceGroup, asgName, prefixSetName)
+	entry := c.store[key]
+
+	if entry == nil {
+		return azure.ErrNotFound
+	}
+
+	// Validate ETag
+	if entry.ETag != etag {
+		return &azure.ARMStatusError{StatusCode: 412, ARMCode: "PreconditionFailed", Message: "etag mismatch"}
+	}
+
+	// ETag matches — update
+	version := entry.Version + 1
+	ipsCopy := make([]string, len(ips))
+	copy(ipsCopy, ips)
+
+	c.store[key] = &PrefixSetEntry{
+		IPs:     ipsCopy,
+		ETag:    fmt.Sprintf(`"v-%d"`, version),
+		Version: version,
+	}
+	return nil
+}
+
 // ClientFactory is a fake factory that returns pre-configured fake clients per subscription.
 type ClientFactory struct {
 	mu      sync.RWMutex
