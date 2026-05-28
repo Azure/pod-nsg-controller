@@ -585,7 +585,7 @@ func actionKindToOperationLabel(kind engine.ActionKind) string {
 	switch kind {
 	case engine.CreatePrefixSet:
 		return "create"
-	case engine.UpdatePrefixSet:
+	case engine.UpdatePrefixSet, engine.PatchPrefixSet:
 		return "update"
 	case engine.DeletePrefixSet:
 		return "delete"
