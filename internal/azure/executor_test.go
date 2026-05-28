@@ -1745,5 +1745,16 @@ func TestExecutor_PatchGetNotFound_RecomputeToCreateOrNoOp(t *testing.T) {
 		if !results[0].Success {
 			t.Errorf("expected no-op success, got error: %v", results[0].Err)
 		}
+		// Verify no PUT was issued — the executor must not create an empty prefix set.
+		client.mu.Lock()
+		puts := client.putCalls
+		storeLen := len(client.store)
+		client.mu.Unlock()
+		if puts != 0 {
+			t.Errorf("expected 0 PUT calls (no-op), got %d", puts)
+		}
+		if storeLen != 0 {
+			t.Errorf("expected empty store (no prefix set created), got %d entries", storeLen)
+		}
 	})
 }

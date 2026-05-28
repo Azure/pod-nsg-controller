@@ -273,9 +273,13 @@ func recomputeSingleTargetActionViaDiff(action engine.Action, current *AddressPr
 }
 
 // buildSingleTargetDesired builds a single-entry desired map for diff recomputation.
-// For DELETE actions, returns an empty map so ComputeDiff produces DeletePrefixSet.
+// For DELETE actions or PatchPrefixSet with empty DesiredIPs, returns an empty map
+// so ComputeDiff converges to no-op when the resource doesn't exist.
 func buildSingleTargetDesired(action engine.Action) map[engine.ASGTarget]engine.DesiredPrefixSet {
 	if action.Kind == engine.DeletePrefixSet {
+		return map[engine.ASGTarget]engine.DesiredPrefixSet{}
+	}
+	if action.Kind == engine.PatchPrefixSet && len(action.DesiredIPs) == 0 {
 		return map[engine.ASGTarget]engine.DesiredPrefixSet{}
 	}
 	ips := make(map[string]struct{}, len(action.DesiredIPs))
