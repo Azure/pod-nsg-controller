@@ -937,16 +937,11 @@ func TestAddressPrefixSetClient_PutWithIfMatch_UsesProvidedETag(t *testing.T) {
 
 	etag := `"my-etag-123"`
 	err := client.PutWithIfMatch(context.Background(), "sub1", "rg1", "asg1", "ps1", []string{"10.0.0.1/32"}, etag)
-	// The stub returns "not yet implemented" so we expect an error
-	// This test is designed to FAIL until PutWithIfMatch is properly implemented
-	if err == nil {
-		// If it succeeds, verify the ETag was used
-		if receivedIfMatch != etag {
-			t.Errorf("expected If-Match header %q, got %q", etag, receivedIfMatch)
-		}
-	} else {
-		// Expected: stub not implemented yet
-		t.Errorf("PutWithIfMatch returned error (not yet implemented): %v", err)
+	if err != nil {
+		t.Fatalf("PutWithIfMatch returned unexpected error: %v", err)
+	}
+	if receivedIfMatch != etag {
+		t.Errorf("expected If-Match header %q, got %q", etag, receivedIfMatch)
 	}
 }
 
@@ -973,10 +968,10 @@ func TestAddressPrefixSetClient_PutWithIfMatch_StaleETagReturns412(t *testing.T)
 	client := NewAddressPrefixSetClient(log, nil, srv.Client(), WithARMBaseURL(srv.URL))
 
 	err := client.PutWithIfMatch(context.Background(), "sub1", "rg1", "asg1", "ps1", []string{"10.0.0.1/32"}, `"stale"`)
-	// The stub returns "not yet implemented", this test FAILS until Phase 4 is implemented
 	if err == nil {
 		t.Fatal("expected error from PutWithIfMatch with stale ETag")
 	}
-	// When properly implemented, should be IsPreconditionFailed
-	// For now, we accept the "not yet implemented" error as a legitimate failure signal
+	if !IsPreconditionFailed(err) {
+		t.Errorf("expected IsPreconditionFailed error, got: %v", err)
+	}
 }
