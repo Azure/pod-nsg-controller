@@ -30,6 +30,10 @@ type DesiredStateCache struct {
 	keyVersions map[types.NamespacedName]uint64
 	// lifecycleEpoch is a terminal lifecycle fence bumped on Delete; survives entry removal.
 	lifecycleEpoch map[types.NamespacedName]uint64
+	// knownGenerations tracks which generations have had entries committed for a key.
+	knownGenerations map[types.NamespacedName]map[int64]struct{}
+	// latestGeneration tracks the highest generation committed for a key.
+	latestGeneration map[types.NamespacedName]int64
 }
 
 type cacheKey struct {
@@ -52,10 +56,12 @@ type cacheEntry struct {
 // NewDesiredStateCache creates a new desired-state cache for the given cluster.
 func NewDesiredStateCache(clusterName string) *DesiredStateCache {
 	return &DesiredStateCache{
-		clusterName:    clusterName,
-		entries:        make(map[cacheKey]*cacheEntry),
-		keyVersions:    make(map[types.NamespacedName]uint64),
-		lifecycleEpoch: make(map[types.NamespacedName]uint64),
+		clusterName:      clusterName,
+		entries:          make(map[cacheKey]*cacheEntry),
+		keyVersions:      make(map[types.NamespacedName]uint64),
+		lifecycleEpoch:   make(map[types.NamespacedName]uint64),
+		knownGenerations: make(map[types.NamespacedName]map[int64]struct{}),
+		latestGeneration: make(map[types.NamespacedName]int64),
 	}
 }
 
@@ -383,9 +389,10 @@ func (c *DesiredStateCache) OnPodUpdate(mapping *v1alpha1.PodASGMapping, oldPod,
 		}
 		// True cache miss (no entry for any generation): bump version so any
 		// in-flight recompute that captured fences before this event will fail
-		// the CAS check; return false so the caller invalidates (defense-in-depth).
+		// the CAS check; return true (safe no-op) to avoid unnecessary
+		// invalidation churn — the fence advance is sufficient protection.
 		c.keyVersions[nsName]++
-		return false
+		return true
 	}
 
 	c.keyVersions[nsName]++
@@ -587,6 +594,10 @@ func (c *DesiredStateCache) Delete(key types.NamespacedName) {
 			delete(c.entries, k)
 		}
 	}
+
+	// Clear generation-rollover tracking for this key.
+	delete(c.knownGenerations, key)
+	delete(c.latestGeneration, key)
 }
 
 // GetWithVersion returns the cached desired state along with the current
@@ -649,8 +660,31 @@ func (c *DesiredStateCache) SetFromRecomputeIfVersion(
 		return false, currentVersion, currentLifecycleEpoch
 	}
 
+	// Generation-rollover guard: reject commits for generations older than the
+	// latest committed generation. This prevents stale recomputes from leaking
+	// entries for superseded spec versions.
+	if latest, ok := c.latestGeneration[nsName]; ok && mapping.Generation < latest {
+		return false, currentVersion, currentLifecycleEpoch
+	}
+
 	// Fences match — commit using inline logic (avoid double-lock via SetFromRecompute).
 	c.setFromRecomputeLocked(mapping, pods, desired, snapshot, matchedPodsByIndex, hasPendingIPPods)
+
+	// Update generation-rollover tracking and prune older generation entries.
+	if c.knownGenerations[nsName] == nil {
+		c.knownGenerations[nsName] = make(map[int64]struct{})
+	}
+	c.knownGenerations[nsName][mapping.Generation] = struct{}{}
+	if mapping.Generation > c.latestGeneration[nsName] {
+		c.latestGeneration[nsName] = mapping.Generation
+		// Prune entries for older generations of this key.
+		for k := range c.entries {
+			if k.key == nsName && k.generation < mapping.Generation {
+				delete(c.entries, k)
+			}
+		}
+	}
+
 	return true, currentVersion, currentLifecycleEpoch
 }
 
