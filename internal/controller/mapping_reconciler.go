@@ -288,9 +288,42 @@ func (r *MappingReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 					hasPendingIPPodsVal = cached.HasPendingIPPods
 					logger.V(1).Info("cache publish conflict resolved from re-read")
 				} else {
-					// No cache entry available, bounded requeue.
-					logger.V(1).Info("cache publish conflict with no fallback entry, requeueing")
-					return ctrl.Result{RequeueAfter: r.cacheConflictRequeueAfter()}, nil
+					// No cache entry: recompute once with refreshed fences and retry publish.
+					_, retryVer, retryEpoch, _ := r.DesiredStateCache.GetWithVersion(&mapping)
+					if retryCurrent, retryFreshErr := r.mappingStillCurrent(ctx, req.NamespacedName, mapping.UID, mapping.Generation); retryFreshErr != nil || !retryCurrent {
+						logger.V(1).Info("mapping no longer current on conflict retry, requeueing")
+						return ctrl.Result{RequeueAfter: r.cacheConflictRequeueAfter()}, nil
+					}
+					var retryPodList corev1.PodList
+					if err := r.List(ctx, &retryPodList, client.InNamespace(mapping.Namespace)); err != nil {
+						result, retErr, metricStage := r.finalizeSystemError(ctx, req, &mapping, ownershipKey, nil, "list-pods-retry", err, true, logger)
+						r.observeReconcile(req, metricStage, reconcileStart, 0)
+						return result, retErr
+					}
+					matchedPodsByIndex = ComputeMatchedPodsByMapping(mapping.Spec, retryPodList.Items)
+					desired, podSnapshot = engine.ComputeDesiredStateWithSnapshot(r.ClusterName, []v1alpha1.PodASGMapping{mapping}, retryPodList.Items)
+					hasPendingIPPodsVal = hasPendingIPPodsFromList(mapping.Spec, retryPodList.Items)
+
+					retryCommitted, _, _ := r.DesiredStateCache.SetFromRecomputeIfVersion(
+						&mapping, retryPodList.Items, desired, podSnapshot, matchedPodsByIndex, hasPendingIPPodsVal,
+						retryVer, retryEpoch,
+					)
+					if retryCommitted {
+						r.markDesiredStateFullRecompute(req.NamespacedName, mapping.Generation, reconcileStart)
+					} else {
+						// Second attempt also failed; check cache once more.
+						if cached2, ok2 := r.DesiredStateCache.Get(&mapping); ok2 {
+							desired = cached2.Desired
+							podSnapshot = cached2.Snapshot
+							matchedPodsByIndex = cached2.MatchedPodsByIndex
+							hasPendingIPPodsVal = cached2.HasPendingIPPods
+							logger.V(1).Info("cache publish conflict resolved from second re-read")
+						} else {
+							// Still no entry; bounded requeue, skip status/diff/executor.
+							logger.V(1).Info("cache publish conflict persists after retry, requeueing")
+							return ctrl.Result{RequeueAfter: r.cacheConflictRequeueAfter()}, nil
+						}
+					}
 				}
 			} else {
 				r.markDesiredStateFullRecompute(req.NamespacedName, mapping.Generation, reconcileStart)
@@ -299,6 +332,15 @@ func (r *MappingReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 			r.markDesiredStateFullRecompute(req.NamespacedName, mapping.Generation, reconcileStart)
 		}
 		logger.V(1).Info("desired state computed from full recompute")
+	}
+
+	// Defensive post-resolution freshness gate: verify the mapping is still
+	// current before executing status, diff, and executor side effects.
+	if r.DesiredStateCache != nil {
+		if postCurrent, postErr := r.mappingStillCurrent(ctx, req.NamespacedName, mapping.UID, mapping.Generation); postErr != nil || !postCurrent {
+			logger.V(1).Info("mapping no longer current before side effects, requeueing")
+			return ctrl.Result{RequeueAfter: r.cacheConflictRequeueAfter()}, nil
+		}
 	}
 
 	// Observe pod churn from the authoritative snapshot.

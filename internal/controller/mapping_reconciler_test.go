@@ -20,6 +20,7 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
 	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 	fakeclient "sigs.k8s.io/controller-runtime/pkg/client/fake"
 )
 
@@ -3183,4 +3184,145 @@ func TestPhase5_Reconcile_TerminalCleanup_LifecycleFenceBump(t *testing.T) {
 	if epochAfter <= epochBefore {
 		t.Errorf("Phase 5: terminal cleanup must bump lifecycle epoch: before=%d, after=%d", epochBefore, epochAfter)
 	}
+}
+
+// ---------------------------------------------------------------------------
+// TestPhase5_Reconcile_SecondPublishConflict_NoCacheEntry_SkipsStatusDiffExecutor
+// When a CAS publish conflict occurs and no cache entry exists, the reconciler
+// retries once with refreshed fences. If the second attempt also fails (due to
+// continued churn) and no cache entry is available, it must requeue without
+// executing status, diff, or executor side effects.
+// ---------------------------------------------------------------------------
+func TestPhase5_Reconcile_SecondPublishConflict_NoCacheEntry_SkipsStatusDiffExecutor(t *testing.T) {
+	ctx := context.Background()
+	scheme := testScheme(t)
+	ns := "test-ns"
+
+	mapping := newTestMapping(ns, "conflict-mapping-2", []v1alpha1.Mapping{
+		{
+			PodSelector: v1alpha1.PodSelector{
+				MatchLabels: map[string]string{"app": "web"},
+			},
+			ApplicationSecurityGroups: []v1alpha1.ASGReference{
+				{ResourceID: asgResourceID("sub1", "rg1", "asg1")},
+			},
+		},
+	})
+	mapping.Finalizers = []string{CleanupFinalizer}
+	mapping.Generation = 1
+
+	pod := newTestPod(ns, "pod-1", "10.0.0.1", map[string]string{"app": "web"})
+
+	fakeClient := fakeclient.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(mapping, pod).
+		Build()
+
+	fakeFactory := fake.NewClientFactory()
+	fakeFactory.RegisterClient("sub1", fake.NewClient())
+
+	exec := &stubExecutor{}
+	cache := engine.NewDesiredStateCache("test-cluster")
+
+	// Use a status updater that tracks whether it was called.
+	statusCalled := false
+	statusUpdater := &phase5StubStatusUpdater{
+		updatePendingFn: func(_ context.Context, _ types.NamespacedName, _ int64, _ string, _ []int) error {
+			statusCalled = true
+			return nil
+		},
+		updateAfterReconcileFn: func(_ context.Context, _ types.NamespacedName, _ int64, _ string, _ []azure.ActionResult, _ error, _ []ValidationIssue, _ []int) error {
+			statusCalled = true
+			return nil
+		},
+	}
+
+	mappingObj := &v1alpha1.PodASGMapping{
+		ObjectMeta: metav1.ObjectMeta{Namespace: ns, Name: "conflict-mapping-2", Generation: 1},
+		Spec:       mapping.Spec,
+	}
+
+	// Use a client that bumps cache version during every pod List call,
+	// simulating continuous pod events arriving between fence capture and publish.
+	bumpOnListClient := &phase5ListInterceptClient{
+		Client: fakeClient,
+		onList: func() {
+			// Each List triggers a new pod event, advancing the version fence
+			churnPod := &corev1.Pod{
+				ObjectMeta: metav1.ObjectMeta{Namespace: ns, Name: "mid-recompute-pod", Labels: map[string]string{"app": "web"}},
+				Status:     corev1.PodStatus{PodIP: "10.0.2.1"},
+			}
+			cache.OnPodAdd(mappingObj, churnPod)
+		},
+	}
+
+	r := &MappingReconciler{
+		Client:            bumpOnListClient,
+		Scheme:            scheme,
+		ClusterName:       "test-cluster",
+		ResyncInterval:    0, // force recompute
+		PrefixSetFactory:  fakeFactory,
+		Executor:          exec,
+		StatusUpdater:     statusUpdater,
+		DesiredStateCache: cache,
+	}
+
+	result, err := r.Reconcile(ctx, ctrl.Request{
+		NamespacedName: types.NamespacedName{Name: "conflict-mapping-2", Namespace: ns},
+	})
+	if err != nil {
+		t.Fatalf("unexpected reconcile error: %v", err)
+	}
+
+	// Should requeue with bounded delay (conflict path)
+	if result.RequeueAfter <= 0 {
+		t.Errorf("Phase 5: expected bounded RequeueAfter on persistent CAS conflict, got %v", result.RequeueAfter)
+	}
+	if result.RequeueAfter > 2*time.Second {
+		t.Errorf("Phase 5: RequeueAfter should be bounded ≤ 2s, got %v", result.RequeueAfter)
+	}
+
+	// Executor must NOT have been called
+	if len(exec.calls) > 0 {
+		t.Errorf("Phase 5: executor must not be called when CAS conflict persists; got %d calls", len(exec.calls))
+	}
+
+	// Status must NOT have been called
+	if statusCalled {
+		t.Error("Phase 5: status updater must not be called when CAS conflict persists after retry")
+	}
+}
+
+// phase5StubStatusUpdater is a configurable StatusUpdater for Phase 5 tests.
+type phase5StubStatusUpdater struct {
+	updatePendingFn        func(ctx context.Context, key types.NamespacedName, gen int64, prefix string, matched []int) error
+	updateAfterReconcileFn func(ctx context.Context, key types.NamespacedName, gen int64, prefix string, results []azure.ActionResult, reconcileErr error, issues []ValidationIssue, matched []int) error
+}
+
+func (s *phase5StubStatusUpdater) UpdatePending(ctx context.Context, key types.NamespacedName, gen int64, prefix string, matched []int) error {
+	if s.updatePendingFn != nil {
+		return s.updatePendingFn(ctx, key, gen, prefix, matched)
+	}
+	return nil
+}
+
+func (s *phase5StubStatusUpdater) UpdateAfterReconcile(ctx context.Context, key types.NamespacedName, gen int64, prefix string, results []azure.ActionResult, reconcileErr error, issues []ValidationIssue, matched []int) error {
+	if s.updateAfterReconcileFn != nil {
+		return s.updateAfterReconcileFn(ctx, key, gen, prefix, results, reconcileErr, issues, matched)
+	}
+	return nil
+}
+
+// phase5ListInterceptClient wraps a client.Client and calls onList before
+// every List operation, allowing tests to simulate concurrent events.
+type phase5ListInterceptClient struct {
+	client.Client
+	onList func()
+}
+
+func (c *phase5ListInterceptClient) List(ctx context.Context, list client.ObjectList, opts ...client.ListOption) error {
+	if c.onList != nil {
+		c.onList()
+	}
+	return c.Client.List(ctx, list, opts...)
 }

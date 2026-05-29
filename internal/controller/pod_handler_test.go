@@ -1162,22 +1162,19 @@ func TestPhase5_PodHandler_Update_CacheMiss_DoesNotInvalidateMapping(t *testing.
 		t.Error("Phase 5: expected web-mapping enqueued on pod update even with cache miss")
 	}
 
-	// The critical assertion: on cache miss, OnPodUpdate returns true (safe no-op),
-	// so the handler should NOT have called Invalidate. Since we start with an
-	// empty cache, we verify no spurious invalidation by checking the cache
-	// remains in a clean state (no entries, no error).
-	// This is observable via GetWithVersion: on a truly fresh cache miss with no
-	// invalidation, the version fence should be 0 (no keyVersion bump from invalidation).
+	// The critical assertion: on cache miss, OnPodUpdate bumps the version fence
+	// so that any in-flight recompute that captured fences before this pod event
+	// will fail the CAS check. The handler returns true (safe no-op for the
+	// caller — no explicit Invalidate call), but the fence IS advanced.
 	mappingObj := &v1alpha1.PodASGMapping{
 		ObjectMeta: metav1.ObjectMeta{Namespace: ns, Name: "web-mapping", Generation: 1},
 		Spec:       mapping.Spec,
 	}
 	_, version, _, _ := cache.GetWithVersion(mappingObj)
 
-	// If invalidation was wrongly called, version would be > 0.
-	// The design requires that cache-miss OnPodUpdate returns true (no-op)
-	// so that no invalidation occurs.
-	if version != 0 {
-		t.Errorf("Phase 5: cache-miss OnPodUpdate should not trigger invalidation; version=%d, want 0", version)
+	// Version must be > 0 because OnPodUpdate bumps the version fence on cache miss,
+	// protecting in-flight recomputes from committing stale state.
+	if version == 0 {
+		t.Errorf("Phase 5: cache-miss OnPodUpdate must bump version fence; version=%d, want > 0", version)
 	}
 }
