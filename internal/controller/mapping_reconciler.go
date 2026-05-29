@@ -133,6 +133,11 @@ func (r *MappingReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 	// Handle deletion: clean up owned prefix sets and remove finalizer.
 	if mapping.DeletionTimestamp != nil {
 		if controllerutil.ContainsFinalizer(&mapping, CleanupFinalizer) {
+			// Bump lifecycle epoch early so any stale in-flight recomputes that
+			// captured fences before observing the deletion cannot repopulate.
+			if r.DesiredStateCache != nil {
+				r.DesiredStateCache.Delete(req.NamespacedName)
+			}
 			if err := r.reconcileDelete(ctx, &mapping, ownershipKey, logger); err != nil {
 				result, retErr, metricStage := r.finalizeSystemError(ctx, req, &mapping, ownershipKey, nil, "delete-cleanup", err, false, logger)
 				r.observeReconcile(req, metricStage, reconcileStart, 0)
@@ -148,9 +153,6 @@ func (r *MappingReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 			}
 			r.markInitialTerminal(req.NamespacedName, true)
 			r.cleanupPerMappingMetricState(req.NamespacedName)
-			if r.DesiredStateCache != nil {
-				r.DesiredStateCache.Delete(req.NamespacedName)
-			}
 			r.observeReconcile(req, ReconcileStageDeleteComplete, reconcileStart, 0)
 			return ctrl.Result{}, nil
 		}

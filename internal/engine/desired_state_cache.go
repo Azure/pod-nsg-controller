@@ -60,7 +60,9 @@ func NewDesiredStateCache(clusterName string) *DesiredStateCache {
 }
 
 // Get returns the cached desired state for a mapping. Returns false if no
-// cached entry exists for this mapping+generation.
+// cached entry exists for this mapping+generation. When the caller provides
+// a non-empty UID, the cached entry's UID must match to prevent stale reads
+// after a delete/recreate with the same namespaced name and generation.
 func (c *DesiredStateCache) Get(mapping *v1alpha1.PodASGMapping) (CachedDesiredState, bool) {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
@@ -71,6 +73,9 @@ func (c *DesiredStateCache) Get(mapping *v1alpha1.PodASGMapping) (CachedDesiredS
 	}
 	entry, ok := c.entries[key]
 	if !ok {
+		return CachedDesiredState{}, false
+	}
+	if mapping.UID != "" && entry.mapping != nil && entry.mapping.UID != mapping.UID {
 		return CachedDesiredState{}, false
 	}
 	// Return deep copy to prevent mutation
@@ -587,7 +592,8 @@ func (c *DesiredStateCache) Delete(key types.NamespacedName) {
 // GetWithVersion returns the cached desired state along with the current
 // mutation version and lifecycle epoch fences. These fences are used by
 // SetFromRecomputeIfVersion for CAS publish semantics. Returns fences even
-// on cache miss (from retained keyVersions/lifecycleEpoch maps).
+// on cache miss (from retained keyVersions/lifecycleEpoch maps). UID validation
+// is applied when the caller provides a non-empty UID to prevent stale reads.
 func (c *DesiredStateCache) GetWithVersion(mapping *v1alpha1.PodASGMapping) (CachedDesiredState, uint64, uint64, bool) {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
@@ -599,6 +605,9 @@ func (c *DesiredStateCache) GetWithVersion(mapping *v1alpha1.PodASGMapping) (Cac
 	key := cacheKey{key: nsName, generation: mapping.Generation}
 	entry, ok := c.entries[key]
 	if !ok {
+		return CachedDesiredState{}, currentVersion, currentLifecycleEpoch, false
+	}
+	if mapping.UID != "" && entry.mapping != nil && entry.mapping.UID != mapping.UID {
 		return CachedDesiredState{}, currentVersion, currentLifecycleEpoch, false
 	}
 	return deepCopyCachedState(entry.state), currentVersion, currentLifecycleEpoch, true
@@ -628,6 +637,15 @@ func (c *DesiredStateCache) SetFromRecomputeIfVersion(
 		return false, currentVersion, currentLifecycleEpoch
 	}
 	if expectedVersion != currentVersion {
+		return false, currentVersion, currentLifecycleEpoch
+	}
+
+	// UID guard: if an existing entry was committed by a different UID (from a
+	// prior incarnation that committed before its Delete ran), reject the publish
+	// to prevent the old reconcile from overwriting the new incarnation's state.
+	key := cacheKey{key: nsName, generation: mapping.Generation}
+	if existing, exists := c.entries[key]; exists && mapping.UID != "" &&
+		existing.mapping != nil && existing.mapping.UID != mapping.UID {
 		return false, currentVersion, currentLifecycleEpoch
 	}
 
