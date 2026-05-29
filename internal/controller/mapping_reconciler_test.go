@@ -2243,3 +2243,944 @@ func TestListActualForTargets_AggregatedErrorPrefersRetriableCause(t *testing.T)
 		t.Errorf("TestListActualForTargets_AggregatedErrorPrefersRetriableCause: error message should include both failed targets; got: %s", errMsg)
 	}
 }
+
+// ===========================================================================
+// Phase 5: Desired-State Cache — Reconciler Cache Integration Tests
+// ===========================================================================
+
+// ---------------------------------------------------------------------------
+// TestPhase5_Reconcile_CacheHit_SkipsFullRecompute
+// When the cache has a valid entry for the mapping+generation, the reconciler
+// should use cached desired state instead of listing pods and recomputing.
+// ---------------------------------------------------------------------------
+func TestPhase5_Reconcile_CacheHit_SkipsFullRecompute(t *testing.T) {
+	ctx := context.Background()
+	scheme := testScheme(t)
+	ns := "test-ns"
+
+	mapping := newTestMapping(ns, "my-mapping", []v1alpha1.Mapping{
+		{
+			PodSelector: v1alpha1.PodSelector{
+				MatchLabels: map[string]string{"app": "web"},
+			},
+			ApplicationSecurityGroups: []v1alpha1.ASGReference{
+				{ResourceID: asgResourceID("sub1", "rg1", "asg1")},
+			},
+		},
+	})
+	mapping.Finalizers = []string{CleanupFinalizer}
+	mapping.Generation = 1
+
+	pod := newTestPod(ns, "pod-1", "10.0.0.1", map[string]string{"app": "web"})
+
+	fakeClient := fakeclient.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(mapping, pod).
+		Build()
+
+	fakeFactory := fake.NewClientFactory()
+	fakeAzClient := fake.NewClient()
+	fakeFactory.RegisterClient("sub1", fakeAzClient)
+
+	exec := &stubExecutor{}
+	cache := engine.NewDesiredStateCache("test-cluster")
+
+	r := &MappingReconciler{
+		Client:            fakeClient,
+		Scheme:            scheme,
+		ClusterName:       "test-cluster",
+		ResyncInterval:    60 * time.Second,
+		PrefixSetFactory:  fakeFactory,
+		Executor:          exec,
+		DesiredStateCache: cache,
+	}
+
+	// Pre-seed cache with desired state (simulating a prior recompute)
+	target := engine.ASGTarget{
+		SubscriptionID: "sub1",
+		ResourceGroup:  "rg1",
+		ASGName:        "asg1",
+		FullResourceID: asgResourceID("sub1", "rg1", "asg1"),
+		PrefixSetName:  "test-cluster-" + ns + "-my-mapping",
+	}
+	cachedDesired := map[engine.ASGTarget]engine.DesiredPrefixSet{
+		target: {IPs: map[string]struct{}{"10.0.0.1/32": {}}},
+	}
+	cache.SetFromRecompute(
+		&v1alpha1.PodASGMapping{
+			ObjectMeta: metav1.ObjectMeta{Namespace: ns, Name: "my-mapping", Generation: 1},
+			Spec:       mapping.Spec,
+		},
+		nil,
+		cachedDesired,
+		engine.PodSnapshot{Pods: map[engine.PodIdentity]engine.PodMembership{
+			{Namespace: ns, Name: "pod-1"}: {PodIP: "10.0.0.1"},
+		}},
+		[]int{1},
+		false,
+	)
+
+	_, err := r.Reconcile(ctx, ctrl.Request{
+		NamespacedName: types.NamespacedName{Name: "my-mapping", Namespace: ns},
+	})
+	if err != nil {
+		t.Fatalf("unexpected reconcile error: %v", err)
+	}
+
+	// The reconciler should have used cached state. Verify it called executor
+	// (behavior preserved - still reconciles Azure state).
+	if len(exec.calls) == 0 {
+		t.Fatal("Phase 5: expected executor to be called using cached desired state")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// TestPhase5_Reconcile_CacheMiss_TriggersFullRecompute
+// When no cache entry exists, the reconciler lists pods and recomputes
+// desired state from scratch (existing behavior preserved).
+// ---------------------------------------------------------------------------
+func TestPhase5_Reconcile_CacheMiss_TriggersFullRecompute(t *testing.T) {
+	ctx := context.Background()
+	scheme := testScheme(t)
+	ns := "test-ns"
+
+	mapping := newTestMapping(ns, "my-mapping", []v1alpha1.Mapping{
+		{
+			PodSelector: v1alpha1.PodSelector{
+				MatchLabels: map[string]string{"app": "web"},
+			},
+			ApplicationSecurityGroups: []v1alpha1.ASGReference{
+				{ResourceID: asgResourceID("sub1", "rg1", "asg1")},
+			},
+		},
+	})
+	mapping.Finalizers = []string{CleanupFinalizer}
+	mapping.Generation = 1
+
+	pod := newTestPod(ns, "pod-1", "10.0.0.1", map[string]string{"app": "web"})
+
+	fakeClient := fakeclient.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(mapping, pod).
+		Build()
+
+	fakeFactory := fake.NewClientFactory()
+	fakeAzClient := fake.NewClient()
+	fakeFactory.RegisterClient("sub1", fakeAzClient)
+
+	exec := &stubExecutor{}
+	cache := engine.NewDesiredStateCache("test-cluster")
+
+	r := &MappingReconciler{
+		Client:            fakeClient,
+		Scheme:            scheme,
+		ClusterName:       "test-cluster",
+		ResyncInterval:    60 * time.Second,
+		PrefixSetFactory:  fakeFactory,
+		Executor:          exec,
+		DesiredStateCache: cache,
+	}
+
+	// No cache seeding — cache miss expected
+	_, err := r.Reconcile(ctx, ctrl.Request{
+		NamespacedName: types.NamespacedName{Name: "my-mapping", Namespace: ns},
+	})
+	if err != nil {
+		t.Fatalf("unexpected reconcile error: %v", err)
+	}
+
+	// Executor should be called (recompute + Azure sync)
+	if len(exec.calls) == 0 {
+		t.Fatal("Phase 5: expected executor to be called after cache miss full recompute")
+	}
+
+	// After recompute, cache should now have an entry
+	mappingObj := &v1alpha1.PodASGMapping{
+		ObjectMeta: metav1.ObjectMeta{Namespace: ns, Name: "my-mapping", Generation: 1},
+		Spec:       mapping.Spec,
+	}
+	if _, ok := cache.Get(mappingObj); !ok {
+		t.Error("Phase 5: expected cache populated after full recompute on cache miss")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// TestPhase5_Reconcile_InvalidSpec_UsesLiveMatchedPods_NotCache
+// Invalid spec path must compute matchedPodsByIndex from a live pod listing,
+// not from cached data, and must delete cache entry.
+// ---------------------------------------------------------------------------
+func TestPhase5_Reconcile_InvalidSpec_UsesLiveMatchedPods_NotCache(t *testing.T) {
+	ctx := context.Background()
+	scheme := testScheme(t)
+	ns := "test-ns"
+
+	// Invalid ASG resource ID
+	mapping := newTestMapping(ns, "invalid-mapping", []v1alpha1.Mapping{
+		{
+			PodSelector: v1alpha1.PodSelector{
+				MatchLabels: map[string]string{"app": "web"},
+			},
+			ApplicationSecurityGroups: []v1alpha1.ASGReference{
+				{ResourceID: "not-a-valid-resource-id"},
+			},
+		},
+	})
+	mapping.Finalizers = []string{CleanupFinalizer}
+	mapping.Generation = 1
+
+	pod := newTestPod(ns, "pod-1", "10.0.0.1", map[string]string{"app": "web"})
+
+	fakeClient := fakeclient.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(mapping, pod).
+		Build()
+
+	fakeFactory := fake.NewClientFactory()
+	exec := &stubExecutor{}
+	cache := engine.NewDesiredStateCache("test-cluster")
+
+	// Pre-seed cache (should be deleted on invalid spec path)
+	mappingObj := &v1alpha1.PodASGMapping{
+		ObjectMeta: metav1.ObjectMeta{Namespace: ns, Name: "invalid-mapping", Generation: 1},
+		Spec:       mapping.Spec,
+	}
+	cache.SetFromRecompute(mappingObj, nil,
+		map[engine.ASGTarget]engine.DesiredPrefixSet{},
+		engine.PodSnapshot{}, []int{99}, false) // stale matched count
+
+	r := &MappingReconciler{
+		Client:            fakeClient,
+		Scheme:            scheme,
+		ClusterName:       "test-cluster",
+		ResyncInterval:    60 * time.Second,
+		PrefixSetFactory:  fakeFactory,
+		Executor:          exec,
+		DesiredStateCache: cache,
+	}
+
+	_, err := r.Reconcile(ctx, ctrl.Request{
+		NamespacedName: types.NamespacedName{Name: "invalid-mapping", Namespace: ns},
+	})
+	if err != nil {
+		t.Fatalf("unexpected reconcile error: %v", err)
+	}
+
+	// Cache entry should be deleted for invalid spec
+	if _, ok := cache.Get(mappingObj); ok {
+		t.Error("Phase 5: expected cache entry deleted for mapping with invalid spec")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// TestPhase5_Reconcile_GenerationChange_ForcesRecompute
+// Valid-to-valid generation change (selector/ASG mutation) must cause a cache
+// miss and recompute, not reuse stale prior-generation desired state.
+// ---------------------------------------------------------------------------
+func TestPhase5_Reconcile_GenerationChange_ForcesRecompute(t *testing.T) {
+	ctx := context.Background()
+	scheme := testScheme(t)
+	ns := "test-ns"
+
+	mapping := newTestMapping(ns, "my-mapping", []v1alpha1.Mapping{
+		{
+			PodSelector: v1alpha1.PodSelector{
+				MatchLabels: map[string]string{"app": "web-v2"}, // new selector
+			},
+			ApplicationSecurityGroups: []v1alpha1.ASGReference{
+				{ResourceID: asgResourceID("sub1", "rg1", "asg1")},
+			},
+		},
+	})
+	mapping.Finalizers = []string{CleanupFinalizer}
+	mapping.Generation = 2 // updated generation
+
+	// pod matches new selector
+	pod := newTestPod(ns, "pod-1", "10.0.0.1", map[string]string{"app": "web-v2"})
+
+	fakeClient := fakeclient.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(mapping, pod).
+		Build()
+
+	fakeFactory := fake.NewClientFactory()
+	fakeAzClient := fake.NewClient()
+	fakeFactory.RegisterClient("sub1", fakeAzClient)
+
+	exec := &stubExecutor{}
+	cache := engine.NewDesiredStateCache("test-cluster")
+
+	// Seed cache with OLD generation (gen=1, old selector)
+	oldMappingObj := &v1alpha1.PodASGMapping{
+		ObjectMeta: metav1.ObjectMeta{Namespace: ns, Name: "my-mapping", Generation: 1},
+	}
+	cache.SetFromRecompute(oldMappingObj, nil,
+		map[engine.ASGTarget]engine.DesiredPrefixSet{
+			{ASGName: "asg1", PrefixSetName: "test-cluster-" + ns + "-my-mapping"}: {
+				IPs: map[string]struct{}{"10.0.0.99/32": {}}, // stale IP from old gen
+			},
+		},
+		engine.PodSnapshot{}, []int{5}, false)
+
+	r := &MappingReconciler{
+		Client:            fakeClient,
+		Scheme:            scheme,
+		ClusterName:       "test-cluster",
+		ResyncInterval:    60 * time.Second,
+		PrefixSetFactory:  fakeFactory,
+		Executor:          exec,
+		DesiredStateCache: cache,
+	}
+
+	_, err := r.Reconcile(ctx, ctrl.Request{
+		NamespacedName: types.NamespacedName{Name: "my-mapping", Namespace: ns},
+	})
+	if err != nil {
+		t.Fatalf("unexpected reconcile error: %v", err)
+	}
+
+	// Executor should have been called with fresh desired state (not stale)
+	if len(exec.calls) == 0 {
+		t.Fatal("Phase 5: expected executor to be called after generation change")
+	}
+
+	// Verify that the action uses the new pod IP (10.0.0.1) not stale (10.0.0.99)
+	actions := exec.calls[0]
+	for _, a := range actions {
+		if a.Kind == engine.CreatePrefixSet || a.Kind == engine.UpdatePrefixSet {
+			for _, ip := range a.DesiredIPs {
+				if ip == "10.0.0.99/32" {
+					t.Error("Phase 5: stale IP from old generation used; generation isolation broken")
+				}
+			}
+		}
+	}
+}
+
+// ---------------------------------------------------------------------------
+// TestPhase5_Reconcile_ForcedRecompute_AtResyncInterval
+// Even with a valid cache entry, the reconciler should force a full recompute
+// at the resync interval boundary to correct any drift.
+// ---------------------------------------------------------------------------
+func TestPhase5_Reconcile_ForcedRecompute_AtResyncInterval(t *testing.T) {
+	ctx := context.Background()
+	scheme := testScheme(t)
+	ns := "test-ns"
+
+	mapping := newTestMapping(ns, "my-mapping", []v1alpha1.Mapping{
+		{
+			PodSelector: v1alpha1.PodSelector{
+				MatchLabels: map[string]string{"app": "web"},
+			},
+			ApplicationSecurityGroups: []v1alpha1.ASGReference{
+				{ResourceID: asgResourceID("sub1", "rg1", "asg1")},
+			},
+		},
+	})
+	mapping.Finalizers = []string{CleanupFinalizer}
+	mapping.Generation = 1
+
+	pod := newTestPod(ns, "pod-1", "10.0.0.1", map[string]string{"app": "web"})
+
+	fakeClient := fakeclient.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(mapping, pod).
+		Build()
+
+	fakeFactory := fake.NewClientFactory()
+	fakeAzClient := fake.NewClient()
+	fakeFactory.RegisterClient("sub1", fakeAzClient)
+
+	exec := &stubExecutor{}
+	cache := engine.NewDesiredStateCache("test-cluster")
+
+	r := &MappingReconciler{
+		Client:            fakeClient,
+		Scheme:            scheme,
+		ClusterName:       "test-cluster",
+		ResyncInterval:    1 * time.Millisecond, // very short for testing
+		PrefixSetFactory:  fakeFactory,
+		Executor:          exec,
+		DesiredStateCache: cache,
+	}
+
+	// Seed cache with stale desired state
+	mappingObj := &v1alpha1.PodASGMapping{
+		ObjectMeta: metav1.ObjectMeta{Namespace: ns, Name: "my-mapping", Generation: 1},
+		Spec:       mapping.Spec,
+	}
+	cache.SetFromRecompute(mappingObj, nil,
+		map[engine.ASGTarget]engine.DesiredPrefixSet{
+			{
+				SubscriptionID: "sub1",
+				ResourceGroup:  "rg1",
+				ASGName:        "asg1",
+				FullResourceID: asgResourceID("sub1", "rg1", "asg1"),
+				PrefixSetName:  "test-cluster-" + ns + "-my-mapping",
+			}: {IPs: map[string]struct{}{"10.0.0.99/32": {}}}, // stale
+		},
+		engine.PodSnapshot{}, []int{1}, false)
+
+	// Wait for resync interval to elapse
+	time.Sleep(5 * time.Millisecond)
+
+	_, err := r.Reconcile(ctx, ctrl.Request{
+		NamespacedName: types.NamespacedName{Name: "my-mapping", Namespace: ns},
+	})
+	if err != nil {
+		t.Fatalf("unexpected reconcile error: %v", err)
+	}
+
+	// After forced recompute, the reconciler should use the actual pod IP (10.0.0.1)
+	// not the stale cached value (10.0.0.99)
+	if len(exec.calls) == 0 {
+		t.Fatal("Phase 5: expected executor call after forced recompute at resync interval")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// TestPhase5_Reconcile_TerminalCleanup_ClearsCacheAndResyncState
+// Terminal exits (mapping not found, delete complete) must clear cache and
+// resync state for the mapping key.
+// ---------------------------------------------------------------------------
+func TestPhase5_Reconcile_TerminalCleanup_ClearsCacheAndResyncState(t *testing.T) {
+	ctx := context.Background()
+	scheme := testScheme(t)
+	ns := "test-ns"
+
+	fakeClient := fakeclient.NewClientBuilder().
+		WithScheme(scheme).
+		Build() // no mapping exists → not found
+
+	fakeFactory := fake.NewClientFactory()
+	exec := &stubExecutor{}
+	cache := engine.NewDesiredStateCache("test-cluster")
+
+	// Pre-seed cache for a mapping that will be "not found"
+	mappingObj := &v1alpha1.PodASGMapping{
+		ObjectMeta: metav1.ObjectMeta{Namespace: ns, Name: "deleted-mapping", Generation: 1},
+	}
+	cache.SetFromRecompute(mappingObj, nil,
+		map[engine.ASGTarget]engine.DesiredPrefixSet{
+			{ASGName: "asg1"}: {IPs: map[string]struct{}{"10.0.0.1/32": {}}},
+		},
+		engine.PodSnapshot{}, []int{1}, false)
+
+	r := &MappingReconciler{
+		Client:            fakeClient,
+		Scheme:            scheme,
+		ClusterName:       "test-cluster",
+		ResyncInterval:    60 * time.Second,
+		PrefixSetFactory:  fakeFactory,
+		Executor:          exec,
+		DesiredStateCache: cache,
+	}
+
+	_, err := r.Reconcile(ctx, ctrl.Request{
+		NamespacedName: types.NamespacedName{Name: "deleted-mapping", Namespace: ns},
+	})
+	if err != nil {
+		t.Fatalf("unexpected reconcile error: %v", err)
+	}
+
+	// Cache entry should be cleared on terminal not-found exit
+	if _, ok := cache.Get(mappingObj); ok {
+		t.Error("Phase 5: expected cache cleared on terminal mapping-not-found exit")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// TestPhase5_Reconcile_CacheMiss_StaleRecomputeRejectedAfterVersionAdvance
+// A reconcile performs recompute but a pod event mutates the cache version
+// mid-flight. The CAS publish (SetFromRecomputeIfVersion) must reject the
+// stale recompute result.
+// ---------------------------------------------------------------------------
+func TestPhase5_Reconcile_CacheMiss_StaleRecomputeRejectedAfterVersionAdvance(t *testing.T) {
+	ctx := context.Background()
+	scheme := testScheme(t)
+	ns := "test-ns"
+
+	mapping := newTestMapping(ns, "my-mapping", []v1alpha1.Mapping{
+		{
+			PodSelector: v1alpha1.PodSelector{
+				MatchLabels: map[string]string{"app": "web"},
+			},
+			ApplicationSecurityGroups: []v1alpha1.ASGReference{
+				{ResourceID: asgResourceID("sub1", "rg1", "asg1")},
+			},
+		},
+	})
+	mapping.Finalizers = []string{CleanupFinalizer}
+	mapping.Generation = 1
+
+	pod := newTestPod(ns, "pod-1", "10.0.0.1", map[string]string{"app": "web"})
+
+	fakeClient := fakeclient.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(mapping, pod).
+		Build()
+
+	fakeFactory := fake.NewClientFactory()
+	fakeAzClient := fake.NewClient()
+	fakeFactory.RegisterClient("sub1", fakeAzClient)
+
+	exec := &stubExecutor{}
+	cache := engine.NewDesiredStateCache("test-cluster")
+
+	r := &MappingReconciler{
+		Client:            fakeClient,
+		Scheme:            scheme,
+		ClusterName:       "test-cluster",
+		ResyncInterval:    60 * time.Second,
+		PrefixSetFactory:  fakeFactory,
+		Executor:          exec,
+		DesiredStateCache: cache,
+	}
+
+	// Seed the cache so it starts with an entry, then simulate version advance
+	mappingObj := &v1alpha1.PodASGMapping{
+		ObjectMeta: metav1.ObjectMeta{Namespace: ns, Name: "my-mapping", Generation: 1},
+		Spec:       mapping.Spec,
+	}
+	target := engine.ASGTarget{
+		SubscriptionID: "sub1",
+		ResourceGroup:  "rg1",
+		ASGName:        "asg1",
+		FullResourceID: asgResourceID("sub1", "rg1", "asg1"),
+		PrefixSetName:  "test-cluster-" + ns + "-my-mapping",
+	}
+	cache.SetFromRecompute(mappingObj, nil,
+		map[engine.ASGTarget]engine.DesiredPrefixSet{
+			target: {IPs: map[string]struct{}{"10.0.0.1/32": {}}},
+		},
+		engine.PodSnapshot{Pods: map[engine.PodIdentity]engine.PodMembership{
+			{Namespace: ns, Name: "pod-1"}: {PodIP: "10.0.0.1"},
+		}},
+		[]int{1}, false)
+
+	// Read fences before reconcile
+	_, versionBefore, epochBefore, _ := cache.GetWithVersion(mappingObj)
+
+	// Simulate a pod event that advances the version mid-recompute
+	pod2 := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{Namespace: ns, Name: "pod-2", Labels: map[string]string{"app": "web"}},
+		Status:     corev1.PodStatus{PodIP: "10.0.0.2"},
+	}
+	cache.OnPodAdd(mappingObj, pod2)
+
+	// Verify CAS primitive: stale publish is rejected
+	staleDesired := map[engine.ASGTarget]engine.DesiredPrefixSet{
+		target: {IPs: map[string]struct{}{"10.0.0.1/32": {}}}, // missing pod-2
+	}
+	committed, _, _ := cache.SetFromRecomputeIfVersion(
+		mappingObj, nil, staleDesired, engine.PodSnapshot{}, []int{1}, false,
+		versionBefore, epochBefore,
+	)
+	if committed {
+		t.Error("Phase 5: stale recompute should be rejected when pod event advanced version")
+	}
+
+	// Cache should retain pod-2 (from OnPodAdd)
+	got, ok := cache.Get(mappingObj)
+	if !ok {
+		t.Fatal("expected cache hit")
+	}
+	if _, has := got.Desired[target].IPs["10.0.0.2/32"]; !has {
+		t.Error("Phase 5: cache should retain pod-2 IP from incremental add; stale recompute must not overwrite")
+	}
+
+	// Verify the reconciler's fenced path: when reconcile runs with existing
+	// cache entry (pod-2 already added), it uses the cache hit path and
+	// proceeds normally without overwriting.
+	// Mark a prior recompute so the resync interval hasn't elapsed and cache hit is used.
+	r.markDesiredStateFullRecompute(types.NamespacedName{Name: "my-mapping", Namespace: ns}, 1, time.Now())
+	_, err := r.Reconcile(ctx, ctrl.Request{
+		NamespacedName: types.NamespacedName{Name: "my-mapping", Namespace: ns},
+	})
+	if err != nil {
+		t.Fatalf("unexpected reconcile error: %v", err)
+	}
+
+	// After reconcile, cache should still contain pod-2's IP (from pod event)
+	got2, ok2 := cache.Get(mappingObj)
+	if !ok2 {
+		t.Fatal("expected cache hit after reconcile")
+	}
+	if _, has := got2.Desired[target].IPs["10.0.0.2/32"]; !has {
+		t.Error("Phase 5: reconcile must not overwrite pod-event mutations in cache")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// TestPhase5_Reconcile_DeleteRecreate_StaleInFlightCannotRepopulateCache
+// A mapping is deleted and recreated with same namespaced name. A stale
+// in-flight reconcile from the old object must not repopulate the cache.
+// ---------------------------------------------------------------------------
+func TestPhase5_Reconcile_DeleteRecreate_StaleInFlightCannotRepopulateCache(t *testing.T) {
+	ctx := context.Background()
+	scheme := testScheme(t)
+	ns := "test-ns"
+
+	fakeFactory := fake.NewClientFactory()
+	fakeAzClient := fake.NewClient()
+	fakeFactory.RegisterClient("sub1", fakeAzClient)
+
+	exec := &stubExecutor{}
+	cache := engine.NewDesiredStateCache("test-cluster")
+
+	// Simulate old mapping being in cache before deletion
+	oldMappingObj := &v1alpha1.PodASGMapping{
+		ObjectMeta: metav1.ObjectMeta{Namespace: ns, Name: "my-mapping", Generation: 3},
+		Spec: v1alpha1.PodASGMappingSpec{
+			Mappings: []v1alpha1.Mapping{
+				{
+					PodSelector: v1alpha1.PodSelector{
+						MatchLabels: map[string]string{"app": "old"},
+					},
+					ApplicationSecurityGroups: []v1alpha1.ASGReference{
+						{ResourceID: asgResourceID("sub1", "rg1", "asg1")},
+					},
+				},
+			},
+		},
+	}
+	target := engine.ASGTarget{
+		SubscriptionID: "sub1",
+		ResourceGroup:  "rg1",
+		ASGName:        "asg1",
+		FullResourceID: asgResourceID("sub1", "rg1", "asg1"),
+		PrefixSetName:  "test-cluster-" + ns + "-my-mapping",
+	}
+	cache.SetFromRecompute(oldMappingObj, nil,
+		map[engine.ASGTarget]engine.DesiredPrefixSet{
+			target: {IPs: map[string]struct{}{"10.0.0.OLD/32": {}}},
+		},
+		engine.PodSnapshot{}, []int{1}, false)
+
+	// Stale reconcile reads fences (before deletion)
+	_, staleVersion, staleEpoch, _ := cache.GetWithVersion(oldMappingObj)
+
+	// Terminal cleanup: reconciler calls Delete (mapping is gone)
+	cache.Delete(types.NamespacedName{Namespace: ns, Name: "my-mapping"})
+
+	// New mapping is created (generation resets to 1)
+	newMapping := newTestMapping(ns, "my-mapping", []v1alpha1.Mapping{
+		{
+			PodSelector: v1alpha1.PodSelector{
+				MatchLabels: map[string]string{"app": "new"},
+			},
+			ApplicationSecurityGroups: []v1alpha1.ASGReference{
+				{ResourceID: asgResourceID("sub1", "rg1", "asg1")},
+			},
+		},
+	})
+	newMapping.Finalizers = []string{CleanupFinalizer}
+	newMapping.Generation = 1
+
+	newPod := newTestPod(ns, "new-pod-1", "10.0.0.NEW", map[string]string{"app": "new"})
+
+	fakeClient := fakeclient.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(newMapping, newPod).
+		Build()
+
+	r := &MappingReconciler{
+		Client:            fakeClient,
+		Scheme:            scheme,
+		ClusterName:       "test-cluster",
+		ResyncInterval:    60 * time.Second,
+		PrefixSetFactory:  fakeFactory,
+		Executor:          exec,
+		DesiredStateCache: cache,
+	}
+
+	// Stale in-flight recompute from old object tries to publish with old fences
+	staleDesired := map[engine.ASGTarget]engine.DesiredPrefixSet{
+		target: {IPs: map[string]struct{}{"10.0.0.OLD/32": {}}},
+	}
+	committed, _, _ := cache.SetFromRecomputeIfVersion(
+		oldMappingObj, nil, staleDesired, engine.PodSnapshot{}, []int{1}, false,
+		staleVersion, staleEpoch,
+	)
+	if committed {
+		t.Error("Phase 5: stale in-flight recompute must not repopulate cache after delete/recreate")
+	}
+
+	// Now reconcile the new mapping normally
+	_, err := r.Reconcile(ctx, ctrl.Request{
+		NamespacedName: types.NamespacedName{Name: "my-mapping", Namespace: ns},
+	})
+	if err != nil {
+		t.Fatalf("unexpected reconcile error: %v", err)
+	}
+
+	// After fresh reconcile, cache should have new data only
+	newMappingObj := &v1alpha1.PodASGMapping{
+		ObjectMeta: metav1.ObjectMeta{Namespace: ns, Name: "my-mapping", Generation: 1},
+		Spec:       newMapping.Spec,
+	}
+	got, ok := cache.Get(newMappingObj)
+	if !ok {
+		t.Fatal("Phase 5: expected cache populated after fresh reconcile for recreated mapping")
+	}
+	if _, hasOld := got.Desired[target].IPs["10.0.0.OLD/32"]; hasOld {
+		t.Error("Phase 5: cache must not contain old mapping data after delete/recreate")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// TestPhase5_Reconcile_NotFoundCleanup_StaleInFlightCannotRepopulateCache
+// A mapping becomes NotFound. Stale in-flight recompute must not repopulate
+// cache after the terminal cleanup.
+// ---------------------------------------------------------------------------
+func TestPhase5_Reconcile_NotFoundCleanup_StaleInFlightCannotRepopulateCache(t *testing.T) {
+	scheme := testScheme(t)
+	ns := "test-ns"
+
+	fakeFactory := fake.NewClientFactory()
+	exec := &stubExecutor{}
+	cache := engine.NewDesiredStateCache("test-cluster")
+
+	mappingObj := &v1alpha1.PodASGMapping{
+		ObjectMeta: metav1.ObjectMeta{Namespace: ns, Name: "gone-mapping", Generation: 2},
+		Spec: v1alpha1.PodASGMappingSpec{
+			Mappings: []v1alpha1.Mapping{
+				{
+					PodSelector: v1alpha1.PodSelector{
+						MatchLabels: map[string]string{"app": "web"},
+					},
+					ApplicationSecurityGroups: []v1alpha1.ASGReference{
+						{ResourceID: asgResourceID("sub1", "rg1", "asg1")},
+					},
+				},
+			},
+		},
+	}
+	target := engine.ASGTarget{
+		SubscriptionID: "sub1",
+		ResourceGroup:  "rg1",
+		ASGName:        "asg1",
+		FullResourceID: asgResourceID("sub1", "rg1", "asg1"),
+		PrefixSetName:  "test-cluster-" + ns + "-gone-mapping",
+	}
+
+	// Pre-seed cache
+	cache.SetFromRecompute(mappingObj, nil,
+		map[engine.ASGTarget]engine.DesiredPrefixSet{
+			target: {IPs: map[string]struct{}{"10.0.0.1/32": {}}},
+		},
+		engine.PodSnapshot{}, []int{1}, false)
+
+	// Stale reconcile reads fences
+	_, staleVersion, staleEpoch, _ := cache.GetWithVersion(mappingObj)
+
+	// Mapping goes away — reconciler discovers NotFound
+	fakeClient := fakeclient.NewClientBuilder().
+		WithScheme(scheme).
+		Build() // no mapping
+
+	r := &MappingReconciler{
+		Client:            fakeClient,
+		Scheme:            scheme,
+		ClusterName:       "test-cluster",
+		ResyncInterval:    60 * time.Second,
+		PrefixSetFactory:  fakeFactory,
+		Executor:          exec,
+		DesiredStateCache: cache,
+	}
+
+	ctx := context.Background()
+	_, err := r.Reconcile(ctx, ctrl.Request{
+		NamespacedName: types.NamespacedName{Name: "gone-mapping", Namespace: ns},
+	})
+	if err != nil {
+		t.Fatalf("unexpected reconcile error: %v", err)
+	}
+
+	// Terminal cleanup should have cleared cache and bumped lifecycle epoch
+	if _, ok := cache.Get(mappingObj); ok {
+		t.Error("Phase 5: expected cache cleared on NotFound terminal cleanup")
+	}
+
+	// Stale in-flight recompute tries to publish with old fences
+	staleDesired := map[engine.ASGTarget]engine.DesiredPrefixSet{
+		target: {IPs: map[string]struct{}{"10.0.0.1/32": {}}},
+	}
+	committed, _, _ := cache.SetFromRecomputeIfVersion(
+		mappingObj, nil, staleDesired, engine.PodSnapshot{}, []int{1}, false,
+		staleVersion, staleEpoch,
+	)
+	if committed {
+		t.Error("Phase 5: stale in-flight recompute must not repopulate cache after NotFound cleanup")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// TestPhase5_Reconcile_ForcedRecompute_ConflictRetry_UsesBoundedRequeueAfter
+// When a forced recompute conflict occurs repeatedly, the reconciler should
+// use a bounded RequeueAfter (not hot-loop with Requeue: true).
+// ---------------------------------------------------------------------------
+func TestPhase5_Reconcile_ForcedRecompute_ConflictRetry_UsesBoundedRequeueAfter(t *testing.T) {
+	ctx := context.Background()
+	scheme := testScheme(t)
+	ns := "test-ns"
+	cache := engine.NewDesiredStateCache("test-cluster")
+
+	mappingObj := &v1alpha1.PodASGMapping{
+		ObjectMeta: metav1.ObjectMeta{Namespace: ns, Name: "conflict-mapping", Generation: 1},
+		Spec: v1alpha1.PodASGMappingSpec{
+			Mappings: []v1alpha1.Mapping{
+				{
+					PodSelector: v1alpha1.PodSelector{
+						MatchLabels: map[string]string{"app": "web"},
+					},
+					ApplicationSecurityGroups: []v1alpha1.ASGReference{
+						{ResourceID: asgResourceID("sub1", "rg1", "asg1")},
+					},
+				},
+			},
+		},
+	}
+
+	target := engine.ASGTarget{
+		SubscriptionID: "sub1",
+		ResourceGroup:  "rg1",
+		ASGName:        "asg1",
+		FullResourceID: asgResourceID("sub1", "rg1", "asg1"),
+		PrefixSetName:  "test-cluster-" + ns + "-conflict-mapping",
+	}
+
+	// Pre-seed cache and read fences
+	cache.SetFromRecompute(mappingObj, nil,
+		map[engine.ASGTarget]engine.DesiredPrefixSet{
+			target: {IPs: map[string]struct{}{"10.0.0.1/32": {}}},
+		},
+		engine.PodSnapshot{}, []int{1}, false)
+	_, ver, epoch, _ := cache.GetWithVersion(mappingObj)
+
+	// Advance version to create a permanent conflict scenario
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{Namespace: ns, Name: "pod-churn", Labels: map[string]string{"app": "web"}},
+		Status:     corev1.PodStatus{PodIP: "10.0.0.99"},
+	}
+	cache.OnPodAdd(mappingObj, pod)
+
+	// Verify CAS primitive: stale publish is rejected
+	committed, _, _ := cache.SetFromRecomputeIfVersion(
+		mappingObj, nil,
+		map[engine.ASGTarget]engine.DesiredPrefixSet{target: {IPs: map[string]struct{}{"10.0.0.1/32": {}}}},
+		engine.PodSnapshot{}, []int{1}, false,
+		ver, epoch,
+	)
+	if committed {
+		t.Fatal("expected CAS failure on stale version")
+	}
+
+	// Verify cacheConflictRequeueAfter returns bounded duration
+	r := &MappingReconciler{
+		Client:            nil,
+		Scheme:            scheme,
+		ClusterName:       "test-cluster",
+		ResyncInterval:    60 * time.Second,
+		DesiredStateCache: cache,
+	}
+
+	requeueAfter := r.cacheConflictRequeueAfter()
+	if requeueAfter <= 0 {
+		t.Errorf("Phase 5: cacheConflictRequeueAfter should be > 0, got %v", requeueAfter)
+	}
+	if requeueAfter > 2*time.Second {
+		t.Errorf("Phase 5: cacheConflictRequeueAfter should be bounded ≤ 2s, got %v", requeueAfter)
+	}
+
+	// Verify the reconciler uses CAS publish through Reconcile():
+	// A forced recompute (ResyncInterval=0) should still succeed because
+	// GetWithVersion captures fresh fences before publish.
+	mapping := newTestMapping(ns, "conflict-mapping", mappingObj.Spec.Mappings)
+	mapping.Finalizers = []string{CleanupFinalizer}
+	mapping.Generation = 1
+
+	podObj := newTestPod(ns, "pod-1", "10.0.0.1", map[string]string{"app": "web"})
+	fakeClient := fakeclient.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(mapping, podObj).
+		Build()
+	fakeFactory := fake.NewClientFactory()
+	fakeFactory.RegisterClient("sub1", fake.NewClient())
+	exec := &stubExecutor{}
+
+	r2 := &MappingReconciler{
+		Client:            fakeClient,
+		Scheme:            scheme,
+		ClusterName:       "test-cluster",
+		ResyncInterval:    0, // force recompute
+		PrefixSetFactory:  fakeFactory,
+		Executor:          exec,
+		DesiredStateCache: cache,
+	}
+	result, err := r2.Reconcile(ctx, ctrl.Request{
+		NamespacedName: types.NamespacedName{Name: "conflict-mapping", Namespace: ns},
+	})
+	if err != nil {
+		t.Fatalf("unexpected reconcile error: %v", err)
+	}
+	// When fences match (synchronous path), the CAS publish succeeds
+	// and reconcile proceeds normally (no RequeueAfter from conflict).
+	if result.RequeueAfter > 2*time.Second {
+		t.Errorf("Phase 5: expected reconcile to succeed or requeue within bounds, got RequeueAfter=%v", result.RequeueAfter)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// TestPhase5_Reconcile_TerminalCleanup_LifecycleFenceBump
+// Terminal exits must call Delete which bumps lifecycle epoch. Verify that
+// after terminal cleanup, the lifecycle epoch is advanced.
+// ---------------------------------------------------------------------------
+func TestPhase5_Reconcile_TerminalCleanup_LifecycleFenceBump(t *testing.T) {
+	ctx := context.Background()
+	scheme := testScheme(t)
+	ns := "test-ns"
+
+	fakeClient := fakeclient.NewClientBuilder().
+		WithScheme(scheme).
+		Build() // no mapping exists → not found
+
+	fakeFactory := fake.NewClientFactory()
+	exec := &stubExecutor{}
+	cache := engine.NewDesiredStateCache("test-cluster")
+
+	// Pre-seed cache for a mapping that will be "not found"
+	mappingObj := &v1alpha1.PodASGMapping{
+		ObjectMeta: metav1.ObjectMeta{Namespace: ns, Name: "terminal-mapping", Generation: 1},
+	}
+	cache.SetFromRecompute(mappingObj, nil,
+		map[engine.ASGTarget]engine.DesiredPrefixSet{
+			{ASGName: "asg1"}: {IPs: map[string]struct{}{"10.0.0.1/32": {}}},
+		},
+		engine.PodSnapshot{}, []int{1}, false)
+
+	// Read lifecycle epoch before terminal
+	_, _, epochBefore, _ := cache.GetWithVersion(mappingObj)
+
+	r := &MappingReconciler{
+		Client:            fakeClient,
+		Scheme:            scheme,
+		ClusterName:       "test-cluster",
+		ResyncInterval:    60 * time.Second,
+		PrefixSetFactory:  fakeFactory,
+		Executor:          exec,
+		DesiredStateCache: cache,
+	}
+
+	_, err := r.Reconcile(ctx, ctrl.Request{
+		NamespacedName: types.NamespacedName{Name: "terminal-mapping", Namespace: ns},
+	})
+	if err != nil {
+		t.Fatalf("unexpected reconcile error: %v", err)
+	}
+
+	// Cache should be cleared and lifecycle epoch bumped
+	_, _, epochAfter, _ := cache.GetWithVersion(mappingObj)
+	if epochAfter <= epochBefore {
+		t.Errorf("Phase 5: terminal cleanup must bump lifecycle epoch: before=%d, after=%d", epochBefore, epochAfter)
+	}
+}

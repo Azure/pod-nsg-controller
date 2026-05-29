@@ -25,6 +25,11 @@ type DesiredStateCache struct {
 	mu          sync.RWMutex
 	clusterName string
 	entries     map[cacheKey]*cacheEntry
+
+	// keyVersions is a per-key version floor bumped by pod events and invalidation.
+	keyVersions map[types.NamespacedName]uint64
+	// lifecycleEpoch is a terminal lifecycle fence bumped on Delete; survives entry removal.
+	lifecycleEpoch map[types.NamespacedName]uint64
 }
 
 type cacheKey struct {
@@ -47,8 +52,10 @@ type cacheEntry struct {
 // NewDesiredStateCache creates a new desired-state cache for the given cluster.
 func NewDesiredStateCache(clusterName string) *DesiredStateCache {
 	return &DesiredStateCache{
-		clusterName: clusterName,
-		entries:     make(map[cacheKey]*cacheEntry),
+		clusterName:    clusterName,
+		entries:        make(map[cacheKey]*cacheEntry),
+		keyVersions:    make(map[types.NamespacedName]uint64),
+		lifecycleEpoch: make(map[types.NamespacedName]uint64),
 	}
 }
 
@@ -82,6 +89,18 @@ func (c *DesiredStateCache) SetFromRecompute(
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
+	c.setFromRecomputeLocked(mapping, pods, desired, snapshot, matchedPodsByIndex, hasPendingIPPods)
+}
+
+// setFromRecomputeLocked is the lock-held core of SetFromRecompute.
+func (c *DesiredStateCache) setFromRecomputeLocked(
+	mapping *v1alpha1.PodASGMapping,
+	pods []corev1.Pod,
+	desired map[ASGTarget]DesiredPrefixSet,
+	snapshot PodSnapshot,
+	matchedPodsByIndex []int,
+	hasPendingIPPods bool,
+) {
 	key := cacheKey{
 		key:        types.NamespacedName{Namespace: mapping.Namespace, Name: mapping.Name},
 		generation: mapping.Generation,
@@ -154,8 +173,11 @@ func (c *DesiredStateCache) OnPodAdd(mapping *v1alpha1.PodASGMapping, pod *corev
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
+	nsName := types.NamespacedName{Namespace: mapping.Namespace, Name: mapping.Name}
+	c.keyVersions[nsName]++
+
 	key := cacheKey{
-		key:        types.NamespacedName{Namespace: mapping.Namespace, Name: mapping.Name},
+		key:        nsName,
 		generation: mapping.Generation,
 	}
 	entry, ok := c.entries[key]
@@ -231,8 +253,11 @@ func (c *DesiredStateCache) OnPodDelete(mapping *v1alpha1.PodASGMapping, pod *co
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
+	nsName := types.NamespacedName{Namespace: mapping.Namespace, Name: mapping.Name}
+	c.keyVersions[nsName]++
+
 	key := cacheKey{
-		key:        types.NamespacedName{Namespace: mapping.Namespace, Name: mapping.Name},
+		key:        nsName,
 		generation: mapping.Generation,
 	}
 	entry, ok := c.entries[key]
@@ -335,14 +360,27 @@ func (c *DesiredStateCache) OnPodUpdate(mapping *v1alpha1.PodASGMapping, oldPod,
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
+	nsName := types.NamespacedName{Namespace: mapping.Namespace, Name: mapping.Name}
+
 	key := cacheKey{
-		key:        types.NamespacedName{Namespace: mapping.Namespace, Name: mapping.Name},
+		key:        nsName,
 		generation: mapping.Generation,
 	}
 	entry, ok := c.entries[key]
 	if !ok {
-		return false
+		// If entries exist for a different generation, bump version and return
+		// false so the caller invalidates stale generation data.
+		for k := range c.entries {
+			if k.key == nsName {
+				c.keyVersions[nsName]++
+				return false
+			}
+		}
+		// True cache miss (no entry for any generation): safe no-op.
+		return true
 	}
+
+	c.keyVersions[nsName]++
 
 	oldIP := oldPod.Status.PodIP
 	newIP := newPod.Status.PodIP
@@ -504,6 +542,8 @@ func (c *DesiredStateCache) Invalidate(key types.NamespacedName) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
+	c.keyVersions[key]++
+
 	for k := range c.entries {
 		if k.key == key {
 			delete(c.entries, k)
@@ -518,14 +558,79 @@ func (c *DesiredStateCache) InvalidateNamespace(namespace string) {
 
 	for k := range c.entries {
 		if k.key.Namespace == namespace {
+			c.keyVersions[k.key]++
 			delete(c.entries, k)
 		}
 	}
 }
 
 // Delete removes the cached entry and any associated state for the given key.
+// It bumps the lifecycle epoch fence so stale in-flight recomputes cannot
+// repopulate the cache after terminal cleanup.
 func (c *DesiredStateCache) Delete(key types.NamespacedName) {
-	c.Invalidate(key)
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	c.lifecycleEpoch[key]++
+	c.keyVersions[key]++
+
+	for k := range c.entries {
+		if k.key == key {
+			delete(c.entries, k)
+		}
+	}
+}
+
+// GetWithVersion returns the cached desired state along with the current
+// mutation version and lifecycle epoch fences. These fences are used by
+// SetFromRecomputeIfVersion for CAS publish semantics. Returns fences even
+// on cache miss (from retained keyVersions/lifecycleEpoch maps).
+func (c *DesiredStateCache) GetWithVersion(mapping *v1alpha1.PodASGMapping) (CachedDesiredState, uint64, uint64, bool) {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+
+	nsName := types.NamespacedName{Namespace: mapping.Namespace, Name: mapping.Name}
+	currentVersion := c.keyVersions[nsName]
+	currentLifecycleEpoch := c.lifecycleEpoch[nsName]
+
+	key := cacheKey{key: nsName, generation: mapping.Generation}
+	entry, ok := c.entries[key]
+	if !ok {
+		return CachedDesiredState{}, currentVersion, currentLifecycleEpoch, false
+	}
+	return deepCopyCachedState(entry.state), currentVersion, currentLifecycleEpoch, true
+}
+
+// SetFromRecomputeIfVersion commits a recompute result only if the provided
+// expectedVersion and expectedLifecycleEpoch match the current fences.
+// Returns (committed, currentVersion, currentLifecycleEpoch).
+func (c *DesiredStateCache) SetFromRecomputeIfVersion(
+	mapping *v1alpha1.PodASGMapping,
+	pods []corev1.Pod,
+	desired map[ASGTarget]DesiredPrefixSet,
+	snapshot PodSnapshot,
+	matchedPodsByIndex []int,
+	hasPendingIPPods bool,
+	expectedVersion uint64,
+	expectedLifecycleEpoch uint64,
+) (committed bool, currentVersion uint64, currentLifecycleEpoch uint64) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	nsName := types.NamespacedName{Namespace: mapping.Namespace, Name: mapping.Name}
+	currentVersion = c.keyVersions[nsName]
+	currentLifecycleEpoch = c.lifecycleEpoch[nsName]
+
+	if expectedLifecycleEpoch != currentLifecycleEpoch {
+		return false, currentVersion, currentLifecycleEpoch
+	}
+	if expectedVersion != currentVersion {
+		return false, currentVersion, currentLifecycleEpoch
+	}
+
+	// Fences match — commit using inline logic (avoid double-lock via SetFromRecompute).
+	c.setFromRecomputeLocked(mapping, pods, desired, snapshot, matchedPodsByIndex, hasPendingIPPods)
+	return true, currentVersion, currentLifecycleEpoch
 }
 
 func deepCopyCachedState(state CachedDesiredState) CachedDesiredState {

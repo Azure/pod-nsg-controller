@@ -64,6 +64,9 @@ type MappingReconciler struct {
 	Executor         Executor
 	StatusUpdater    StatusUpdater
 
+	// DesiredStateCache is the shared desired-state cache for cache-first reconciliation.
+	DesiredStateCache *engine.DesiredStateCache
+
 	// Metrics instrumentation (all optional; nil disables the metric path).
 	MetricsRecorder      *metrics.Recorder
 	PodChurnTracker      *metrics.PodChurnTracker
@@ -72,6 +75,9 @@ type MappingReconciler struct {
 
 	// lastReconcileState tracks per-key debounce state for Phase 3.
 	lastReconcileState sync.Map
+
+	// desiredStateResyncState tracks per-key full-recompute timing for Phase 5.
+	desiredStateResyncState sync.Map
 }
 
 const (
@@ -97,6 +103,10 @@ func (r *MappingReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 		if apierrors.IsNotFound(err) {
 			r.markInitialTerminal(req.NamespacedName, true)
 			r.cleanupPerMappingMetricState(req.NamespacedName)
+			if r.DesiredStateCache != nil {
+				r.DesiredStateCache.Delete(req.NamespacedName)
+			}
+			r.clearDesiredStateResyncState(req.NamespacedName)
 			r.observeReconcile(req, ReconcileStageMappingNotFound, reconcileStart, 0)
 			return ctrl.Result{}, nil
 		}
@@ -138,11 +148,17 @@ func (r *MappingReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 			}
 			r.markInitialTerminal(req.NamespacedName, true)
 			r.cleanupPerMappingMetricState(req.NamespacedName)
+			if r.DesiredStateCache != nil {
+				r.DesiredStateCache.Delete(req.NamespacedName)
+			}
 			r.observeReconcile(req, ReconcileStageDeleteComplete, reconcileStart, 0)
 			return ctrl.Result{}, nil
 		}
 		r.markInitialTerminal(req.NamespacedName, true)
 		r.cleanupPerMappingMetricState(req.NamespacedName)
+		if r.DesiredStateCache != nil {
+			r.DesiredStateCache.Delete(req.NamespacedName)
+		}
 		r.observeReconcile(req, ReconcileStageDeleteComplete, reconcileStart, 0)
 		return ctrl.Result{}, nil
 	}
@@ -167,20 +183,18 @@ func (r *MappingReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 		return ctrl.Result{RequeueAfter: remaining}, nil
 	}
 
-	// List pods in mapping namespace.
-	var podList corev1.PodList
-	if err := r.List(ctx, &podList, client.InNamespace(mapping.Namespace)); err != nil {
-		result, retErr, metricStage := r.finalizeSystemError(ctx, req, &mapping, ownershipKey, nil, "list-pods", err, true, logger)
-		r.observeReconcile(req, metricStage, reconcileStart, 0)
-		return result, retErr
-	}
-
-	// Compute matched pods per mapping index.
-	matchedPodsByIndex := ComputeMatchedPodsByMapping(mapping.Spec, podList.Items)
-
-	// Validate ASG resource IDs.
+	// Validate ASG resource IDs (cheap, no pod listing needed).
 	validationIssues := validateASGResourceIDs(mapping.Spec.Mappings)
 	if len(validationIssues) > 0 {
+		// Invalid spec: list pods for matchedPodsByIndex used in status.
+		var podList corev1.PodList
+		if err := r.List(ctx, &podList, client.InNamespace(mapping.Namespace)); err != nil {
+			result, retErr, metricStage := r.finalizeSystemError(ctx, req, &mapping, ownershipKey, nil, "list-pods", err, true, logger)
+			r.observeReconcile(req, metricStage, reconcileStart, 0)
+			return result, retErr
+		}
+		matchedPodsByIndex := ComputeMatchedPodsByMapping(mapping.Spec, podList.Items)
+
 		validationErr := aggregateValidationErrors(validationIssues)
 		logger.Error(validationErr, "spec validation failed, waiting for spec update")
 		if r.StatusUpdater != nil {
@@ -200,10 +214,95 @@ func (r *MappingReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 				logger.Error(statusErr, "failed to update status for validation failure")
 			}
 		}
+		if r.DesiredStateCache != nil {
+			r.DesiredStateCache.Delete(req.NamespacedName)
+		}
+		r.clearDesiredStateResyncState(req.NamespacedName)
 		r.markInitialTerminal(req.NamespacedName, true)
 		r.observeReconcile(req, ReconcileStageValidationTerminal, reconcileStart, 0)
 		return ctrl.Result{}, nil
 	}
+
+	// Phase 5: Cache-first desired-state resolution with CAS fencing.
+	var desired map[engine.ASGTarget]engine.DesiredPrefixSet
+	var podSnapshot engine.PodSnapshot
+	var matchedPodsByIndex []int
+	var hasPendingIPPodsVal bool
+
+	crdResolutionStart := time.Now()
+	cacheHit := false
+
+	// Capture fences on read for CAS publish later.
+	var expectedVersion uint64
+	var expectedLifecycleEpoch uint64
+
+	if r.DesiredStateCache != nil && !r.shouldForceDesiredStateRecompute(req.NamespacedName, mapping.Generation, reconcileStart) {
+		cached, ver, epoch, ok := r.DesiredStateCache.GetWithVersion(&mapping)
+		expectedVersion = ver
+		expectedLifecycleEpoch = epoch
+		if ok {
+			desired = cached.Desired
+			podSnapshot = cached.Snapshot
+			matchedPodsByIndex = cached.MatchedPodsByIndex
+			hasPendingIPPodsVal = cached.HasPendingIPPods
+			cacheHit = true
+			logger.V(1).Info("desired state resolved from cache")
+		}
+	} else if r.DesiredStateCache != nil {
+		// Forced recompute: still capture fences for CAS publish.
+		_, ver, epoch, _ := r.DesiredStateCache.GetWithVersion(&mapping)
+		expectedVersion = ver
+		expectedLifecycleEpoch = epoch
+	}
+
+	if !cacheHit {
+		// Cache miss or forced resync: full pod list + recompute.
+		var podList corev1.PodList
+		if err := r.List(ctx, &podList, client.InNamespace(mapping.Namespace)); err != nil {
+			result, retErr, metricStage := r.finalizeSystemError(ctx, req, &mapping, ownershipKey, nil, "list-pods", err, true, logger)
+			r.observeReconcile(req, metricStage, reconcileStart, 0)
+			return result, retErr
+		}
+		matchedPodsByIndex = ComputeMatchedPodsByMapping(mapping.Spec, podList.Items)
+		desired, podSnapshot = engine.ComputeDesiredStateWithSnapshot(r.ClusterName, []v1alpha1.PodASGMapping{mapping}, podList.Items)
+		hasPendingIPPodsVal = hasPendingIPPodsFromList(mapping.Spec, podList.Items)
+
+		// Populate the desired-state cache from this full recompute with CAS semantics.
+		if r.DesiredStateCache != nil {
+			// Freshness check: verify the mapping hasn't been deleted/recreated.
+			if current, freshErr := r.mappingStillCurrent(ctx, req.NamespacedName, mapping.UID, mapping.Generation); freshErr != nil || !current {
+				logger.V(1).Info("mapping no longer current after recompute, skipping cache publish")
+				return ctrl.Result{RequeueAfter: r.cacheConflictRequeueAfter()}, nil
+			}
+
+			committed, _, _ := r.DesiredStateCache.SetFromRecomputeIfVersion(
+				&mapping, podList.Items, desired, podSnapshot, matchedPodsByIndex, hasPendingIPPodsVal,
+				expectedVersion, expectedLifecycleEpoch,
+			)
+			if !committed {
+				// CAS conflict: re-read cache; if entry exists, use it.
+				if cached, ok := r.DesiredStateCache.Get(&mapping); ok {
+					desired = cached.Desired
+					podSnapshot = cached.Snapshot
+					matchedPodsByIndex = cached.MatchedPodsByIndex
+					hasPendingIPPodsVal = cached.HasPendingIPPods
+					logger.V(1).Info("cache publish conflict resolved from re-read")
+				} else {
+					// No cache entry available, bounded requeue.
+					logger.V(1).Info("cache publish conflict with no fallback entry, requeueing")
+					return ctrl.Result{RequeueAfter: r.cacheConflictRequeueAfter()}, nil
+				}
+			} else {
+				r.markDesiredStateFullRecompute(req.NamespacedName, mapping.Generation, reconcileStart)
+			}
+		} else {
+			r.markDesiredStateFullRecompute(req.NamespacedName, mapping.Generation, reconcileStart)
+		}
+		logger.V(1).Info("desired state computed from full recompute")
+	}
+
+	// Observe pod churn from the authoritative snapshot.
+	r.observePodChurnFromSnapshot(req.NamespacedName, podSnapshot)
 
 	// Write pending status before Azure operations.
 	if r.StatusUpdater != nil {
@@ -222,15 +321,6 @@ func (r *MappingReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 			logger.Error(pendingErr, "failed to update pending status, continuing")
 		}
 	}
-
-	// Compute desired state for this mapping using the snapshot-aware path.
-	// The snapshot provides the authoritative pod set for both NSG reconciliation
-	// and pod-churn metrics, eliminating a duplicate selector walk.
-	crdResolutionStart := time.Now()
-	desired, podSnapshot := engine.ComputeDesiredStateWithSnapshot(r.ClusterName, []v1alpha1.PodASGMapping{mapping}, podList.Items)
-
-	// Observe pod churn from the same authoritative snapshot.
-	r.observePodChurnFromSnapshot(req.NamespacedName, podSnapshot)
 
 	// Filter out targets with no desired IPs to avoid creating empty prefix sets
 	// (e.g., when pods haven't received IPs yet). Owned-but-empty targets are
@@ -448,7 +538,7 @@ func (r *MappingReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 		promptWindow := promptFollowUpWindow(r.ResyncInterval)
 
 		// Pods matched selectors but have no IPs → IP assignment event will trigger.
-		if hasPendingIPPods(mapping.Spec.Mappings, podList.Items) &&
+		if hasPendingIPPodsVal &&
 			withinPromptFollowUpWindow(mapping.CreationTimestamp.Time, promptWindow) {
 			r.observeReconcile(req, ReconcileStageSteadyStateSuccess, reconcileStart, len(actions))
 			return ctrl.Result{RequeueAfter: promptRequeueAfter(r.ResyncInterval)}, nil
@@ -508,11 +598,12 @@ func (r *MappingReconciler) ensureInitialTrackerFallback() {
 }
 
 // cleanupPerMappingMetricState removes all per-mapping state on terminal cleanup:
-// debounce tracking, convergence trackers, pod churn windows, and per-key time
-// series. This prevents unbounded cardinality growth and stale debounce state
-// when PodASGMapping resources are deleted.
+// debounce tracking, convergence trackers, pod churn windows, per-key time
+// series, and desired-state resync state. This prevents unbounded cardinality
+// growth and stale state when PodASGMapping resources are deleted.
 func (r *MappingReconciler) cleanupPerMappingMetricState(key types.NamespacedName) {
 	r.clearDebounceState(key)
+	r.clearDesiredStateResyncState(key)
 	if r.ConvergenceTracker != nil {
 		r.ConvergenceTracker.Forget(key)
 	}
@@ -1018,6 +1109,11 @@ func hasPendingIPPods(rules []v1alpha1.Mapping, pods []corev1.Pod) bool {
 	return false
 }
 
+// hasPendingIPPodsFromList checks if any matched pod has no IP (spec variant).
+func hasPendingIPPodsFromList(spec v1alpha1.PodASGMappingSpec, pods []corev1.Pod) bool {
+	return hasPendingIPPods(spec.Mappings, pods)
+}
+
 func promptRequeueAfter(resyncInterval time.Duration) time.Duration {
 	const defaultDelay = time.Second
 
@@ -1125,4 +1221,97 @@ func (r *MappingReconciler) markReconcileSuccess(key types.NamespacedName, gener
 // clearDebounceState removes debounce tracking for a key (on delete/not-found).
 func (r *MappingReconciler) clearDebounceState(key types.NamespacedName) {
 	r.lastReconcileState.Delete(key)
+}
+
+// ---------------------------------------------------------------------------
+// Phase 5: Desired-state cache resync state tracking
+// ---------------------------------------------------------------------------
+
+// resyncState tracks per-mapping full-recompute timing for the desired-state cache.
+type resyncState struct {
+	generation          int64
+	lastFullRecomputeAt time.Time
+}
+
+// shouldForceDesiredStateRecompute returns true if the resync interval has elapsed
+// since the last full recompute for this key+generation, meaning the cache should
+// be bypassed.
+func (r *MappingReconciler) shouldForceDesiredStateRecompute(key types.NamespacedName, generation int64, now time.Time) bool {
+	if r.ResyncInterval <= 0 {
+		return true
+	}
+	val, ok := r.desiredStateResyncState.Load(key)
+	if !ok {
+		return true
+	}
+	state := val.(resyncState)
+	if state.generation != generation {
+		return true
+	}
+	return now.Sub(state.lastFullRecomputeAt) >= r.ResyncInterval
+}
+
+// markDesiredStateFullRecompute records that a full desired-state recomputation
+// was performed for the given key+generation at the given time.
+func (r *MappingReconciler) markDesiredStateFullRecompute(key types.NamespacedName, generation int64, now time.Time) {
+	r.desiredStateResyncState.Store(key, resyncState{
+		generation:          generation,
+		lastFullRecomputeAt: now,
+	})
+}
+
+// clearDesiredStateResyncState removes resync tracking for a key on terminal cleanup.
+func (r *MappingReconciler) clearDesiredStateResyncState(key types.NamespacedName) {
+	r.desiredStateResyncState.Delete(key)
+}
+
+// cacheConflictRequeueAfter returns the bounded delay to use when a CAS publish
+// conflict occurs during cache-first reconciliation. This prevents hot loops
+// when pod churn keeps advancing the version.
+//
+// TODO(phase5): Implement bounded retry delay policy.
+// Currently returns 500ms fallback - tests will verify bounds.
+func (r *MappingReconciler) cacheConflictRequeueAfter() time.Duration {
+	if r.MinReconcileInterval > 0 {
+		return r.MinReconcileInterval
+	}
+	if r.ResyncInterval > 0 {
+		quarter := r.ResyncInterval / 4
+		result := quarter
+		if result < 200*time.Millisecond {
+			result = 200 * time.Millisecond
+		}
+		if result > 2*time.Second {
+			result = 2 * time.Second
+		}
+		return result
+	}
+	return 500 * time.Millisecond
+}
+
+// mappingStillCurrent verifies the mapping hasn't been deleted/recreated or
+// updated since the reconcile started. Returns (true, nil) when current.
+func (r *MappingReconciler) mappingStillCurrent(
+	ctx context.Context,
+	key types.NamespacedName,
+	observedUID types.UID,
+	observedGeneration int64,
+) (bool, error) {
+	var current v1alpha1.PodASGMapping
+	if err := r.Get(ctx, key, &current); err != nil {
+		if apierrors.IsNotFound(err) {
+			return false, nil
+		}
+		return false, err
+	}
+	if current.UID != observedUID {
+		return false, nil
+	}
+	if current.Generation != observedGeneration {
+		return false, nil
+	}
+	if current.DeletionTimestamp != nil {
+		return false, nil
+	}
+	return true, nil
 }

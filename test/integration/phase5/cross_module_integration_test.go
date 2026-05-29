@@ -763,3 +763,477 @@ func TestPhase5_PrefixSetIPs_DeterministicOrder(t *testing.T) {
 		}
 	}
 }
+
+// ===========================================================================
+// Phase 5: Desired-State Cache — Cross-Module Integration Tests
+// ===========================================================================
+
+// ---------------------------------------------------------------------------
+// TestPhase5_CacheBacked_MultiPodAggregation_PreservedWithPendingIP
+// Cache-backed reconcile must still aggregate multiple pod IPs correctly and
+// track pending-IP pods for follow-up behavior.
+// ---------------------------------------------------------------------------
+func TestPhase5_CacheBacked_MultiPodAggregation_PreservedWithPendingIP(t *testing.T) {
+	te := setupTestEnv(t)
+	defer te.teardown(t)
+	ctx := context.Background()
+
+	ns := &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: "test-cache-multi-pod"}}
+	if err := te.k8sClient.Create(ctx, ns); err != nil {
+		t.Fatalf("failed to create namespace: %v", err)
+	}
+
+	mapping := &v1alpha1.PodASGMapping{
+		ObjectMeta: metav1.ObjectMeta{Name: "multi-cache-mapping", Namespace: ns.Name},
+		Spec: v1alpha1.PodASGMappingSpec{
+			Mappings: []v1alpha1.Mapping{
+				{
+					PodSelector: v1alpha1.PodSelector{MatchLabels: map[string]string{"app": "cached"}},
+					ApplicationSecurityGroups: []v1alpha1.ASGReference{
+						{ResourceID: asgResourceID("sub1", "rg1", "asg1")},
+					},
+				},
+			},
+		},
+	}
+	if err := te.k8sClient.Create(ctx, mapping); err != nil {
+		t.Fatalf("failed to create mapping: %v", err)
+	}
+
+	// Create 3 pods: 2 with IPs, 1 pending
+	podsWithIP := []struct {
+		name string
+		ip   string
+	}{
+		{"pod-1", "10.0.1.1"},
+		{"pod-2", "10.0.1.2"},
+	}
+
+	for _, p := range podsWithIP {
+		pod := &corev1.Pod{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      p.name,
+				Namespace: ns.Name,
+				Labels:    map[string]string{"app": "cached"},
+			},
+			Spec: corev1.PodSpec{
+				Containers: []corev1.Container{{Name: "app", Image: "nginx"}},
+			},
+		}
+		if err := te.k8sClient.Create(ctx, pod); err != nil {
+			t.Fatalf("failed to create pod %s: %v", p.name, err)
+		}
+		pod.Status.PodIP = p.ip
+		if err := te.k8sClient.Status().Update(ctx, pod); err != nil {
+			t.Fatalf("failed to set pod %s IP: %v", p.name, err)
+		}
+	}
+
+	// Create pending pod (no IP yet)
+	pendingPod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "pod-pending",
+			Namespace: ns.Name,
+			Labels:    map[string]string{"app": "cached"},
+		},
+		Spec: corev1.PodSpec{
+			Containers: []corev1.Container{{Name: "app", Image: "nginx"}},
+		},
+	}
+	if err := te.k8sClient.Create(ctx, pendingPod); err != nil {
+		t.Fatalf("failed to create pending pod: %v", err)
+	}
+
+	ownershipKey := "test-cluster-" + ns.Name + "-multi-cache-mapping"
+
+	// Verify both IPs are aggregated
+	eventually(t, 15*time.Second, 300*time.Millisecond, func() bool {
+		ps, err := te.fakeClient.Get(ctx, "sub1", "rg1", "asg1", ownershipKey)
+		if err != nil || ps.Properties == nil {
+			return false
+		}
+		ips := make(map[string]bool)
+		for _, ip := range ps.Properties.AddressPrefixes {
+			ips[ip] = true
+		}
+		return ips["10.0.1.1/32"] && ips["10.0.1.2/32"]
+	}, "expected both pod IPs aggregated in prefix set")
+
+	// Now the pending pod gets an IP → should be added via cache path
+	pendingPod.Status.PodIP = "10.0.1.3"
+	if err := te.k8sClient.Status().Update(ctx, pendingPod); err != nil {
+		t.Fatalf("failed to set pending pod IP: %v", err)
+	}
+
+	eventually(t, 15*time.Second, 300*time.Millisecond, func() bool {
+		ps, err := te.fakeClient.Get(ctx, "sub1", "rg1", "asg1", ownershipKey)
+		if err != nil || ps.Properties == nil {
+			return false
+		}
+		ips := make(map[string]bool)
+		for _, ip := range ps.Properties.AddressPrefixes {
+			ips[ip] = true
+		}
+		return ips["10.0.1.1/32"] && ips["10.0.1.2/32"] && ips["10.0.1.3/32"]
+	}, "expected all 3 IPs after pending pod gets IP")
+}
+
+// ---------------------------------------------------------------------------
+// TestPhase5_InvalidToValid_MappingTransition_NoCacheReuse
+// A mapping that transitions between spec generations (spec change) must not
+// reuse any stale cache data from the prior generation. This verifies
+// generation-based cache isolation and the Delete-on-terminal path.
+// ---------------------------------------------------------------------------
+func TestPhase5_InvalidToValid_MappingTransition_NoCacheReuse(t *testing.T) {
+	te := setupTestEnv(t)
+	defer te.teardown(t)
+	ctx := context.Background()
+
+	ns := &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: "test-invalid-to-valid"}}
+	if err := te.k8sClient.Create(ctx, ns); err != nil {
+		t.Fatalf("failed to create namespace: %v", err)
+	}
+
+	// Start with mapping pointing to asg-old
+	mapping := &v1alpha1.PodASGMapping{
+		ObjectMeta: metav1.ObjectMeta{Name: "transition-mapping", Namespace: ns.Name},
+		Spec: v1alpha1.PodASGMappingSpec{
+			Mappings: []v1alpha1.Mapping{
+				{
+					PodSelector: v1alpha1.PodSelector{MatchLabels: map[string]string{"app": "transition"}},
+					ApplicationSecurityGroups: []v1alpha1.ASGReference{
+						{ResourceID: asgResourceID("sub1", "rg1", "asg-old")},
+					},
+				},
+			},
+		},
+	}
+	if err := te.k8sClient.Create(ctx, mapping); err != nil {
+		t.Fatalf("failed to create mapping: %v", err)
+	}
+
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "transition-pod",
+			Namespace: ns.Name,
+			Labels:    map[string]string{"app": "transition"},
+		},
+		Spec: corev1.PodSpec{
+			Containers: []corev1.Container{{Name: "app", Image: "nginx"}},
+		},
+	}
+	if err := te.k8sClient.Create(ctx, pod); err != nil {
+		t.Fatalf("failed to create pod: %v", err)
+	}
+	pod.Status.PodIP = "10.0.2.1"
+	if err := te.k8sClient.Status().Update(ctx, pod); err != nil {
+		t.Fatalf("failed to set pod IP: %v", err)
+	}
+
+	ownershipKey := "test-cluster-" + ns.Name + "-transition-mapping"
+
+	// Wait for the old spec to reconcile and produce Azure state
+	eventually(t, 15*time.Second, 300*time.Millisecond, func() bool {
+		ps, err := te.fakeClient.Get(ctx, "sub1", "rg1", "asg-old", ownershipKey)
+		if err != nil || ps.Properties == nil {
+			return false
+		}
+		for _, ip := range ps.Properties.AddressPrefixes {
+			if ip == "10.0.2.1/32" {
+				return true
+			}
+		}
+		return false
+	}, "expected pod IP in asg-old before spec change")
+
+	// Change the mapping to point to asg-new (generation bump invalidates cache)
+	if err := te.k8sClient.Get(ctx, types.NamespacedName{Name: "transition-mapping", Namespace: ns.Name}, mapping); err != nil {
+		t.Fatalf("failed to get mapping for update: %v", err)
+	}
+	mapping.Spec.Mappings[0].ApplicationSecurityGroups[0].ResourceID = asgResourceID("sub1", "rg1", "asg1")
+	if err := te.k8sClient.Update(ctx, mapping); err != nil {
+		t.Fatalf("failed to update mapping to new spec: %v", err)
+	}
+
+	// After spec change, the pod IP should appear at the new target (fresh recompute, not cached old data)
+	eventually(t, 15*time.Second, 300*time.Millisecond, func() bool {
+		ps, err := te.fakeClient.Get(ctx, "sub1", "rg1", "asg1", ownershipKey)
+		if err != nil || ps.Properties == nil {
+			return false
+		}
+		for _, ip := range ps.Properties.AddressPrefixes {
+			if ip == "10.0.2.1/32" {
+				return true
+			}
+		}
+		return false
+	}, "expected pod IP after spec transition (no stale cache reuse)")
+}
+
+// ---------------------------------------------------------------------------
+// TestPhase5_ValidToValid_SelectorChange_NoStaleCarryover
+// A valid-to-valid selector change must produce Azure state from the new
+// generation's selector without stale prior-generation data.
+// ---------------------------------------------------------------------------
+func TestPhase5_ValidToValid_SelectorChange_NoStaleCarryover(t *testing.T) {
+	te := setupTestEnv(t)
+	defer te.teardown(t)
+	ctx := context.Background()
+
+	ns := &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: "test-selector-change"}}
+	if err := te.k8sClient.Create(ctx, ns); err != nil {
+		t.Fatalf("failed to create namespace: %v", err)
+	}
+
+	// Initial mapping selects app=v1
+	mapping := &v1alpha1.PodASGMapping{
+		ObjectMeta: metav1.ObjectMeta{Name: "selector-mapping", Namespace: ns.Name},
+		Spec: v1alpha1.PodASGMappingSpec{
+			Mappings: []v1alpha1.Mapping{
+				{
+					PodSelector: v1alpha1.PodSelector{MatchLabels: map[string]string{"app": "v1"}},
+					ApplicationSecurityGroups: []v1alpha1.ASGReference{
+						{ResourceID: asgResourceID("sub1", "rg1", "asg1")},
+					},
+				},
+			},
+		},
+	}
+	if err := te.k8sClient.Create(ctx, mapping); err != nil {
+		t.Fatalf("failed to create mapping: %v", err)
+	}
+
+	// Pod matching v1
+	podV1 := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "v1-pod",
+			Namespace: ns.Name,
+			Labels:    map[string]string{"app": "v1"},
+		},
+		Spec: corev1.PodSpec{
+			Containers: []corev1.Container{{Name: "app", Image: "nginx"}},
+		},
+	}
+	if err := te.k8sClient.Create(ctx, podV1); err != nil {
+		t.Fatalf("failed to create v1 pod: %v", err)
+	}
+	podV1.Status.PodIP = "10.0.3.1"
+	if err := te.k8sClient.Status().Update(ctx, podV1); err != nil {
+		t.Fatalf("failed to set v1 pod IP: %v", err)
+	}
+
+	// Pod matching v2 (pre-created)
+	podV2 := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "v2-pod",
+			Namespace: ns.Name,
+			Labels:    map[string]string{"app": "v2"},
+		},
+		Spec: corev1.PodSpec{
+			Containers: []corev1.Container{{Name: "app", Image: "nginx"}},
+		},
+	}
+	if err := te.k8sClient.Create(ctx, podV2); err != nil {
+		t.Fatalf("failed to create v2 pod: %v", err)
+	}
+	podV2.Status.PodIP = "10.0.3.2"
+	if err := te.k8sClient.Status().Update(ctx, podV2); err != nil {
+		t.Fatalf("failed to set v2 pod IP: %v", err)
+	}
+
+	ownershipKey := "test-cluster-" + ns.Name + "-selector-mapping"
+
+	// Wait for v1 IP to appear
+	eventually(t, 15*time.Second, 300*time.Millisecond, func() bool {
+		ps, err := te.fakeClient.Get(ctx, "sub1", "rg1", "asg1", ownershipKey)
+		if err != nil || ps.Properties == nil {
+			return false
+		}
+		for _, ip := range ps.Properties.AddressPrefixes {
+			if ip == "10.0.3.1/32" {
+				return true
+			}
+		}
+		return false
+	}, "expected v1 pod IP in prefix set")
+
+	// Change selector from app=v1 to app=v2 (valid-to-valid generation change)
+	if err := te.k8sClient.Get(ctx, types.NamespacedName{Name: "selector-mapping", Namespace: ns.Name}, mapping); err != nil {
+		t.Fatalf("failed to get mapping for update: %v", err)
+	}
+	mapping.Spec.Mappings[0].PodSelector.MatchLabels = map[string]string{"app": "v2"}
+	if err := te.k8sClient.Update(ctx, mapping); err != nil {
+		t.Fatalf("failed to update mapping selector: %v", err)
+	}
+
+	// After selector change: v2 IP should appear, v1 IP should be removed
+	eventually(t, 15*time.Second, 300*time.Millisecond, func() bool {
+		ps, err := te.fakeClient.Get(ctx, "sub1", "rg1", "asg1", ownershipKey)
+		if err != nil || ps.Properties == nil {
+			return false
+		}
+		hasV2 := false
+		hasV1 := false
+		for _, ip := range ps.Properties.AddressPrefixes {
+			if ip == "10.0.3.2/32" {
+				hasV2 = true
+			}
+			if ip == "10.0.3.1/32" {
+				hasV1 = true
+			}
+		}
+		// v2 must be present, v1 must be gone (no stale carryover)
+		return hasV2 && !hasV1
+	}, "expected v2 IP present and v1 IP removed after selector change (no stale cache)")
+}
+
+// ---------------------------------------------------------------------------
+// TestPhase5_CrossModule_PodEventMutation_TerminalCleanup_StalePublish
+// Cross-module race: a pod event mutates cache version, terminal cleanup
+// bumps lifecycle epoch, and a stale recompute attempts to publish. The cache
+// must remain clean, and subsequent reconcile converges from fresh state.
+// ---------------------------------------------------------------------------
+func TestPhase5_CrossModule_PodEventMutation_TerminalCleanup_StalePublish(t *testing.T) {
+	te := setupTestEnv(t)
+	defer te.teardown(t)
+	ctx := context.Background()
+
+	ns := &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: "test-cross-race"}}
+	if err := te.k8sClient.Create(ctx, ns); err != nil {
+		t.Fatalf("failed to create namespace: %v", err)
+	}
+
+	// Create mapping and pods
+	mapping := &v1alpha1.PodASGMapping{
+		ObjectMeta: metav1.ObjectMeta{Name: "cross-race-mapping", Namespace: ns.Name},
+		Spec: v1alpha1.PodASGMappingSpec{
+			Mappings: []v1alpha1.Mapping{
+				{
+					PodSelector: v1alpha1.PodSelector{MatchLabels: map[string]string{"app": "race"}},
+					ApplicationSecurityGroups: []v1alpha1.ASGReference{
+						{ResourceID: asgResourceID("sub1", "rg1", "asg1")},
+					},
+				},
+			},
+		},
+	}
+	if err := te.k8sClient.Create(ctx, mapping); err != nil {
+		t.Fatalf("failed to create mapping: %v", err)
+	}
+
+	pod1 := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "race-pod-1",
+			Namespace: ns.Name,
+			Labels:    map[string]string{"app": "race"},
+		},
+		Spec: corev1.PodSpec{Containers: []corev1.Container{{Name: "app", Image: "nginx"}}},
+	}
+	if err := te.k8sClient.Create(ctx, pod1); err != nil {
+		t.Fatalf("failed to create pod: %v", err)
+	}
+	pod1.Status.PodIP = "10.0.1.1"
+	if err := te.k8sClient.Status().Update(ctx, pod1); err != nil {
+		t.Fatalf("failed to set pod IP: %v", err)
+	}
+
+	ownershipKey := "test-cluster-" + ns.Name + "-cross-race-mapping"
+
+	// Wait for initial reconcile to converge
+	eventually(t, 15*time.Second, 300*time.Millisecond, func() bool {
+		ps, err := te.fakeClient.Get(ctx, "sub1", "rg1", "asg1", ownershipKey)
+		if err != nil || ps.Properties == nil {
+			return false
+		}
+		for _, ip := range ps.Properties.AddressPrefixes {
+			if ip == "10.0.1.1/32" {
+				return true
+			}
+		}
+		return false
+	}, "expected pod-1 IP in prefix set")
+
+	// Rapid sequence: add pod (pod event mutation) → delete mapping (terminal cleanup)
+	pod2 := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "race-pod-2",
+			Namespace: ns.Name,
+			Labels:    map[string]string{"app": "race"},
+		},
+		Spec: corev1.PodSpec{Containers: []corev1.Container{{Name: "app", Image: "nginx"}}},
+	}
+	if err := te.k8sClient.Create(ctx, pod2); err != nil {
+		t.Fatalf("failed to create pod-2: %v", err)
+	}
+	pod2.Status.PodIP = "10.0.1.2"
+	if err := te.k8sClient.Status().Update(ctx, pod2); err != nil {
+		t.Fatalf("failed to set pod-2 IP: %v", err)
+	}
+
+	// Immediately delete the mapping (races with pod-2 event)
+	if err := te.k8sClient.Delete(ctx, mapping); err != nil {
+		t.Fatalf("failed to delete mapping: %v", err)
+	}
+
+	// After terminal cleanup, prefix set should be cleaned up
+	eventually(t, 15*time.Second, 500*time.Millisecond, func() bool {
+		ps, err := te.fakeClient.Get(ctx, "sub1", "rg1", "asg1", ownershipKey)
+		if err != nil {
+			return true // not found = cleaned up
+		}
+		return ps.Properties == nil || len(ps.Properties.AddressPrefixes) == 0
+	}, "expected prefix set cleaned up after terminal delete despite concurrent pod events")
+
+	// Recreate mapping to verify clean convergence from fresh state
+	freshMapping := &v1alpha1.PodASGMapping{
+		ObjectMeta: metav1.ObjectMeta{Name: "cross-race-mapping", Namespace: ns.Name},
+		Spec: v1alpha1.PodASGMappingSpec{
+			Mappings: []v1alpha1.Mapping{
+				{
+					PodSelector: v1alpha1.PodSelector{MatchLabels: map[string]string{"app": "fresh"}},
+					ApplicationSecurityGroups: []v1alpha1.ASGReference{
+						{ResourceID: asgResourceID("sub1", "rg1", "asg1")},
+					},
+				},
+			},
+		},
+	}
+	if err := te.k8sClient.Create(ctx, freshMapping); err != nil {
+		t.Fatalf("failed to recreate mapping: %v", err)
+	}
+
+	pod3 := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "fresh-pod",
+			Namespace: ns.Name,
+			Labels:    map[string]string{"app": "fresh"},
+		},
+		Spec: corev1.PodSpec{Containers: []corev1.Container{{Name: "app", Image: "nginx"}}},
+	}
+	if err := te.k8sClient.Create(ctx, pod3); err != nil {
+		t.Fatalf("failed to create fresh pod: %v", err)
+	}
+	pod3.Status.PodIP = "10.0.1.3"
+	if err := te.k8sClient.Status().Update(ctx, pod3); err != nil {
+		t.Fatalf("failed to set fresh pod IP: %v", err)
+	}
+
+	// Fresh reconcile should converge with only the new pod's IP
+	eventually(t, 15*time.Second, 300*time.Millisecond, func() bool {
+		ps, err := te.fakeClient.Get(ctx, "sub1", "rg1", "asg1", ownershipKey)
+		if err != nil || ps.Properties == nil {
+			return false
+		}
+		hasFresh := false
+		hasStale := false
+		for _, ip := range ps.Properties.AddressPrefixes {
+			if ip == "10.0.1.3/32" {
+				hasFresh = true
+			}
+			if ip == "10.0.1.1/32" || ip == "10.0.1.2/32" {
+				hasStale = true
+			}
+		}
+		return hasFresh && !hasStale
+	}, "Phase 5: after cross-module race (pod event + terminal cleanup + recreate), only fresh state should converge")
+}

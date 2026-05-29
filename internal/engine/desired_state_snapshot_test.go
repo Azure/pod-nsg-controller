@@ -197,3 +197,145 @@ func TestPhase8_ComputeDesiredStateWithSnapshot_PodWithoutIPExcluded(t *testing.
 		t.Errorf("snapshot.Pods length = %d, want 1 (exclude pods without IP)", len(snapshot.Pods))
 	}
 }
+
+// ===========================================================================
+// Phase 5: Desired-State Cache — Snapshot Extraction Tests
+// ===========================================================================
+
+// ---------------------------------------------------------------------------
+// TestPhase5_ComputeDesiredStateWithSnapshot_HelperExtraction_PreservesParity
+// After extracting shared evaluation logic, ComputeDesiredStateWithSnapshot
+// should still produce identical results for desired state and snapshot.
+// ---------------------------------------------------------------------------
+func TestPhase5_ComputeDesiredStateWithSnapshot_HelperExtraction_PreservesParity(t *testing.T) {
+	mappings := []v1alpha1.PodASGMapping{
+		makeMapping("default", "mapping-1", []v1alpha1.Mapping{
+			{
+				PodSelector: v1alpha1.PodSelector{
+					MatchLabels: map[string]string{"app": "web"},
+				},
+				ApplicationSecurityGroups: []v1alpha1.ASGReference{
+					{ResourceID: makeASGResourceID("sub-1", "rg-1", "asg-1")},
+					{ResourceID: makeASGResourceID("sub-1", "rg-1", "asg-2")},
+				},
+			},
+			{
+				PodSelector: v1alpha1.PodSelector{
+					MatchLabels: map[string]string{"tier": "backend"},
+				},
+				ApplicationSecurityGroups: []v1alpha1.ASGReference{
+					{ResourceID: makeASGResourceID("sub-1", "rg-1", "asg-3")},
+				},
+			},
+		}),
+	}
+	pods := []corev1.Pod{
+		makePod("default", "web-pod-1", map[string]string{"app": "web"}, "10.0.0.1"),
+		makePod("default", "web-pod-2", map[string]string{"app": "web", "tier": "backend"}, "10.0.0.2"),
+		makePod("default", "backend-pod", map[string]string{"tier": "backend"}, "10.0.0.3"),
+		makePod("default", "unrelated-pod", map[string]string{"app": "db"}, "10.0.0.4"),
+	}
+
+	desired, snapshot := ComputeDesiredStateWithSnapshot("test-cluster", mappings, pods)
+
+	// Verify desired state has correct targets
+	if len(desired) == 0 {
+		t.Fatal("expected non-empty desired state")
+	}
+
+	// Count unique pods in snapshot: web-pod-1, web-pod-2, backend-pod
+	// (web-pod-2 matches both rules but should be deduplicated)
+	if len(snapshot.Pods) != 3 {
+		t.Errorf("snapshot.Pods length = %d, want 3 (web-pod-1, web-pod-2, backend-pod)", len(snapshot.Pods))
+	}
+
+	// Verify the shared evaluation logic: web-pod-2 matches both selectors
+	// and contributes to asg-1, asg-2 (via app=web) and asg-3 (via tier=backend)
+	foundWebPod2 := false
+	for id, member := range snapshot.Pods {
+		if id.Name == "web-pod-2" {
+			foundWebPod2 = true
+			if member.PodIP != "10.0.0.2" {
+				t.Errorf("web-pod-2 IP = %q, want 10.0.0.2", member.PodIP)
+			}
+		}
+	}
+	if !foundWebPod2 {
+		t.Error("snapshot missing web-pod-2 which matches multiple selectors")
+	}
+
+	// Verify parity: ComputeDesiredState produces same desired state
+	desiredOnly := ComputeDesiredState("test-cluster", mappings, pods)
+	if len(desiredOnly) != len(desired) {
+		t.Errorf("desired state count mismatch: ComputeDesiredState=%d vs WithSnapshot=%d",
+			len(desiredOnly), len(desired))
+	}
+	for target, dps := range desiredOnly {
+		withSnap, ok := desired[target]
+		if !ok {
+			t.Errorf("target %v present in ComputeDesiredState but missing from WithSnapshot", target)
+			continue
+		}
+		if len(dps.IPs) != len(withSnap.IPs) {
+			t.Errorf("IP set length mismatch for target %v: %d vs %d",
+				target, len(dps.IPs), len(withSnap.IPs))
+		}
+	}
+}
+
+// ---------------------------------------------------------------------------
+// TestPhase5_ComputeDesiredStateWithSnapshot_PendingIPPods_Tracked
+// Pods without IP should be excluded from desired IPs but tracked for
+// pending-IP detection in the cache.
+// ---------------------------------------------------------------------------
+func TestPhase5_ComputeDesiredStateWithSnapshot_PendingIPPods_Tracked(t *testing.T) {
+	mappings := []v1alpha1.PodASGMapping{
+		makeMapping("default", "mapping-1", []v1alpha1.Mapping{
+			{
+				PodSelector: v1alpha1.PodSelector{
+					MatchLabels: map[string]string{"app": "web"},
+				},
+				ApplicationSecurityGroups: []v1alpha1.ASGReference{
+					{ResourceID: makeASGResourceID("sub-1", "rg-1", "asg-1")},
+				},
+			},
+		}),
+	}
+	pods := []corev1.Pod{
+		makePod("default", "pod-with-ip", map[string]string{"app": "web"}, "10.0.0.1"),
+		// Pods without IPs (pending scheduling)
+		{
+			ObjectMeta: metav1.ObjectMeta{
+				Namespace: "default",
+				Name:      "pod-no-ip-1",
+				Labels:    map[string]string{"app": "web"},
+			},
+			Status: corev1.PodStatus{PodIP: ""},
+		},
+		{
+			ObjectMeta: metav1.ObjectMeta{
+				Namespace: "default",
+				Name:      "pod-no-ip-2",
+				Labels:    map[string]string{"app": "web"},
+			},
+			Status: corev1.PodStatus{PodIP: ""},
+		},
+	}
+
+	desired, snapshot := ComputeDesiredStateWithSnapshot("test-cluster", mappings, pods)
+
+	// Only pod-with-ip should contribute to desired IPs
+	for _, dps := range desired {
+		if len(dps.IPs) != 1 {
+			t.Errorf("desired IPs = %d, want 1 (only pod with IP contributes)", len(dps.IPs))
+		}
+		if _, ok := dps.IPs["10.0.0.1/32"]; !ok {
+			t.Errorf("desired IPs should contain 10.0.0.1/32, got %v", dps.IPs)
+		}
+	}
+
+	// Snapshot should only contain the pod with IP
+	if len(snapshot.Pods) != 1 {
+		t.Errorf("snapshot.Pods = %d, want 1 (only pods with IP in snapshot)", len(snapshot.Pods))
+	}
+}

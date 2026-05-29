@@ -10,6 +10,7 @@ import (
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/builder"
 	ctrlcontroller "sigs.k8s.io/controller-runtime/pkg/controller"
+	"sigs.k8s.io/controller-runtime/pkg/handler"
 )
 
 // controllerSeq provides unique controller names to avoid prometheus metrics
@@ -19,11 +20,21 @@ var controllerSeq int64
 
 // SetupWithManager registers the MappingReconciler watches.
 func (r *MappingReconciler) SetupWithManager(mgr ctrl.Manager) error {
-	podHandler := NewPodToMappingEventHandler(
-		mgr.GetClient(),
-		ctrl.Log.WithName("pod-handler"),
-		r.MinReconcileInterval,
-	)
+	var podHandler handler.EventHandler
+	if r.DesiredStateCache != nil {
+		podHandler = NewPodToMappingEventHandlerWithCache(
+			mgr.GetClient(),
+			ctrl.Log.WithName("pod-handler"),
+			r.MinReconcileInterval,
+			r.DesiredStateCache,
+		)
+	} else {
+		podHandler = NewPodToMappingEventHandler(
+			mgr.GetClient(),
+			ctrl.Log.WithName("pod-handler"),
+			r.MinReconcileInterval,
+		)
+	}
 
 	name := fmt.Sprintf("podasgmapping-%d", atomic.AddInt64(&controllerSeq, 1))
 

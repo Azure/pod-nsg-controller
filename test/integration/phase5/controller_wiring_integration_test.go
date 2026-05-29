@@ -129,12 +129,13 @@ func asgResourceID(sub, rg, name string) string {
 }
 
 type testEnv struct {
-	env         *envtest.Environment
-	k8sClient   client.Client
-	mgr         ctrl.Manager
-	cancel      context.CancelFunc
-	fakeClient  *fake.Client
-	fakeFactory *fake.ClientFactory
+	env              *envtest.Environment
+	k8sClient        client.Client
+	mgr              ctrl.Manager
+	cancel           context.CancelFunc
+	fakeClient       *fake.Client
+	fakeFactory      *fake.ClientFactory
+	desiredStateCache *engine.DesiredStateCache
 }
 
 func setupTestEnv(t *testing.T) *testEnv {
@@ -163,13 +164,16 @@ func setupTestEnv(t *testing.T) *testEnv {
 
 	executor := azure.NewExecutor(zapLog, fakeFactory, 2)
 
+	desiredStateCache := engine.NewDesiredStateCache("test-cluster")
+
 	reconciler := &controller.MappingReconciler{
-		Client:           mgr.GetClient(),
-		Scheme:           scheme,
-		ClusterName:      "test-cluster",
-		ResyncInterval:   2 * time.Second, // short for testing
-		PrefixSetFactory: fakeFactory,
-		Executor:         executor,
+		Client:            mgr.GetClient(),
+		Scheme:            scheme,
+		ClusterName:       "test-cluster",
+		ResyncInterval:    2 * time.Second, // short for testing
+		PrefixSetFactory:  fakeFactory,
+		Executor:          executor,
+		DesiredStateCache: desiredStateCache,
 	}
 
 	if err := reconciler.SetupWithManager(mgr); err != nil {
@@ -193,12 +197,13 @@ func setupTestEnv(t *testing.T) *testEnv {
 	}
 
 	return &testEnv{
-		env:         env,
-		k8sClient:   mgr.GetClient(),
-		mgr:         mgr,
-		cancel:      cancel,
-		fakeClient:  fakeAzClient,
-		fakeFactory: fakeFactory,
+		env:               env,
+		k8sClient:         mgr.GetClient(),
+		mgr:               mgr,
+		cancel:            cancel,
+		fakeClient:        fakeAzClient,
+		fakeFactory:       fakeFactory,
+		desiredStateCache: desiredStateCache,
 	}
 }
 
@@ -1239,12 +1244,13 @@ func setupTestEnvWithConcurrency(t *testing.T, maxConcurrentReconciles int) (*te
 	}
 
 	return &testEnv{
-		env:         env,
-		k8sClient:   mgr.GetClient(),
-		mgr:         mgr,
-		cancel:      cancel,
-		fakeClient:  fakeAzClient,
-		fakeFactory: fakeFactory,
+		env:               env,
+		k8sClient:         mgr.GetClient(),
+		mgr:               mgr,
+		cancel:            cancel,
+		fakeClient:        fakeAzClient,
+		fakeFactory:       fakeFactory,
+		desiredStateCache: nil, // not tracked in blocking variant
 	}, blockExec
 }
 
@@ -1659,4 +1665,424 @@ func TestPhase3_PodBurstDebounce_CoalescesReconcileCycles(t *testing.T) {
 	if !hasLastIP {
 		t.Errorf("Phase 3: final prefix set does not contain last IP %s; got %v", finalIP, ips)
 	}
+}
+
+// ===========================================================================
+// Phase 5: Desired-State Cache — Controller Wiring Integration Tests
+// ===========================================================================
+
+// ---------------------------------------------------------------------------
+// TestPhase5_CacheWiring_SharedBetweenPodHandlerAndReconciler
+// Validates that a shared DesiredStateCache instance is passed to both the
+// pod handler and the reconciler, enabling cache-first reconcile paths.
+// ---------------------------------------------------------------------------
+func TestPhase5_CacheWiring_SharedBetweenPodHandlerAndReconciler(t *testing.T) {
+	te := setupTestEnv(t)
+	defer te.teardown(t)
+	ctx := context.Background()
+
+	ns := &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: "test-cache-wiring"}}
+	if err := te.k8sClient.Create(ctx, ns); err != nil {
+		t.Fatalf("failed to create namespace: %v", err)
+	}
+
+	mapping := &v1alpha1.PodASGMapping{
+		ObjectMeta: metav1.ObjectMeta{Name: "cache-wiring-mapping", Namespace: ns.Name},
+		Spec: v1alpha1.PodASGMappingSpec{
+			Mappings: []v1alpha1.Mapping{
+				{
+					PodSelector: v1alpha1.PodSelector{MatchLabels: map[string]string{"app": "cache-test"}},
+					ApplicationSecurityGroups: []v1alpha1.ASGReference{
+						{ResourceID: asgResourceID("sub1", "rg1", "asg1")},
+					},
+				},
+			},
+		},
+	}
+	if err := te.k8sClient.Create(ctx, mapping); err != nil {
+		t.Fatalf("failed to create mapping: %v", err)
+	}
+
+	// Create a pod that triggers reconciliation
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "cache-test-pod",
+			Namespace: ns.Name,
+			Labels:    map[string]string{"app": "cache-test"},
+		},
+		Spec: corev1.PodSpec{
+			Containers: []corev1.Container{{Name: "app", Image: "nginx"}},
+		},
+	}
+	if err := te.k8sClient.Create(ctx, pod); err != nil {
+		t.Fatalf("failed to create pod: %v", err)
+	}
+	pod.Status.PodIP = "10.0.0.1"
+	if err := te.k8sClient.Status().Update(ctx, pod); err != nil {
+		t.Fatalf("failed to set pod IP: %v", err)
+	}
+
+	ownershipKey := "test-cluster-" + ns.Name + "-cache-wiring-mapping"
+
+	// Wait for initial reconcile to complete (creates prefix set)
+	eventually(t, 15*time.Second, 300*time.Millisecond, func() bool {
+		ps, err := te.fakeClient.Get(ctx, "sub1", "rg1", "asg1", ownershipKey)
+		if err != nil || ps.Properties == nil {
+			return false
+		}
+		for _, ip := range ps.Properties.AddressPrefixes {
+			if ip == "10.0.0.1/32" {
+				return true
+			}
+		}
+		return false
+	}, "expected initial pod IP in prefix set")
+
+	// Now add another pod — this should trigger cache path (if wired correctly)
+	pod2 := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "cache-test-pod-2",
+			Namespace: ns.Name,
+			Labels:    map[string]string{"app": "cache-test"},
+		},
+		Spec: corev1.PodSpec{
+			Containers: []corev1.Container{{Name: "app", Image: "nginx"}},
+		},
+	}
+	if err := te.k8sClient.Create(ctx, pod2); err != nil {
+		t.Fatalf("failed to create pod2: %v", err)
+	}
+	pod2.Status.PodIP = "10.0.0.2"
+	if err := te.k8sClient.Status().Update(ctx, pod2); err != nil {
+		t.Fatalf("failed to set pod2 IP: %v", err)
+	}
+
+	// Verify the second pod's IP also appears
+	eventually(t, 15*time.Second, 300*time.Millisecond, func() bool {
+		ps, err := te.fakeClient.Get(ctx, "sub1", "rg1", "asg1", ownershipKey)
+		if err != nil || ps.Properties == nil {
+			return false
+		}
+		ips := make(map[string]bool)
+		for _, ip := range ps.Properties.AddressPrefixes {
+			ips[ip] = true
+		}
+		return ips["10.0.0.1/32"] && ips["10.0.0.2/32"]
+	}, "expected both pod IPs after cache-backed reconcile")
+}
+
+// ---------------------------------------------------------------------------
+// TestPhase5_PeriodicResync_CorrectsDriftWithCache
+// Even when cache is populated, periodic resync should still correct Azure
+// drift by forcing a full recompute.
+// ---------------------------------------------------------------------------
+func TestPhase5_PeriodicResync_CorrectsDriftWithCache(t *testing.T) {
+	te := setupTestEnv(t)
+	defer te.teardown(t)
+	ctx := context.Background()
+
+	ns := &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: "test-resync-drift-cache"}}
+	if err := te.k8sClient.Create(ctx, ns); err != nil {
+		t.Fatalf("failed to create namespace: %v", err)
+	}
+
+	mapping := &v1alpha1.PodASGMapping{
+		ObjectMeta: metav1.ObjectMeta{Name: "drift-mapping", Namespace: ns.Name},
+		Spec: v1alpha1.PodASGMappingSpec{
+			Mappings: []v1alpha1.Mapping{
+				{
+					PodSelector: v1alpha1.PodSelector{MatchLabels: map[string]string{"app": "drift-test"}},
+					ApplicationSecurityGroups: []v1alpha1.ASGReference{
+						{ResourceID: asgResourceID("sub1", "rg1", "asg1")},
+					},
+				},
+			},
+		},
+	}
+	if err := te.k8sClient.Create(ctx, mapping); err != nil {
+		t.Fatalf("failed to create mapping: %v", err)
+	}
+
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "drift-pod",
+			Namespace: ns.Name,
+			Labels:    map[string]string{"app": "drift-test"},
+		},
+		Spec: corev1.PodSpec{
+			Containers: []corev1.Container{{Name: "app", Image: "nginx"}},
+		},
+	}
+	if err := te.k8sClient.Create(ctx, pod); err != nil {
+		t.Fatalf("failed to create pod: %v", err)
+	}
+	pod.Status.PodIP = "10.0.0.1"
+	if err := te.k8sClient.Status().Update(ctx, pod); err != nil {
+		t.Fatalf("failed to set pod IP: %v", err)
+	}
+
+	ownershipKey := "test-cluster-" + ns.Name + "-drift-mapping"
+
+	// Wait for initial sync
+	eventually(t, 15*time.Second, 300*time.Millisecond, func() bool {
+		ps, err := te.fakeClient.Get(ctx, "sub1", "rg1", "asg1", ownershipKey)
+		if err != nil || ps.Properties == nil {
+			return false
+		}
+		for _, ip := range ps.Properties.AddressPrefixes {
+			if ip == "10.0.0.1/32" {
+				return true
+			}
+		}
+		return false
+	}, "expected initial IP in prefix set")
+
+	// Simulate external drift: put rogue data directly into the fake client
+	if err := te.fakeClient.Put(ctx, "sub1", "rg1", "asg1", ownershipKey, []string{"10.0.0.1/32", "ROGUE_IP/32"}); err != nil {
+		t.Fatalf("failed to inject drift: %v", err)
+	}
+
+	// The periodic resync (2s in test env) should correct the drift
+	eventually(t, 10*time.Second, 500*time.Millisecond, func() bool {
+		ps, err := te.fakeClient.Get(ctx, "sub1", "rg1", "asg1", ownershipKey)
+		if err != nil || ps.Properties == nil {
+			return false
+		}
+		for _, ip := range ps.Properties.AddressPrefixes {
+			if ip == "ROGUE_IP/32" {
+				return false // drift not yet corrected
+			}
+		}
+		return true
+	}, "expected periodic resync to correct drift even with cache")
+}
+
+// ---------------------------------------------------------------------------
+// TestPhase5_DeleteRecreateRace_StaleInFlightCannotRepopulateCache
+// Integration test: a mapping is deleted and recreated with the same name.
+// A stale in-flight reconcile from the old object must not repopulate the
+// desired-state cache for the recreated mapping key.
+// ---------------------------------------------------------------------------
+func TestPhase5_DeleteRecreateRace_StaleInFlightCannotRepopulateCache(t *testing.T) {
+	te := setupTestEnv(t)
+	defer te.teardown(t)
+	ctx := context.Background()
+
+	ns := &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: "test-delete-recreate-race"}}
+	if err := te.k8sClient.Create(ctx, ns); err != nil {
+		t.Fatalf("failed to create namespace: %v", err)
+	}
+
+	// Create initial mapping + pod
+	mapping := &v1alpha1.PodASGMapping{
+		ObjectMeta: metav1.ObjectMeta{Name: "race-mapping", Namespace: ns.Name},
+		Spec: v1alpha1.PodASGMappingSpec{
+			Mappings: []v1alpha1.Mapping{
+				{
+					PodSelector: v1alpha1.PodSelector{MatchLabels: map[string]string{"app": "v1"}},
+					ApplicationSecurityGroups: []v1alpha1.ASGReference{
+						{ResourceID: asgResourceID("sub1", "rg1", "asg1")},
+					},
+				},
+			},
+		},
+	}
+	if err := te.k8sClient.Create(ctx, mapping); err != nil {
+		t.Fatalf("failed to create mapping: %v", err)
+	}
+
+	pod1 := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "v1-pod",
+			Namespace: ns.Name,
+			Labels:    map[string]string{"app": "v1"},
+		},
+		Spec: corev1.PodSpec{Containers: []corev1.Container{{Name: "app", Image: "nginx"}}},
+	}
+	if err := te.k8sClient.Create(ctx, pod1); err != nil {
+		t.Fatalf("failed to create pod: %v", err)
+	}
+	pod1.Status.PodIP = "10.0.0.1"
+	if err := te.k8sClient.Status().Update(ctx, pod1); err != nil {
+		t.Fatalf("failed to set pod IP: %v", err)
+	}
+
+	ownershipKey := "test-cluster-" + ns.Name + "-race-mapping"
+
+	// Wait for initial reconciliation
+	eventually(t, 15*time.Second, 300*time.Millisecond, func() bool {
+		ps, err := te.fakeClient.Get(ctx, "sub1", "rg1", "asg1", ownershipKey)
+		if err != nil || ps.Properties == nil {
+			return false
+		}
+		for _, ip := range ps.Properties.AddressPrefixes {
+			if ip == "10.0.0.1/32" {
+				return true
+			}
+		}
+		return false
+	}, "expected initial IP in prefix set before delete/recreate")
+
+	// Delete the mapping
+	if err := te.k8sClient.Delete(ctx, mapping); err != nil {
+		t.Fatalf("failed to delete mapping: %v", err)
+	}
+
+	// Wait for cleanup (prefix set should be empty/deleted)
+	eventually(t, 15*time.Second, 300*time.Millisecond, func() bool {
+		ps, err := te.fakeClient.Get(ctx, "sub1", "rg1", "asg1", ownershipKey)
+		if err != nil {
+			return true // not found = cleaned up
+		}
+		return ps.Properties == nil || len(ps.Properties.AddressPrefixes) == 0
+	}, "expected prefix set cleaned up after mapping delete")
+
+	// Recreate mapping with different selector (v2)
+	newMapping := &v1alpha1.PodASGMapping{
+		ObjectMeta: metav1.ObjectMeta{Name: "race-mapping", Namespace: ns.Name},
+		Spec: v1alpha1.PodASGMappingSpec{
+			Mappings: []v1alpha1.Mapping{
+				{
+					PodSelector: v1alpha1.PodSelector{MatchLabels: map[string]string{"app": "v2"}},
+					ApplicationSecurityGroups: []v1alpha1.ASGReference{
+						{ResourceID: asgResourceID("sub1", "rg1", "asg1")},
+					},
+				},
+			},
+		},
+	}
+	if err := te.k8sClient.Create(ctx, newMapping); err != nil {
+		t.Fatalf("failed to recreate mapping: %v", err)
+	}
+
+	// Create a v2 pod
+	pod2 := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "v2-pod",
+			Namespace: ns.Name,
+			Labels:    map[string]string{"app": "v2"},
+		},
+		Spec: corev1.PodSpec{Containers: []corev1.Container{{Name: "app", Image: "nginx"}}},
+	}
+	if err := te.k8sClient.Create(ctx, pod2); err != nil {
+		t.Fatalf("failed to create v2 pod: %v", err)
+	}
+	pod2.Status.PodIP = "10.0.0.2"
+	if err := te.k8sClient.Status().Update(ctx, pod2); err != nil {
+		t.Fatalf("failed to set v2 pod IP: %v", err)
+	}
+
+	// After reconciliation, only v2 IP should be present (v1 stale data must not leak)
+	eventually(t, 15*time.Second, 300*time.Millisecond, func() bool {
+		ps, err := te.fakeClient.Get(ctx, "sub1", "rg1", "asg1", ownershipKey)
+		if err != nil || ps.Properties == nil {
+			return false
+		}
+		hasV2 := false
+		hasV1 := false
+		for _, ip := range ps.Properties.AddressPrefixes {
+			if ip == "10.0.0.2/32" {
+				hasV2 = true
+			}
+			if ip == "10.0.0.1/32" {
+				hasV1 = true
+			}
+		}
+		return hasV2 && !hasV1
+	}, "Phase 5: after delete/recreate, only v2 IP should be present; stale v1 cache must not repopulate")
+}
+
+// ---------------------------------------------------------------------------
+// TestPhase5_TerminalNotFound_StaleInFlightCannotRepopulateCache
+// Integration test: a mapping is deleted (becomes NotFound). A stale in-flight
+// reconcile must not repopulate the cache after terminal cleanup.
+// ---------------------------------------------------------------------------
+func TestPhase5_TerminalNotFound_StaleInFlightCannotRepopulateCache(t *testing.T) {
+	te := setupTestEnv(t)
+	defer te.teardown(t)
+	ctx := context.Background()
+
+	ns := &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: "test-notfound-race"}}
+	if err := te.k8sClient.Create(ctx, ns); err != nil {
+		t.Fatalf("failed to create namespace: %v", err)
+	}
+
+	mapping := &v1alpha1.PodASGMapping{
+		ObjectMeta: metav1.ObjectMeta{Name: "ephemeral-mapping", Namespace: ns.Name},
+		Spec: v1alpha1.PodASGMappingSpec{
+			Mappings: []v1alpha1.Mapping{
+				{
+					PodSelector: v1alpha1.PodSelector{MatchLabels: map[string]string{"app": "temp"}},
+					ApplicationSecurityGroups: []v1alpha1.ASGReference{
+						{ResourceID: asgResourceID("sub1", "rg1", "asg1")},
+					},
+				},
+			},
+		},
+	}
+	if err := te.k8sClient.Create(ctx, mapping); err != nil {
+		t.Fatalf("failed to create mapping: %v", err)
+	}
+
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "temp-pod",
+			Namespace: ns.Name,
+			Labels:    map[string]string{"app": "temp"},
+		},
+		Spec: corev1.PodSpec{Containers: []corev1.Container{{Name: "app", Image: "nginx"}}},
+	}
+	if err := te.k8sClient.Create(ctx, pod); err != nil {
+		t.Fatalf("failed to create pod: %v", err)
+	}
+	pod.Status.PodIP = "10.0.0.10"
+	if err := te.k8sClient.Status().Update(ctx, pod); err != nil {
+		t.Fatalf("failed to set pod IP: %v", err)
+	}
+
+	ownershipKey := "test-cluster-" + ns.Name + "-ephemeral-mapping"
+
+	// Wait for initial reconciliation to populate prefix set
+	eventually(t, 15*time.Second, 300*time.Millisecond, func() bool {
+		ps, err := te.fakeClient.Get(ctx, "sub1", "rg1", "asg1", ownershipKey)
+		if err != nil || ps.Properties == nil {
+			return false
+		}
+		for _, ip := range ps.Properties.AddressPrefixes {
+			if ip == "10.0.0.10/32" {
+				return true
+			}
+		}
+		return false
+	}, "expected initial IP in prefix set before delete")
+
+	// Delete the mapping (terminal NotFound path)
+	if err := te.k8sClient.Delete(ctx, mapping); err != nil {
+		t.Fatalf("failed to delete mapping: %v", err)
+	}
+
+	// Wait for terminal cleanup
+	eventually(t, 15*time.Second, 300*time.Millisecond, func() bool {
+		ps, err := te.fakeClient.Get(ctx, "sub1", "rg1", "asg1", ownershipKey)
+		if err != nil {
+			return true // not found = cleaned up
+		}
+		return ps.Properties == nil || len(ps.Properties.AddressPrefixes) == 0
+	}, "expected prefix set cleaned up after terminal NotFound")
+
+	// After cleanup, verify the desired-state cache does not have stale data
+	// (The lifecycle epoch fence ensures stale in-flight reconciles cannot repopulate)
+	mappingObj := &v1alpha1.PodASGMapping{
+		ObjectMeta: metav1.ObjectMeta{Namespace: ns.Name, Name: "ephemeral-mapping", Generation: 1},
+		Spec:       mapping.Spec,
+	}
+	if _, ok := te.getDesiredStateCacheEntry(mappingObj); ok {
+		t.Error("Phase 5: desired-state cache must be empty after terminal NotFound cleanup")
+	}
+}
+
+// getDesiredStateCacheEntry is a test helper that reads from the test env's
+// desired state cache. Returns the entry and whether it was found.
+func (te *testEnv) getDesiredStateCacheEntry(mapping *v1alpha1.PodASGMapping) (engine.CachedDesiredState, bool) {
+	return te.desiredStateCache.Get(mapping)
 }

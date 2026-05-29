@@ -22,6 +22,7 @@ import (
 	"github.com/Azure/pod-nsg-controller/internal/azure"
 	"github.com/Azure/pod-nsg-controller/internal/config"
 	"github.com/Azure/pod-nsg-controller/internal/controller"
+	"github.com/Azure/pod-nsg-controller/internal/engine"
 	"github.com/Azure/pod-nsg-controller/internal/metrics"
 )
 
@@ -137,6 +138,8 @@ func main() {
 		}
 	})
 
+	desiredStateCache := engine.NewDesiredStateCache(cfg.ClusterName)
+
 	reconciler := &controller.MappingReconciler{
 		Client:                  mgr.GetClient(),
 		Scheme:                  mgr.GetScheme(),
@@ -150,6 +153,7 @@ func main() {
 		PrefixSetFactory:        prefixSetFactory,
 		Executor:                executor,
 		StatusUpdater:           statusUpdater,
+		DesiredStateCache:       desiredStateCache,
 		MetricsRecorder:         rec,
 		PodChurnTracker:         podChurnTracker,
 		ConvergenceTracker:      convergenceTracker,
