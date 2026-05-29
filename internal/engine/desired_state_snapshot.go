@@ -24,8 +24,46 @@ type PodSnapshot struct {
 	Pods map[PodIdentity]PodMembership
 }
 
+// matchPodToRuleIndices returns the indices of mapping rules whose selectors
+// match the given pod labels. Rules with invalid selectors are skipped.
+func matchPodToRuleIndices(mapping *v1alpha1.PodASGMapping, podLabels labels.Set) []int {
+	var indices []int
+	for i, rule := range mapping.Spec.Mappings {
+		selector, err := model.CompileSelector(rule.PodSelector)
+		if err != nil {
+			continue
+		}
+		if selector.Matches(podLabels) {
+			indices = append(indices, i)
+		}
+	}
+	return indices
+}
+
+// resolveRuleTargets resolves the ASG targets for a mapping rule, skipping
+// entries with invalid resource IDs.
+func resolveRuleTargets(rule v1alpha1.Mapping, prefixSetName string) []ASGTarget {
+	var targets []ASGTarget
+	for _, asgRef := range rule.ApplicationSecurityGroups {
+		parsed, err := model.ParseASGResourceID(asgRef.ResourceID)
+		if err != nil {
+			continue
+		}
+		targets = append(targets, ASGTarget{
+			SubscriptionID: parsed.SubscriptionID,
+			ResourceGroup:  parsed.ResourceGroup,
+			ASGName:        parsed.ASGName,
+			FullResourceID: parsed.FullResourceID,
+			PrefixSetName:  prefixSetName,
+		})
+	}
+	return targets
+}
+
 // ComputeDesiredStateWithSnapshot computes desired state and returns a PodSnapshot
 // of all matched pods. This is the snapshot-aware variant of ComputeDesiredState.
+// It uses the shared matchPodToRuleIndices and resolveRuleTargets helpers to keep
+// selector/target evaluation aligned with the incremental cache paths.
 func ComputeDesiredStateWithSnapshot(
 	clusterName string,
 	mappings []v1alpha1.PodASGMapping,
@@ -45,54 +83,39 @@ func ComputeDesiredStateWithSnapshot(
 		prefixSetName := model.OwnershipKey(clusterName, m.Namespace, m.Name)
 		namespacePods := podsByNamespace[m.Namespace]
 
-		for _, rule := range m.Spec.Mappings {
-			selector, err := model.CompileSelector(rule.PodSelector)
-			if err != nil {
+		for _, pod := range namespacePods {
+			if pod.Status.PodIP == "" {
 				continue
 			}
 
-			var matchedIPs []string
-			for _, pod := range namespacePods {
-				if !selector.Matches(labels.Set(pod.Labels)) {
-					continue
-				}
-				if pod.Status.PodIP != "" {
-					matchedIPs = append(matchedIPs, toCIDR(pod.Status.PodIP))
-					// Add matched pod to snapshot with raw IP (for churn metrics)
-					id := PodIdentity{
-						Namespace: pod.Namespace,
-						Name:      pod.Name,
-						UID:       string(pod.UID),
-					}
-					snapshot.Pods[id] = PodMembership{PodIP: pod.Status.PodIP}
-				}
+			matchedIndices := matchPodToRuleIndices(m, labels.Set(pod.Labels))
+			if len(matchedIndices) == 0 {
+				continue
 			}
 
-			for _, asgRef := range rule.ApplicationSecurityGroups {
-				parsed, err := model.ParseASGResourceID(asgRef.ResourceID)
-				if err != nil {
-					continue
-				}
+			cidr := toCIDR(pod.Status.PodIP)
+			id := PodIdentity{
+				Namespace: pod.Namespace,
+				Name:      pod.Name,
+				UID:       string(pod.UID),
+			}
+			snapshot.Pods[id] = PodMembership{PodIP: pod.Status.PodIP}
 
-				normKey := targetIdentityKey(parsed.FullResourceID, prefixSetName)
+			for _, ruleIdx := range matchedIndices {
+				rule := m.Spec.Mappings[ruleIdx]
+				targets := resolveRuleTargets(rule, prefixSetName)
+				for _, target := range targets {
+					normKey := targetIdentityKey(target.FullResourceID, prefixSetName)
 
-				entry, exists := internal[normKey]
-				if !exists {
-					entry = &internalEntry{
-						target: ASGTarget{
-							SubscriptionID: parsed.SubscriptionID,
-							ResourceGroup:  parsed.ResourceGroup,
-							ASGName:        parsed.ASGName,
-							FullResourceID: parsed.FullResourceID,
-							PrefixSetName:  prefixSetName,
-						},
-						ips: make(map[string]struct{}),
+					entry, exists := internal[normKey]
+					if !exists {
+						entry = &internalEntry{
+							target: target,
+							ips:    make(map[string]struct{}),
+						}
+						internal[normKey] = entry
 					}
-					internal[normKey] = entry
-				}
-
-				for _, ip := range matchedIPs {
-					entry.ips[ip] = struct{}{}
+					entry.ips[cidr] = struct{}{}
 				}
 			}
 		}
