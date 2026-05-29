@@ -383,9 +383,9 @@ func (c *DesiredStateCache) OnPodUpdate(mapping *v1alpha1.PodASGMapping, oldPod,
 		}
 		// True cache miss (no entry for any generation): bump version so any
 		// in-flight recompute that captured fences before this event will fail
-		// the CAS check, then return true (safe no-op for the caller).
+		// the CAS check; return false so the caller invalidates (defense-in-depth).
 		c.keyVersions[nsName]++
-		return true
+		return false
 	}
 
 	c.keyVersions[nsName]++

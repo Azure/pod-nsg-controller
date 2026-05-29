@@ -203,6 +203,9 @@ func (r *MappingReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 			statusErr := r.StatusUpdater.UpdateAfterReconcile(ctx, req.NamespacedName, mapping.Generation, ownershipKey, nil, validationErr, validationIssues, matchedPodsByIndex)
 			if statusErr != nil {
 				if errors.Is(statusErr, ErrStatusObjectNotFound) {
+					if r.DesiredStateCache != nil {
+						r.DesiredStateCache.Delete(req.NamespacedName)
+					}
 					r.cleanupPerMappingMetricState(req.NamespacedName)
 					r.markInitialTerminal(req.NamespacedName, true)
 					r.observeReconcile(req, ReconcileStageStatusSentinelTerminal, reconcileStart, 0)
@@ -352,6 +355,9 @@ func (r *MappingReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 	if r.StatusUpdater != nil {
 		if pendingErr := r.StatusUpdater.UpdatePending(ctx, req.NamespacedName, mapping.Generation, ownershipKey, matchedPodsByIndex); pendingErr != nil {
 			if errors.Is(pendingErr, ErrStatusObjectNotFound) {
+				if r.DesiredStateCache != nil {
+					r.DesiredStateCache.Delete(req.NamespacedName)
+				}
 				r.cleanupPerMappingMetricState(req.NamespacedName)
 				r.markInitialTerminal(req.NamespacedName, true)
 				r.observeReconcile(req, ReconcileStageStatusSentinelTerminal, reconcileStart, 0)
@@ -535,6 +541,9 @@ func (r *MappingReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 		statusErr = r.StatusUpdater.UpdateAfterReconcile(ctx, req.NamespacedName, mapping.Generation, ownershipKey, results, reconcileErr, nil, matchedPodsByIndex)
 		if statusErr != nil {
 			if errors.Is(statusErr, ErrStatusObjectNotFound) {
+				if r.DesiredStateCache != nil {
+					r.DesiredStateCache.Delete(req.NamespacedName)
+				}
 				r.cleanupPerMappingMetricState(req.NamespacedName)
 				r.markInitialTerminal(req.NamespacedName, true)
 				r.observeReconcile(req, ReconcileStageStatusSentinelTerminal, reconcileStart, 0)
