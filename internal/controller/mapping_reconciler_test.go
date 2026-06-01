@@ -3326,3 +3326,488 @@ func (c *phase5ListInterceptClient) List(ctx context.Context, list client.Object
 	}
 	return c.Client.List(ctx, list, opts...)
 }
+
+// ===========================================================================
+// Phase 5: Artifact-Based Reconcile Path Tests
+// ===========================================================================
+
+// ---------------------------------------------------------------------------
+// TestPhase5_Reconcile_CacheMiss_ArtifactPath_ProducesCorrectDesiredState
+// On cache miss, the reconciler should use the single-pass artifact path
+// (ComputeDesiredStateRecomputeArtifacts) and publish via
+// SetFromRecomputeArtifactsIfVersion, producing identical results to the
+// legacy multi-pass approach.
+// ---------------------------------------------------------------------------
+func TestPhase5_Reconcile_CacheMiss_ArtifactPath_ProducesCorrectDesiredState(t *testing.T) {
+	ctx := context.Background()
+	scheme := testScheme(t)
+	ns := "test-ns"
+
+	mapping := newTestMapping(ns, "artifact-mapping", []v1alpha1.Mapping{
+		{
+			PodSelector: v1alpha1.PodSelector{
+				MatchLabels: map[string]string{"app": "web"},
+			},
+			ApplicationSecurityGroups: []v1alpha1.ASGReference{
+				{ResourceID: asgResourceID("sub1", "rg1", "asg1")},
+			},
+		},
+	})
+	mapping.Finalizers = []string{CleanupFinalizer}
+	mapping.Generation = 1
+
+	pod1 := newTestPod(ns, "pod-1", "10.0.0.1", map[string]string{"app": "web"})
+	pod2 := newTestPod(ns, "pod-2", "10.0.0.2", map[string]string{"app": "web"})
+
+	fakeClient := fakeclient.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(mapping, pod1, pod2).
+		Build()
+
+	fakeFactory := fake.NewClientFactory()
+	fakeAzClient := fake.NewClient()
+	fakeFactory.RegisterClient("sub1", fakeAzClient)
+
+	exec := &stubExecutor{}
+	cache := engine.NewDesiredStateCache("test-cluster")
+
+	statusUpdater := &phase5StubStatusUpdater{}
+
+	r := &MappingReconciler{
+		Client:            fakeClient,
+		Scheme:            scheme,
+		ClusterName:       "test-cluster",
+		ResyncInterval:    0, // Force recompute (cache miss)
+		PrefixSetFactory:  fakeFactory,
+		Executor:          exec,
+		StatusUpdater:     statusUpdater,
+		DesiredStateCache: cache,
+	}
+
+	_, err := r.Reconcile(ctx, ctrl.Request{
+		NamespacedName: types.NamespacedName{Name: "artifact-mapping", Namespace: ns},
+	})
+	if err != nil {
+		t.Fatalf("unexpected reconcile error: %v", err)
+	}
+
+	// After reconcile, the cache should be populated with correct state
+	cachedState, ok := cache.Get(mapping)
+	if !ok {
+		t.Fatal("expected cache to be populated after reconcile on cache miss")
+	}
+
+	// Verify the cached desired state has both pod IPs
+	found10001 := false
+	found10002 := false
+	for _, dps := range cachedState.Desired {
+		if _, ok := dps.IPs["10.0.0.1/32"]; ok {
+			found10001 = true
+		}
+		if _, ok := dps.IPs["10.0.0.2/32"]; ok {
+			found10002 = true
+		}
+	}
+	if !found10001 {
+		t.Error("cached desired state missing 10.0.0.1/32")
+	}
+	if !found10002 {
+		t.Error("cached desired state missing 10.0.0.2/32")
+	}
+
+	// Executor should have been called with actions
+	if len(exec.calls) == 0 {
+		t.Error("expected executor to be called for cache-miss reconcile")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// TestPhase5_Reconcile_ForcedResync_ArtifactPath_NoFunctionalRegression
+// A forced resync should still produce correct results through the
+// artifact path, not regressing behavior vs the legacy multi-pass path.
+// ---------------------------------------------------------------------------
+func TestPhase5_Reconcile_ForcedResync_ArtifactPath_NoFunctionalRegression(t *testing.T) {
+	ctx := context.Background()
+	scheme := testScheme(t)
+	ns := "test-ns"
+
+	mapping := newTestMapping(ns, "resync-artifact-mapping", []v1alpha1.Mapping{
+		{
+			PodSelector: v1alpha1.PodSelector{
+				MatchLabels: map[string]string{"app": "web"},
+			},
+			ApplicationSecurityGroups: []v1alpha1.ASGReference{
+				{ResourceID: asgResourceID("sub1", "rg1", "asg1")},
+			},
+		},
+		{
+			PodSelector: v1alpha1.PodSelector{
+				MatchLabels: map[string]string{"tier": "backend"},
+			},
+			ApplicationSecurityGroups: []v1alpha1.ASGReference{
+				{ResourceID: asgResourceID("sub1", "rg1", "asg2")},
+			},
+		},
+	})
+	mapping.Finalizers = []string{CleanupFinalizer}
+	mapping.Generation = 1
+
+	// pod-1 matches both rules, pod-2 only first rule
+	pod1 := newTestPod(ns, "pod-1", "10.0.0.1", map[string]string{"app": "web", "tier": "backend"})
+	pod2 := newTestPod(ns, "pod-2", "10.0.0.2", map[string]string{"app": "web"})
+
+	fakeClient := fakeclient.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(mapping, pod1, pod2).
+		Build()
+
+	fakeFactory := fake.NewClientFactory()
+	fakeAzClient := fake.NewClient()
+	fakeFactory.RegisterClient("sub1", fakeAzClient)
+
+	exec := &stubExecutor{}
+	cache := engine.NewDesiredStateCache("test-cluster")
+	statusUpdater := &phase5StubStatusUpdater{}
+
+	r := &MappingReconciler{
+		Client:            fakeClient,
+		Scheme:            scheme,
+		ClusterName:       "test-cluster",
+		ResyncInterval:    0, // Force resync
+		PrefixSetFactory:  fakeFactory,
+		Executor:          exec,
+		StatusUpdater:     statusUpdater,
+		DesiredStateCache: cache,
+	}
+
+	_, err := r.Reconcile(ctx, ctrl.Request{
+		NamespacedName: types.NamespacedName{Name: "resync-artifact-mapping", Namespace: ns},
+	})
+	if err != nil {
+		t.Fatalf("unexpected reconcile error: %v", err)
+	}
+
+	// Verify cache is populated
+	cachedState, ok := cache.Get(mapping)
+	if !ok {
+		t.Fatal("expected cache populated after forced resync")
+	}
+
+	// MatchedPodsByIndex should reflect:
+	// Rule 0 (app=web): 2 pods (pod-1, pod-2)
+	// Rule 1 (tier=backend): 1 pod (pod-1)
+	if len(cachedState.MatchedPodsByIndex) != 2 {
+		t.Fatalf("MatchedPodsByIndex length = %d, want 2", len(cachedState.MatchedPodsByIndex))
+	}
+	if cachedState.MatchedPodsByIndex[0] != 2 {
+		t.Errorf("MatchedPodsByIndex[0] = %d, want 2", cachedState.MatchedPodsByIndex[0])
+	}
+	if cachedState.MatchedPodsByIndex[1] != 1 {
+		t.Errorf("MatchedPodsByIndex[1] = %d, want 1", cachedState.MatchedPodsByIndex[1])
+	}
+
+	// HasPendingIPPods should be false (both pods have IPs)
+	if cachedState.HasPendingIPPods {
+		t.Error("HasPendingIPPods should be false when all matched pods have IPs")
+	}
+}
+
+
+// ---------------------------------------------------------------------------
+// TestPhase5_Reconcile_ForcedResync_CASConflict_DoesNotFallbackToStaleCacheReread
+// Design: When shouldForceDesiredStateRecompute returns true and the CAS publish
+// fails, the reconciler must NOT fall back to stale cache re-read as a successful
+// forced-resync completion. It should bounded-requeue instead.
+// Currently FAILS because the code at line 291 uses cache.Get() as fallback.
+//
+// To produce a CAS conflict in a synchronous test, we use a wrapping client
+// that injects a cache mutation (OnPodAdd) during the List call, simulating a
+// concurrent pod event between GetWithVersion and SetFromRecomputeArtifactsIfVersion.
+// ---------------------------------------------------------------------------
+func TestPhase5_Reconcile_ForcedResync_CASConflict_DoesNotFallbackToStaleCacheReread(t *testing.T) {
+	ctx := context.Background()
+	scheme := testScheme(t)
+	ns := "test-ns"
+
+	cache := engine.NewDesiredStateCache("test-cluster")
+
+	asgID := asgResourceID("sub1", "rg1", "asg1")
+
+	// Set up mapping object
+	mappingObj := &v1alpha1.PodASGMapping{
+		ObjectMeta: metav1.ObjectMeta{Namespace: ns, Name: "forced-mapping", Generation: 1},
+		Spec: v1alpha1.PodASGMappingSpec{
+			Mappings: []v1alpha1.Mapping{
+				{
+					PodSelector:               v1alpha1.PodSelector{MatchLabels: map[string]string{"app": "web"}},
+					ApplicationSecurityGroups: []v1alpha1.ASGReference{{ResourceID: asgID}},
+				},
+			},
+		},
+	}
+
+	target := engine.ASGTarget{
+		SubscriptionID: "sub1",
+		ResourceGroup:  "rg1",
+		ASGName:        "asg1",
+		FullResourceID: asgID,
+		PrefixSetName:  "test-cluster-" + ns + "-forced-mapping",
+	}
+
+	// Pre-seed cache with a STALE state (only pod-1, missing pod-2's IP)
+	cache.SetFromRecompute(mappingObj, nil,
+		map[engine.ASGTarget]engine.DesiredPrefixSet{
+			target: {IPs: map[string]struct{}{"10.0.0.1/32": {}}},
+		},
+		engine.PodSnapshot{Pods: map[engine.PodIdentity]engine.PodMembership{
+			{Namespace: ns, Name: "pod-1"}: {PodIP: "10.0.0.1"},
+		}},
+		[]int{1}, false)
+
+	// Now set up reconciler with ResyncInterval=0 to force recompute
+	mapping := newTestMapping(ns, "forced-mapping", mappingObj.Spec.Mappings)
+	mapping.Finalizers = []string{CleanupFinalizer}
+	mapping.Generation = 1
+
+	// Include both pod-1 and pod-2 in the cluster (truth that recompute will find)
+	pod1 := newTestPod(ns, "pod-1", "10.0.0.1", map[string]string{"app": "web"})
+	pod2 := newTestPod(ns, "pod-2", "10.0.0.2", map[string]string{"app": "web"})
+
+	innerClient := fakeclient.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(mapping, pod1, pod2).
+		Build()
+
+	// Wrapping client that injects a cache mutation during List (simulating concurrent pod event)
+	listCallCount := 0
+	wrappedClient := &listInterceptingClient{
+		Client: innerClient,
+		onList: func() {
+			listCallCount++
+			if listCallCount <= 2 {
+				// Inject a concurrent pod event to advance the cache version fence,
+				// causing subsequent CAS publish to fail
+				churnPod := &corev1.Pod{
+					ObjectMeta: metav1.ObjectMeta{Namespace: ns, Name: fmt.Sprintf("churn-pod-%d", listCallCount), Labels: map[string]string{"app": "web"}},
+					Status:     corev1.PodStatus{PodIP: fmt.Sprintf("10.0.0.%d", 90+listCallCount)},
+				}
+				cache.OnPodAdd(mappingObj, churnPod)
+			}
+		},
+	}
+
+	fakeFactory := fake.NewClientFactory()
+	fakeFactory.RegisterClient("sub1", fake.NewClient())
+
+	// Use a tracking executor to see what IPs are sent to Azure
+	exec := &stubExecutor{}
+
+	r := &MappingReconciler{
+		Client:            wrappedClient,
+		Scheme:            scheme,
+		ClusterName:       "test-cluster",
+		ResyncInterval:    0, // forced recompute (shouldForceDesiredStateRecompute returns true)
+		PrefixSetFactory:  fakeFactory,
+		Executor:          exec,
+		DesiredStateCache: cache,
+	}
+
+	result, err := r.Reconcile(ctx, ctrl.Request{
+		NamespacedName: types.NamespacedName{Name: "forced-mapping", Namespace: ns},
+	})
+
+	// There are two valid outcomes for the fix:
+	// 1. Bounded requeue (no execution with stale data)
+	// 2. Retry recompute succeeds and executor is called with FRESH data (all pods)
+	//
+	// The INVALID outcome (current bug): executor is called with stale cache data
+	// from the re-read fallback that only contains pod-1 + churn-pod (missing pod-2).
+
+	if err != nil {
+		t.Fatalf("unexpected reconcile error: %v", err)
+	}
+
+	if len(exec.calls) > 0 {
+		// If executor was called, verify it got the FRESH recomputed data (pod-2 must be present)
+		actions := exec.calls[0]
+		foundPod2IP := false
+		for _, a := range actions {
+			for _, ip := range a.DesiredIPs {
+				if ip == "10.0.0.2/32" {
+					foundPod2IP = true
+				}
+			}
+		}
+		if !foundPod2IP {
+			t.Error("Phase 5: Forced resync CAS conflict MUST NOT fall back to stale cache re-read; " +
+				"executor was called without pod-2's IP (10.0.0.2/32), indicating stale cache substitution")
+		}
+	} else {
+		// Executor was not called — acceptable only if bounded requeue was returned
+		if result.RequeueAfter <= 0 {
+			t.Error("Phase 5: When forced resync CAS conflict occurs and executor is not called, " +
+				"result must have RequeueAfter > 0 (bounded requeue)")
+		}
+	}
+}
+
+// listInterceptingClient wraps a client.Client and calls onList before each List call.
+type listInterceptingClient struct {
+	client.Client
+	onList func()
+}
+
+func (c *listInterceptingClient) List(ctx context.Context, list client.ObjectList, opts ...client.ListOption) error {
+	if c.onList != nil {
+		c.onList()
+	}
+	return c.Client.List(ctx, list, opts...)
+}
+
+// ---------------------------------------------------------------------------
+// TestPhase5_Reconcile_CacheMiss_CASConflict_NonForced_CanUseCacheReread
+// Locks in the current NON-forced behavior: on cache miss with CAS conflict,
+// the reconciler may use cache re-read as fallback (this is acceptable for
+// non-forced reconciles since it's incremental data that was just mutated).
+//
+// To produce a genuine cache miss + CAS conflict in a synchronous test, we:
+// 1. Invalidate the cache so GetWithVersion returns ok=false (true cache miss).
+// 2. Use a listInterceptingClient that calls OnPodAdd during List to advance
+//    the version fence, causing SetFromRecomputeArtifactsIfVersion to fail.
+// 3. The non-forced path then falls back to cache re-read (Get), which succeeds
+//    because OnPodAdd re-populated the entry.
+// ---------------------------------------------------------------------------
+func TestPhase5_Reconcile_CacheMiss_CASConflict_NonForced_CanUseCacheReread(t *testing.T) {
+ctx := context.Background()
+scheme := testScheme(t)
+ns := "test-ns"
+
+cache := engine.NewDesiredStateCache("test-cluster")
+
+asgID := asgResourceID("sub1", "rg1", "asg1")
+
+mappingObj := &v1alpha1.PodASGMapping{
+ObjectMeta: metav1.ObjectMeta{Namespace: ns, Name: "nonforced-mapping", Generation: 1},
+Spec: v1alpha1.PodASGMappingSpec{
+Mappings: []v1alpha1.Mapping{
+{
+PodSelector:               v1alpha1.PodSelector{MatchLabels: map[string]string{"app": "web"}},
+ApplicationSecurityGroups: []v1alpha1.ASGReference{{ResourceID: asgID}},
+},
+},
+},
+}
+
+// Seed cache then invalidate to create a true cache-miss state
+// (GetWithVersion returns ok=false, but keyVersions is non-zero).
+target := engine.ASGTarget{
+SubscriptionID: "sub1",
+ResourceGroup:  "rg1",
+ASGName:        "asg1",
+FullResourceID: asgID,
+PrefixSetName:  "test-cluster-" + ns + "-nonforced-mapping",
+}
+cache.SetFromRecompute(mappingObj, nil,
+map[engine.ASGTarget]engine.DesiredPrefixSet{
+target: {IPs: map[string]struct{}{"10.0.0.1/32": {}}},
+},
+engine.PodSnapshot{Pods: map[engine.PodIdentity]engine.PodMembership{
+{Namespace: ns, Name: "pod-1"}: {PodIP: "10.0.0.1"},
+}},
+[]int{1}, false)
+cache.Invalidate(types.NamespacedName{Namespace: ns, Name: "nonforced-mapping"})
+
+// Now: GetWithVersion will return ok=false (true cache miss) but version > 0.
+
+mapping := newTestMapping(ns, "nonforced-mapping", mappingObj.Spec.Mappings)
+mapping.Finalizers = []string{CleanupFinalizer}
+mapping.Generation = 1
+
+pod := newTestPod(ns, "pod-1", "10.0.0.1", map[string]string{"app": "web"})
+
+innerClient := fakeclient.NewClientBuilder().
+WithScheme(scheme).
+WithObjects(mapping, pod).
+Build()
+
+// Wrapping client injects a concurrent cache repopulation during List to:
+// (a) advance the version fence (causing CAS publish to fail), and
+// (b) repopulate the cache entry (so Get re-read succeeds).
+// OnPodAdd alone cannot repopulate after Invalidate (returns early on missing entry),
+// so we use OnPodAdd to bump the version fence, then SetFromRecompute to re-seed the entry.
+listCallCount := 0
+wrappedClient := &listInterceptingClient{
+Client: innerClient,
+onList: func() {
+listCallCount++
+if listCallCount == 1 {
+// Step 1: Bump version fence via OnPodAdd (bumps keyVersions
+// even though entry is missing — returns early at line 194-196).
+churnPod := &corev1.Pod{
+ObjectMeta: metav1.ObjectMeta{
+Namespace: ns,
+Name:      "churn-pod-nonforced",
+Labels:    map[string]string{"app": "web"},
+},
+Status: corev1.PodStatus{PodIP: "10.0.0.99"},
+}
+cache.OnPodAdd(mappingObj, churnPod)
+
+// Step 2: Re-populate entry via SetFromRecompute (simulates a
+// concurrent reconciler completing its recompute). This does NOT
+// bump keyVersions, so the CAS conflict still triggers.
+cache.SetFromRecompute(mappingObj, nil,
+map[engine.ASGTarget]engine.DesiredPrefixSet{
+target: {IPs: map[string]struct{}{"10.0.0.1/32": {}, "10.0.0.99/32": {}}},
+},
+engine.PodSnapshot{Pods: map[engine.PodIdentity]engine.PodMembership{
+{Namespace: ns, Name: "pod-1"}:              {PodIP: "10.0.0.1"},
+{Namespace: ns, Name: "churn-pod-nonforced"}: {PodIP: "10.0.0.99"},
+}},
+[]int{2}, false)
+}
+},
+}
+
+fakeFactory := fake.NewClientFactory()
+fakeFactory.RegisterClient("sub1", fake.NewClient())
+exec := &stubExecutor{}
+
+r := &MappingReconciler{
+Client:            wrappedClient,
+Scheme:            scheme,
+ClusterName:       "test-cluster",
+ResyncInterval:    60 * time.Second, // non-forced (long interval)
+PrefixSetFactory:  fakeFactory,
+Executor:          exec,
+DesiredStateCache: cache,
+}
+
+// Mark recent full recompute so shouldForceDesiredStateRecompute returns false
+r.markDesiredStateFullRecompute(
+types.NamespacedName{Name: "nonforced-mapping", Namespace: ns},
+1, time.Now(),
+)
+
+result, err := r.Reconcile(ctx, ctrl.Request{
+NamespacedName: types.NamespacedName{Name: "nonforced-mapping", Namespace: ns},
+})
+if err != nil {
+t.Fatalf("unexpected reconcile error: %v", err)
+}
+
+// Verify a true cache miss occurred (List was invoked for pod recompute)
+if listCallCount == 0 {
+t.Fatal("Phase 5: expected List to be called (cache miss triggers pod recompute), " +
+"but listInterceptingClient.onList was never invoked — this is a cache HIT, not a miss")
+}
+
+// The non-forced CAS conflict path MUST resolve via cache re-read because
+// SetFromRecompute populated the entry during List. The reconciler should
+// use the re-read data and proceed to the executor.
+if len(exec.calls) == 0 {
+t.Fatal("Phase 5: expected executor to be called after cache re-read resolved " +
+"CAS conflict, but no executor calls recorded — re-read path was NOT exercised")
+}
+_ = result
+}

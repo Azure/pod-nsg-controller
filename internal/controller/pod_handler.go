@@ -75,7 +75,6 @@ func (h *PodToMappingEventHandler) Create(ctx context.Context, e event.TypedCrea
 		return
 	}
 	for _, m := range matched {
-		h.enqueueRequest(q, m.Request)
 		if h.DesiredStateCache != nil {
 			issues := validateASGResourceIDs(m.Mapping.Spec.Mappings)
 			if len(issues) > 0 {
@@ -84,6 +83,7 @@ func (h *PodToMappingEventHandler) Create(ctx context.Context, e event.TypedCrea
 				h.DesiredStateCache.OnPodAdd(m.Mapping, pod)
 			}
 		}
+		h.enqueueRequest(q, m.Request)
 	}
 }
 
@@ -115,15 +115,8 @@ func (h *PodToMappingEventHandler) Update(ctx context.Context, e event.TypedUpda
 		h.DesiredStateCache.InvalidateNamespace(ns)
 	}
 
-	// Build union for enqueue (preserving existing semantics)
-	oldReqs := matchedMappingsToRequests(oldMatched)
-	newReqs := matchedMappingsToRequests(newMatched)
-	union := UnionRequests(oldReqs, newReqs)
-	for _, req := range union {
-		h.enqueueRequest(q, req)
-	}
-
 	// Cache mutation logic (only when no resolution errors and cache exists)
+	// Must happen BEFORE enqueue so reconcilers observe fresh state.
 	if h.DesiredStateCache != nil && err1 == nil && err2 == nil {
 		oldSet := matchedMappingsByKey(oldMatched)
 		newSet := matchedMappingsByKey(newMatched)
@@ -165,6 +158,14 @@ func (h *PodToMappingEventHandler) Update(ctx context.Context, e event.TypedUpda
 			}
 		}
 	}
+
+	// Enqueue union of affected mappings AFTER cache mutation.
+	oldReqs := matchedMappingsToRequests(oldMatched)
+	newReqs := matchedMappingsToRequests(newMatched)
+	union := UnionRequests(oldReqs, newReqs)
+	for _, req := range union {
+		h.enqueueRequest(q, req)
+	}
 }
 
 // Delete enqueues matches for a deleted pod.
@@ -183,7 +184,6 @@ func (h *PodToMappingEventHandler) Delete(ctx context.Context, e event.TypedDele
 		return
 	}
 	for _, m := range matched {
-		h.enqueueRequest(q, m.Request)
 		if h.DesiredStateCache != nil {
 			issues := validateASGResourceIDs(m.Mapping.Spec.Mappings)
 			if len(issues) > 0 {
@@ -192,6 +192,7 @@ func (h *PodToMappingEventHandler) Delete(ctx context.Context, e event.TypedDele
 				h.DesiredStateCache.OnPodDelete(m.Mapping, pod)
 			}
 		}
+		h.enqueueRequest(q, m.Request)
 	}
 }
 

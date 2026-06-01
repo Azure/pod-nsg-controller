@@ -688,6 +688,108 @@ func (c *DesiredStateCache) SetFromRecomputeIfVersion(
 	return true, currentVersion, currentLifecycleEpoch
 }
 
+// SetFromRecomputeArtifactsIfVersion commits a recompute result from pre-built
+// artifacts only if the provided expectedVersion and expectedLifecycleEpoch
+// match the current fences. This avoids re-matching pods to build podRules
+// since the artifacts already contain them.
+// Returns (committed, currentVersion, currentLifecycleEpoch).
+func (c *DesiredStateCache) SetFromRecomputeArtifactsIfVersion(
+	mapping *v1alpha1.PodASGMapping,
+	artifacts DesiredStateRecomputeArtifacts,
+	expectedVersion uint64,
+	expectedLifecycleEpoch uint64,
+) (committed bool, currentVersion uint64, currentLifecycleEpoch uint64) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	nsName := types.NamespacedName{Namespace: mapping.Namespace, Name: mapping.Name}
+	currentVersion = c.keyVersions[nsName]
+	currentLifecycleEpoch = c.lifecycleEpoch[nsName]
+
+	if expectedLifecycleEpoch != currentLifecycleEpoch {
+		return false, currentVersion, currentLifecycleEpoch
+	}
+	if expectedVersion != currentVersion {
+		return false, currentVersion, currentLifecycleEpoch
+	}
+
+	// UID guard: reject if an existing entry was committed by a different UID.
+	key := cacheKey{key: nsName, generation: mapping.Generation}
+	if existing, exists := c.entries[key]; exists && mapping.UID != "" &&
+		existing.mapping != nil && existing.mapping.UID != mapping.UID {
+		return false, currentVersion, currentLifecycleEpoch
+	}
+
+	// Generation-rollover guard: reject commits for generations older than the
+	// latest committed generation.
+	if latest, ok := c.latestGeneration[nsName]; ok && mapping.Generation < latest {
+		return false, currentVersion, currentLifecycleEpoch
+	}
+
+	c.entries[key] = buildCacheEntryFromArtifacts(mapping, artifacts)
+
+	// Update generation-rollover tracking and prune older generation entries.
+	if c.knownGenerations[nsName] == nil {
+		c.knownGenerations[nsName] = make(map[int64]struct{})
+	}
+	c.knownGenerations[nsName][mapping.Generation] = struct{}{}
+	if mapping.Generation > c.latestGeneration[nsName] {
+		c.latestGeneration[nsName] = mapping.Generation
+		for k := range c.entries {
+			if k.key == nsName && k.generation < mapping.Generation {
+				delete(c.entries, k)
+			}
+		}
+	}
+
+	return true, currentVersion, currentLifecycleEpoch
+}
+
+// buildCacheEntryFromArtifacts constructs a cache entry with deep-copied data
+// from recompute artifacts, preventing external mutation of cached state.
+func buildCacheEntryFromArtifacts(
+	mapping *v1alpha1.PodASGMapping,
+	artifacts DesiredStateRecomputeArtifacts,
+) *cacheEntry {
+	copiedDesired := make(map[ASGTarget]DesiredPrefixSet, len(artifacts.Desired))
+	for k, v := range artifacts.Desired {
+		ips := make(map[string]struct{}, len(v.IPs))
+		for ip := range v.IPs {
+			ips[ip] = struct{}{}
+		}
+		copiedDesired[k] = DesiredPrefixSet{IPs: ips}
+	}
+
+	copiedSnapshot := PodSnapshot{Pods: make(map[PodIdentity]PodMembership, len(artifacts.Snapshot.Pods))}
+	for k, v := range artifacts.Snapshot.Pods {
+		copiedSnapshot.Pods[k] = v
+	}
+
+	copiedMatchedPods := make([]int, len(artifacts.MatchedPodsByIndex))
+	copy(copiedMatchedPods, artifacts.MatchedPodsByIndex)
+
+	copiedPodRules := make(map[PodIdentity]map[int]struct{}, len(artifacts.PodRules))
+	for podID, rules := range artifacts.PodRules {
+		rulesCopy := make(map[int]struct{}, len(rules))
+		for idx := range rules {
+			rulesCopy[idx] = struct{}{}
+		}
+		copiedPodRules[podID] = rulesCopy
+	}
+
+	return &cacheEntry{
+		state: CachedDesiredState{
+			Desired:            copiedDesired,
+			Snapshot:           copiedSnapshot,
+			MatchedPodsByIndex: copiedMatchedPods,
+			HasPendingIPPods:   artifacts.HasPendingIPPods,
+		},
+		mapping:        mapping,
+		podRules:       copiedPodRules,
+		pendingIPCount: artifacts.PendingIPCount,
+	}
+}
+
 func deepCopyCachedState(state CachedDesiredState) CachedDesiredState {
 	cp := CachedDesiredState{
 		HasPendingIPPods: state.HasPendingIPPods,

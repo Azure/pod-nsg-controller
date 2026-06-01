@@ -127,3 +127,96 @@ func ComputeDesiredStateWithSnapshot(
 	}
 	return result, snapshot
 }
+
+// DesiredStateRecomputeArtifacts holds the complete output of a single-pass
+// recompute analysis, eliminating the need for multiple passes over pods/selectors.
+type DesiredStateRecomputeArtifacts struct {
+	Desired            map[ASGTarget]DesiredPrefixSet
+	Snapshot           PodSnapshot
+	MatchedPodsByIndex []int
+	HasPendingIPPods   bool
+	PodRules           map[PodIdentity]map[int]struct{}
+	PendingIPCount     int
+}
+
+// ComputeDesiredStateRecomputeArtifacts computes all recompute-derived data in
+// a single pass over namespace pods. This replaces the multi-pass approach of
+// calling ComputeMatchedPodsByMapping + ComputeDesiredStateWithSnapshot +
+// hasPendingIPPodsFromList separately.
+//
+// PARITY CONTRACT: The artifacts produced here must remain semantically
+// equivalent to the incremental cache mutation paths (OnPodAdd, OnPodUpdate,
+// OnPodDelete) in DesiredStateCache. Any change to matching/IP-resolution
+// logic here must be mirrored in those methods and vice-versa.
+func ComputeDesiredStateRecomputeArtifacts(
+	clusterName string,
+	mapping v1alpha1.PodASGMapping,
+	pods []corev1.Pod,
+) DesiredStateRecomputeArtifacts {
+	internal := make(map[string]*internalEntry)
+	prefixSetName := model.OwnershipKey(clusterName, mapping.Namespace, mapping.Name)
+
+	arts := DesiredStateRecomputeArtifacts{
+		Desired:            make(map[ASGTarget]DesiredPrefixSet),
+		Snapshot:           PodSnapshot{Pods: make(map[PodIdentity]PodMembership)},
+		MatchedPodsByIndex: make([]int, len(mapping.Spec.Mappings)),
+		HasPendingIPPods:   false,
+		PodRules:           make(map[PodIdentity]map[int]struct{}),
+		PendingIPCount:     0,
+	}
+
+	for pi := range pods {
+		pod := &pods[pi]
+		if pod.Namespace != mapping.Namespace {
+			continue
+		}
+
+		matchedIndices := matchPodToRuleIndices(&mapping, labels.Set(pod.Labels))
+		if len(matchedIndices) == 0 {
+			continue
+		}
+
+		podID := PodIdentity{Namespace: pod.Namespace, Name: pod.Name, UID: string(pod.UID)}
+
+		// Track per-rule counts (includes pods without IPs)
+		for _, i := range matchedIndices {
+			arts.MatchedPodsByIndex[i]++
+			if arts.PodRules[podID] == nil {
+				arts.PodRules[podID] = make(map[int]struct{})
+			}
+			arts.PodRules[podID][i] = struct{}{}
+		}
+
+		if pod.Status.PodIP == "" {
+			arts.HasPendingIPPods = true
+			arts.PendingIPCount++
+			continue
+		}
+
+		cidr := toCIDR(pod.Status.PodIP)
+		arts.Snapshot.Pods[podID] = PodMembership{PodIP: pod.Status.PodIP}
+
+		for _, ruleIdx := range matchedIndices {
+			rule := mapping.Spec.Mappings[ruleIdx]
+			targets := resolveRuleTargets(rule, prefixSetName)
+			for _, target := range targets {
+				normKey := targetIdentityKey(target.FullResourceID, prefixSetName)
+				entry, exists := internal[normKey]
+				if !exists {
+					entry = &internalEntry{
+						target: target,
+						ips:    make(map[string]struct{}),
+					}
+					internal[normKey] = entry
+				}
+				entry.ips[cidr] = struct{}{}
+			}
+		}
+	}
+
+	for _, entry := range internal {
+		arts.Desired[entry.target] = DesiredPrefixSet{IPs: entry.ips}
+	}
+
+	return arts
+}

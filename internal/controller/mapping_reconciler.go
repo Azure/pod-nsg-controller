@@ -236,6 +236,7 @@ func (r *MappingReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 
 	crdResolutionStart := time.Now()
 	cacheHit := false
+	forcedResync := false
 
 	// Capture fences on read for CAS publish later.
 	var expectedVersion uint64
@@ -255,6 +256,7 @@ func (r *MappingReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 		}
 	} else if r.DesiredStateCache != nil {
 		// Forced recompute: still capture fences for CAS publish.
+		forcedResync = true
 		_, ver, epoch, _ := r.DesiredStateCache.GetWithVersion(&mapping)
 		expectedVersion = ver
 		expectedLifecycleEpoch = epoch
@@ -268,9 +270,11 @@ func (r *MappingReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 			r.observeReconcile(req, metricStage, reconcileStart, 0)
 			return result, retErr
 		}
-		matchedPodsByIndex = ComputeMatchedPodsByMapping(mapping.Spec, podList.Items)
-		desired, podSnapshot = engine.ComputeDesiredStateWithSnapshot(r.ClusterName, []v1alpha1.PodASGMapping{mapping}, podList.Items)
-		hasPendingIPPodsVal = hasPendingIPPodsFromList(mapping.Spec, podList.Items)
+		arts := engine.ComputeDesiredStateRecomputeArtifacts(r.ClusterName, mapping, podList.Items)
+		matchedPodsByIndex = arts.MatchedPodsByIndex
+		desired = arts.Desired
+		podSnapshot = arts.Snapshot
+		hasPendingIPPodsVal = arts.HasPendingIPPods
 
 		// Populate the desired-state cache from this full recompute with CAS semantics.
 		if r.DesiredStateCache != nil {
@@ -280,20 +284,28 @@ func (r *MappingReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 				return ctrl.Result{RequeueAfter: r.cacheConflictRequeueAfter()}, nil
 			}
 
-			committed, _, _ := r.DesiredStateCache.SetFromRecomputeIfVersion(
-				&mapping, podList.Items, desired, podSnapshot, matchedPodsByIndex, hasPendingIPPodsVal,
+			committed, _, _ := r.DesiredStateCache.SetFromRecomputeArtifactsIfVersion(
+				&mapping, arts,
 				expectedVersion, expectedLifecycleEpoch,
 			)
 			if !committed {
-				// CAS conflict: re-read cache; if entry exists, use it.
-				if cached, ok := r.DesiredStateCache.Get(&mapping); ok {
-					desired = cached.Desired
-					podSnapshot = cached.Snapshot
-					matchedPodsByIndex = cached.MatchedPodsByIndex
-					hasPendingIPPodsVal = cached.HasPendingIPPods
-					logger.V(1).Info("cache publish conflict resolved from re-read")
-				} else {
-					// No cache entry: recompute once with refreshed fences and retry publish.
+				// CAS conflict path.
+				// For non-forced resync, stale cache re-read is acceptable.
+				// For forced resync, stale cache is unsafe; skip directly to retry.
+				usedCacheReread := false
+				if !forcedResync {
+					if cached, ok := r.DesiredStateCache.Get(&mapping); ok {
+						desired = cached.Desired
+						podSnapshot = cached.Snapshot
+						matchedPodsByIndex = cached.MatchedPodsByIndex
+						hasPendingIPPodsVal = cached.HasPendingIPPods
+						usedCacheReread = true
+						logger.V(1).Info("cache publish conflict resolved from re-read")
+					}
+				}
+
+				if !usedCacheReread {
+					// Recompute once with refreshed fences and retry publish.
 					_, retryVer, retryEpoch, _ := r.DesiredStateCache.GetWithVersion(&mapping)
 					if retryCurrent, retryFreshErr := r.mappingStillCurrent(ctx, req.NamespacedName, mapping.UID, mapping.Generation); retryFreshErr != nil || !retryCurrent {
 						logger.V(1).Info("mapping no longer current on conflict retry, requeueing")
@@ -305,29 +317,22 @@ func (r *MappingReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 						r.observeReconcile(req, metricStage, reconcileStart, 0)
 						return result, retErr
 					}
-					matchedPodsByIndex = ComputeMatchedPodsByMapping(mapping.Spec, retryPodList.Items)
-					desired, podSnapshot = engine.ComputeDesiredStateWithSnapshot(r.ClusterName, []v1alpha1.PodASGMapping{mapping}, retryPodList.Items)
-					hasPendingIPPodsVal = hasPendingIPPodsFromList(mapping.Spec, retryPodList.Items)
+					retryArts := engine.ComputeDesiredStateRecomputeArtifacts(r.ClusterName, mapping, retryPodList.Items)
+					matchedPodsByIndex = retryArts.MatchedPodsByIndex
+					desired = retryArts.Desired
+					podSnapshot = retryArts.Snapshot
+					hasPendingIPPodsVal = retryArts.HasPendingIPPods
 
-					retryCommitted, _, _ := r.DesiredStateCache.SetFromRecomputeIfVersion(
-						&mapping, retryPodList.Items, desired, podSnapshot, matchedPodsByIndex, hasPendingIPPodsVal,
+					retryCommitted, _, _ := r.DesiredStateCache.SetFromRecomputeArtifactsIfVersion(
+						&mapping, retryArts,
 						retryVer, retryEpoch,
 					)
 					if retryCommitted {
 						r.markDesiredStateFullRecompute(req.NamespacedName, mapping.Generation, reconcileStart)
 					} else {
-						// Second attempt also failed; check cache once more.
-						if cached2, ok2 := r.DesiredStateCache.Get(&mapping); ok2 {
-							desired = cached2.Desired
-							podSnapshot = cached2.Snapshot
-							matchedPodsByIndex = cached2.MatchedPodsByIndex
-							hasPendingIPPodsVal = cached2.HasPendingIPPods
-							logger.V(1).Info("cache publish conflict resolved from second re-read")
-						} else {
-							// Still no entry; bounded requeue, skip status/diff/executor.
-							logger.V(1).Info("cache publish conflict persists after retry, requeueing")
-							return ctrl.Result{RequeueAfter: r.cacheConflictRequeueAfter()}, nil
-						}
+						// Second attempt also failed; bounded requeue.
+						logger.V(1).Info("cache publish conflict persists after retry, requeueing")
+						return ctrl.Result{RequeueAfter: r.cacheConflictRequeueAfter()}, nil
 					}
 				}
 			} else {

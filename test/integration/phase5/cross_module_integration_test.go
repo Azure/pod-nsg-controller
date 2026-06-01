@@ -1237,3 +1237,305 @@ func TestPhase5_CrossModule_PodEventMutation_TerminalCleanup_StalePublish(t *tes
 		return hasFresh && !hasStale
 	}, "Phase 5: after cross-module race (pod event + terminal cleanup + recreate), only fresh state should converge")
 }
+
+// ===========================================================================
+// Phase 5: Artifact-based Recompute Path — Integration Tests
+// ===========================================================================
+
+// ---------------------------------------------------------------------------
+// TestPhase5_ArtifactRecomputePath_CacheMiss_ConvergesIdenticalToLegacy
+// Verifies that when the reconciler uses the artifact-based recompute path
+// on cache miss, the end-to-end behavior (pod list → compute → cache → diff
+// → executor → Azure PUT) converges to the same Azure state as the legacy path.
+// ---------------------------------------------------------------------------
+func TestPhase5_ArtifactRecomputePath_CacheMiss_ConvergesIdenticalToLegacy(t *testing.T) {
+	te := setupTestEnv(t)
+	defer te.teardown(t)
+	ctx := context.Background()
+
+	ns := &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: "test-artifact-miss"}}
+	if err := te.k8sClient.Create(ctx, ns); err != nil {
+		t.Fatalf("failed to create namespace: %v", err)
+	}
+
+	mapping := &v1alpha1.PodASGMapping{
+		ObjectMeta: metav1.ObjectMeta{Name: "artifact-mapping", Namespace: ns.Name},
+		Spec: v1alpha1.PodASGMappingSpec{
+			Mappings: []v1alpha1.Mapping{
+				{
+					PodSelector: v1alpha1.PodSelector{MatchLabels: map[string]string{"app": "web"}},
+					ApplicationSecurityGroups: []v1alpha1.ASGReference{
+						{ResourceID: asgResourceID("sub1", "rg1", "asg-artifact")},
+					},
+				},
+				{
+					PodSelector: v1alpha1.PodSelector{MatchLabels: map[string]string{"tier": "backend"}},
+					ApplicationSecurityGroups: []v1alpha1.ASGReference{
+						{ResourceID: asgResourceID("sub1", "rg1", "asg-backend-artifact")},
+					},
+				},
+			},
+		},
+	}
+	if err := te.k8sClient.Create(ctx, mapping); err != nil {
+		t.Fatalf("failed to create mapping: %v", err)
+	}
+
+	// Create pods: pod-1 matches rule 0, pod-2 matches both rules
+	pods := []struct {
+		name   string
+		ip     string
+		labels map[string]string
+	}{
+		{"art-pod-1", "10.0.1.1", map[string]string{"app": "web"}},
+		{"art-pod-2", "10.0.1.2", map[string]string{"app": "web", "tier": "backend"}},
+	}
+
+	for _, p := range pods {
+		pod := &corev1.Pod{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      p.name,
+				Namespace: ns.Name,
+				Labels:    p.labels,
+			},
+			Spec: corev1.PodSpec{
+				Containers: []corev1.Container{{Name: "app", Image: "nginx"}},
+			},
+		}
+		if err := te.k8sClient.Create(ctx, pod); err != nil {
+			t.Fatalf("failed to create pod %s: %v", p.name, err)
+		}
+		pod.Status.PodIP = p.ip
+		if err := te.k8sClient.Status().Update(ctx, pod); err != nil {
+			t.Fatalf("failed to set pod %s IP: %v", p.name, err)
+		}
+	}
+
+	ownershipKey := "test-cluster-" + ns.Name + "-artifact-mapping"
+
+	// Assert: asg-artifact should have both pod IPs (rule 0 matches app=web)
+	eventually(t, 15*time.Second, 300*time.Millisecond, func() bool {
+		ps, err := te.fakeClient.Get(ctx, "sub1", "rg1", "asg-artifact", ownershipKey)
+		if err != nil || ps.Properties == nil {
+			return false
+		}
+		ips := make(map[string]bool)
+		for _, ip := range ps.Properties.AddressPrefixes {
+			ips[ip] = true
+		}
+		return ips["10.0.1.1/32"] && ips["10.0.1.2/32"]
+	}, "Phase 5 artifact path: expected both pod IPs in asg-artifact prefix set")
+
+	// Assert: asg-backend-artifact should have only pod-2's IP (rule 1 matches tier=backend)
+	eventually(t, 15*time.Second, 300*time.Millisecond, func() bool {
+		ps, err := te.fakeClient.Get(ctx, "sub1", "rg1", "asg-backend-artifact", ownershipKey)
+		if err != nil || ps.Properties == nil {
+			return false
+		}
+		ips := make(map[string]bool)
+		for _, ip := range ps.Properties.AddressPrefixes {
+			ips[ip] = true
+		}
+		return ips["10.0.1.2/32"] && !ips["10.0.1.1/32"]
+	}, "Phase 5 artifact path: expected only pod-2 IP in asg-backend-artifact prefix set")
+}
+
+// ---------------------------------------------------------------------------
+// TestPhase5_ArtifactRecomputePath_PendingIPPod_TrackedCorrectly
+// Verifies that the artifact path correctly tracks pods without IPs and
+// handles their eventual IP assignment through a subsequent reconcile.
+// ---------------------------------------------------------------------------
+func TestPhase5_ArtifactRecomputePath_PendingIPPod_TrackedCorrectly(t *testing.T) {
+	te := setupTestEnv(t)
+	defer te.teardown(t)
+	ctx := context.Background()
+
+	ns := &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: "test-artifact-pending"}}
+	if err := te.k8sClient.Create(ctx, ns); err != nil {
+		t.Fatalf("failed to create namespace: %v", err)
+	}
+
+	mapping := &v1alpha1.PodASGMapping{
+		ObjectMeta: metav1.ObjectMeta{Name: "pending-mapping", Namespace: ns.Name},
+		Spec: v1alpha1.PodASGMappingSpec{
+			Mappings: []v1alpha1.Mapping{
+				{
+					PodSelector: v1alpha1.PodSelector{MatchLabels: map[string]string{"app": "web"}},
+					ApplicationSecurityGroups: []v1alpha1.ASGReference{
+						{ResourceID: asgResourceID("sub1", "rg1", "asg-pending")},
+					},
+				},
+			},
+		},
+	}
+	if err := te.k8sClient.Create(ctx, mapping); err != nil {
+		t.Fatalf("failed to create mapping: %v", err)
+	}
+
+	// Create a pod WITH IP
+	podWithIP := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "pod-with-ip",
+			Namespace: ns.Name,
+			Labels:    map[string]string{"app": "web"},
+		},
+		Spec: corev1.PodSpec{
+			Containers: []corev1.Container{{Name: "app", Image: "nginx"}},
+		},
+	}
+	if err := te.k8sClient.Create(ctx, podWithIP); err != nil {
+		t.Fatalf("failed to create pod-with-ip: %v", err)
+	}
+	podWithIP.Status.PodIP = "10.0.2.1"
+	if err := te.k8sClient.Status().Update(ctx, podWithIP); err != nil {
+		t.Fatalf("failed to set pod-with-ip IP: %v", err)
+	}
+
+	// Create a pod WITHOUT IP (simulating pending scheduling)
+	podNoIP := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "pod-pending",
+			Namespace: ns.Name,
+			Labels:    map[string]string{"app": "web"},
+		},
+		Spec: corev1.PodSpec{
+			Containers: []corev1.Container{{Name: "app", Image: "nginx"}},
+		},
+	}
+	if err := te.k8sClient.Create(ctx, podNoIP); err != nil {
+		t.Fatalf("failed to create pod-pending: %v", err)
+	}
+
+	ownershipKey := "test-cluster-" + ns.Name + "-pending-mapping"
+
+	// Assert: initially only the pod with IP should appear
+	eventually(t, 15*time.Second, 300*time.Millisecond, func() bool {
+		ps, err := te.fakeClient.Get(ctx, "sub1", "rg1", "asg-pending", ownershipKey)
+		if err != nil || ps.Properties == nil {
+			return false
+		}
+		if len(ps.Properties.AddressPrefixes) != 1 {
+			return false
+		}
+		return ps.Properties.AddressPrefixes[0] == "10.0.2.1/32"
+	}, "Phase 5 artifact path: expected only pod-with-ip in prefix set initially")
+
+	// Now assign IP to the pending pod
+	var currentPodNoIP corev1.Pod
+	if err := te.k8sClient.Get(ctx, types.NamespacedName{Name: "pod-pending", Namespace: ns.Name}, &currentPodNoIP); err != nil {
+		t.Fatalf("failed to get pod-pending: %v", err)
+	}
+	currentPodNoIP.Status.PodIP = "10.0.2.2"
+	if err := te.k8sClient.Status().Update(ctx, &currentPodNoIP); err != nil {
+		t.Fatalf("failed to set pod-pending IP: %v", err)
+	}
+
+	// Assert: both IPs should appear after the pending pod gets its IP
+	eventually(t, 15*time.Second, 300*time.Millisecond, func() bool {
+		ps, err := te.fakeClient.Get(ctx, "sub1", "rg1", "asg-pending", ownershipKey)
+		if err != nil || ps.Properties == nil {
+			return false
+		}
+		ips := make(map[string]bool)
+		for _, ip := range ps.Properties.AddressPrefixes {
+			ips[ip] = true
+		}
+		return ips["10.0.2.1/32"] && ips["10.0.2.2/32"]
+	}, "Phase 5 artifact path: expected both pod IPs after pending pod gets IP")
+}
+
+// ---------------------------------------------------------------------------
+// TestPhase5_ForcedResync_ChurnScenario_BoundedRequeueAndEventualPublish
+// Integration test: Under active pod churn during a forced resync window,
+// the reconciler should eventually publish fresh recompute data (not stale
+// cache fallback) and use bounded requeue to prevent hot loops.
+// ---------------------------------------------------------------------------
+func TestPhase5_ForcedResync_ChurnScenario_BoundedRequeueAndEventualPublish(t *testing.T) {
+te := setupTestEnv(t)
+defer te.teardown(t)
+ctx := context.Background()
+
+ns := &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: "test-forced-churn"}}
+if err := te.k8sClient.Create(ctx, ns); err != nil {
+t.Fatalf("failed to create namespace: %v", err)
+}
+
+mapping := &v1alpha1.PodASGMapping{
+ObjectMeta: metav1.ObjectMeta{Name: "churn-mapping", Namespace: ns.Name},
+Spec: v1alpha1.PodASGMappingSpec{
+Mappings: []v1alpha1.Mapping{
+{
+PodSelector: v1alpha1.PodSelector{MatchLabels: map[string]string{"app": "churn"}},
+ApplicationSecurityGroups: []v1alpha1.ASGReference{
+{ResourceID: asgResourceID("sub1", "rg1", "asg1")},
+},
+},
+},
+},
+}
+if err := te.k8sClient.Create(ctx, mapping); err != nil {
+t.Fatalf("failed to create mapping: %v", err)
+}
+
+// Create initial set of pods
+for i := 1; i <= 3; i++ {
+pod := &corev1.Pod{
+ObjectMeta: metav1.ObjectMeta{
+Name: fmt.Sprintf("churn-pod-%d", i), Namespace: ns.Name,
+Labels: map[string]string{"app": "churn"},
+},
+Spec: corev1.PodSpec{Containers: []corev1.Container{{Name: "app", Image: "nginx"}}},
+}
+if err := te.k8sClient.Create(ctx, pod); err != nil {
+t.Fatalf("failed to create pod-%d: %v", i, err)
+}
+pod.Status.PodIP = fmt.Sprintf("10.0.3.%d", i)
+if err := te.k8sClient.Status().Update(ctx, pod); err != nil {
+t.Fatalf("failed to set pod-%d IP: %v", i, err)
+}
+}
+
+ownershipKey := "test-cluster-" + ns.Name + "-churn-mapping"
+
+// Wait for initial convergence
+eventually(t, 15*time.Second, 300*time.Millisecond, func() bool {
+ps, err := te.fakeClient.Get(ctx, "sub1", "rg1", "asg1", ownershipKey)
+if err != nil || ps.Properties == nil {
+return false
+}
+return len(ps.Properties.AddressPrefixes) == 3
+}, "expected initial 3 pods to converge")
+
+// Wait for forced resync to trigger (ResyncInterval=2s in test env)
+time.Sleep(3 * time.Second)
+
+// During the forced resync window, add a new pod (simulating churn)
+pod4 := &corev1.Pod{
+ObjectMeta: metav1.ObjectMeta{
+Name: "churn-pod-4", Namespace: ns.Name,
+Labels: map[string]string{"app": "churn"},
+},
+Spec: corev1.PodSpec{Containers: []corev1.Container{{Name: "app", Image: "nginx"}}},
+}
+if err := te.k8sClient.Create(ctx, pod4); err != nil {
+t.Fatalf("failed to create pod-4: %v", err)
+}
+pod4.Status.PodIP = "10.0.3.4"
+if err := te.k8sClient.Status().Update(ctx, pod4); err != nil {
+t.Fatalf("failed to set pod-4 IP: %v", err)
+}
+
+// Assert: eventually all 4 IPs should appear, proving forced resync
+// correctly publishes fresh recompute data even under churn
+eventually(t, 15*time.Second, 300*time.Millisecond, func() bool {
+ps, err := te.fakeClient.Get(ctx, "sub1", "rg1", "asg1", ownershipKey)
+if err != nil || ps.Properties == nil {
+return false
+}
+ips := make(map[string]bool)
+for _, ip := range ps.Properties.AddressPrefixes {
+ips[ip] = true
+}
+return ips["10.0.3.1/32"] && ips["10.0.3.2/32"] && ips["10.0.3.3/32"] && ips["10.0.3.4/32"]
+}, "Phase 5: forced resync under churn must eventually publish all 4 pods (no stale cache substitution)")
+}

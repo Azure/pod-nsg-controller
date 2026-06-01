@@ -2086,3 +2086,99 @@ func TestPhase5_TerminalNotFound_StaleInFlightCannotRepopulateCache(t *testing.T
 func (te *testEnv) getDesiredStateCacheEntry(mapping *v1alpha1.PodASGMapping) (engine.CachedDesiredState, bool) {
 	return te.desiredStateCache.Get(mapping)
 }
+
+// ---------------------------------------------------------------------------
+// TestPhase5_PodEvent_CacheMutationVisibleToImmediateReconcile
+// Integration test: when a pod event fires, the reconciler should observe
+// the cache mutation immediately (no extra forced recompute needed).
+// This validates the mutate-before-enqueue design at the integration level.
+// ---------------------------------------------------------------------------
+func TestPhase5_PodEvent_CacheMutationVisibleToImmediateReconcile(t *testing.T) {
+te := setupTestEnv(t)
+defer te.teardown(t)
+ctx := context.Background()
+
+ns := &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: "test-cache-visible"}}
+if err := te.k8sClient.Create(ctx, ns); err != nil {
+t.Fatalf("failed to create namespace: %v", err)
+}
+
+mapping := &v1alpha1.PodASGMapping{
+ObjectMeta: metav1.ObjectMeta{Name: "cache-vis-mapping", Namespace: ns.Name},
+Spec: v1alpha1.PodASGMappingSpec{
+Mappings: []v1alpha1.Mapping{
+{
+PodSelector: v1alpha1.PodSelector{MatchLabels: map[string]string{"app": "cache-test"}},
+ApplicationSecurityGroups: []v1alpha1.ASGReference{
+{ResourceID: asgResourceID("sub1", "rg1", "asg1")},
+},
+},
+},
+},
+}
+if err := te.k8sClient.Create(ctx, mapping); err != nil {
+t.Fatalf("failed to create mapping: %v", err)
+}
+
+// Create initial pod and wait for it to be reconciled
+pod1 := &corev1.Pod{
+ObjectMeta: metav1.ObjectMeta{
+Name: "vis-pod-1", Namespace: ns.Name,
+Labels: map[string]string{"app": "cache-test"},
+},
+Spec: corev1.PodSpec{Containers: []corev1.Container{{Name: "app", Image: "nginx"}}},
+}
+if err := te.k8sClient.Create(ctx, pod1); err != nil {
+t.Fatalf("failed to create pod-1: %v", err)
+}
+pod1.Status.PodIP = "10.0.1.1"
+if err := te.k8sClient.Status().Update(ctx, pod1); err != nil {
+t.Fatalf("failed to set pod-1 IP: %v", err)
+}
+
+ownershipKey := "test-cluster-" + ns.Name + "-cache-vis-mapping"
+
+// Wait for first pod to appear in prefix set
+eventually(t, 15*time.Second, 300*time.Millisecond, func() bool {
+ps, err := te.fakeClient.Get(ctx, "sub1", "rg1", "asg1", ownershipKey)
+if err != nil || ps.Properties == nil {
+return false
+}
+for _, ip := range ps.Properties.AddressPrefixes {
+if ip == "10.0.1.1/32" {
+return true
+}
+}
+return false
+}, "Phase 5: expected pod-1 IP to appear in prefix set")
+
+// Now add a second pod — the cache mutation should make this visible
+// to the reconciler without needing a full recompute cycle
+pod2 := &corev1.Pod{
+ObjectMeta: metav1.ObjectMeta{
+Name: "vis-pod-2", Namespace: ns.Name,
+Labels: map[string]string{"app": "cache-test"},
+},
+Spec: corev1.PodSpec{Containers: []corev1.Container{{Name: "app", Image: "nginx"}}},
+}
+if err := te.k8sClient.Create(ctx, pod2); err != nil {
+t.Fatalf("failed to create pod-2: %v", err)
+}
+pod2.Status.PodIP = "10.0.1.2"
+if err := te.k8sClient.Status().Update(ctx, pod2); err != nil {
+t.Fatalf("failed to set pod-2 IP: %v", err)
+}
+
+// Assert: pod-2's IP should appear quickly (cache hit path, no full recompute)
+eventually(t, 10*time.Second, 200*time.Millisecond, func() bool {
+ps, err := te.fakeClient.Get(ctx, "sub1", "rg1", "asg1", ownershipKey)
+if err != nil || ps.Properties == nil {
+return false
+}
+ips := make(map[string]bool)
+for _, ip := range ps.Properties.AddressPrefixes {
+ips[ip] = true
+}
+return ips["10.0.1.1/32"] && ips["10.0.1.2/32"]
+}, "Phase 5: expected pod-2 IP to appear via cache-hit path (mutate-before-enqueue)")
+}
