@@ -3802,12 +3802,38 @@ t.Fatal("Phase 5: expected List to be called (cache miss triggers pod recompute)
 "but listInterceptingClient.onList was never invoked — this is a cache HIT, not a miss")
 }
 
+// Branch-distinguishing assertion: the re-read path does NOT issue a second
+// List call. If listCallCount > 1, the reconciler fell through to the retry
+// full-recompute path (which also calls List), meaning re-read was NOT used.
+if listCallCount != 1 {
+t.Fatalf("Phase 5: expected exactly 1 List call (cache re-read path), got %d — "+
+"reconciler fell through to retry recompute instead of using cache re-read", listCallCount)
+}
+
 // The non-forced CAS conflict path MUST resolve via cache re-read because
 // SetFromRecompute populated the entry during List. The reconciler should
 // use the re-read data and proceed to the executor.
 if len(exec.calls) == 0 {
 t.Fatal("Phase 5: expected executor to be called after cache re-read resolved " +
 "CAS conflict, but no executor calls recorded — re-read path was NOT exercised")
+}
+
+// The re-read cache entry contains 10.0.0.99/32 (injected by SetFromRecompute
+// during the List interception). The retry recompute path would only produce
+// 10.0.0.1/32 from the fakeclient's pod list. Verify the re-read data was used.
+foundRereadIP := false
+for _, actions := range exec.calls {
+for _, a := range actions {
+for _, ip := range a.DesiredIPs {
+if ip == "10.0.0.99/32" {
+foundRereadIP = true
+}
+}
+}
+}
+if !foundRereadIP {
+t.Fatal("Phase 5: executor actions do not contain 10.0.0.99/32 which is only present " +
+"in the cache re-read entry — reconciler did not use re-read data")
 }
 _ = result
 }
