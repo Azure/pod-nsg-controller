@@ -1539,3 +1539,211 @@ ips[ip] = true
 return ips["10.0.3.1/32"] && ips["10.0.3.2/32"] && ips["10.0.3.3/32"] && ips["10.0.3.4/32"]
 }, "Phase 5: forced resync under churn must eventually publish all 4 pods (no stale cache substitution)")
 }
+
+// ===========================================================================
+// Phase 5: Cross-Module Parity — SharedIP Incremental vs Recompute
+// ===========================================================================
+
+// ---------------------------------------------------------------------------
+// TestPhase5_CrossModule_SharedIP_IncrementalDeleteVsRecompute_Parity
+// Two pods sharing the same IP. Delete one pod through the full controller
+// pipeline. The remaining state (single pod with shared IP) must match what
+// a fresh recompute would produce. This validates the design's parity
+// contract for shared-IP scenarios end-to-end.
+// ---------------------------------------------------------------------------
+func TestPhase5_CrossModule_SharedIP_IncrementalDeleteVsRecompute_Parity(t *testing.T) {
+	te := setupTestEnv(t)
+	defer te.teardown(t)
+	ctx := context.Background()
+
+	ns := &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: "test-shared-ip-parity"}}
+	if err := te.k8sClient.Create(ctx, ns); err != nil {
+		t.Fatalf("failed to create namespace: %v", err)
+	}
+
+	mapping := &v1alpha1.PodASGMapping{
+		ObjectMeta: metav1.ObjectMeta{Name: "shared-ip-mapping", Namespace: ns.Name},
+		Spec: v1alpha1.PodASGMappingSpec{
+			Mappings: []v1alpha1.Mapping{
+				{
+					PodSelector: v1alpha1.PodSelector{MatchLabels: map[string]string{"app": "shared"}},
+					ApplicationSecurityGroups: []v1alpha1.ASGReference{
+						{ResourceID: asgResourceID("sub1", "rg1", "asg1")},
+					},
+				},
+			},
+		},
+	}
+	if err := te.k8sClient.Create(ctx, mapping); err != nil {
+		t.Fatalf("failed to create mapping: %v", err)
+	}
+
+	// Create two pods with the SAME IP (host-network scenario)
+	sharedIP := "192.168.1.100"
+	for _, name := range []string{"host-pod-a", "host-pod-b"} {
+		pod := &corev1.Pod{
+			ObjectMeta: metav1.ObjectMeta{
+				Name: name, Namespace: ns.Name,
+				Labels: map[string]string{"app": "shared"},
+			},
+			Spec: corev1.PodSpec{
+				HostNetwork: true,
+				Containers:  []corev1.Container{{Name: "app", Image: "nginx"}},
+			},
+		}
+		if err := te.k8sClient.Create(ctx, pod); err != nil {
+			t.Fatalf("failed to create %s: %v", name, err)
+		}
+		pod.Status.PodIP = sharedIP
+		if err := te.k8sClient.Status().Update(ctx, pod); err != nil {
+			t.Fatalf("failed to set %s IP: %v", name, err)
+		}
+	}
+
+	ownershipKey := "test-cluster-" + ns.Name + "-shared-ip-mapping"
+	expectedCIDR := sharedIP + "/32"
+
+	// Wait for initial convergence (shared IP should appear)
+	eventually(t, 15*time.Second, 300*time.Millisecond, func() bool {
+		ps, err := te.fakeClient.Get(ctx, "sub1", "rg1", "asg1", ownershipKey)
+		if err != nil || ps.Properties == nil {
+			return false
+		}
+		for _, ip := range ps.Properties.AddressPrefixes {
+			if ip == expectedCIDR {
+				return true
+			}
+		}
+		return false
+	}, "expected shared IP to appear in prefix set")
+
+	// Delete one of the two pods — the IP must be RETAINED
+	podA := &corev1.Pod{}
+	if err := te.k8sClient.Get(ctx, types.NamespacedName{Namespace: ns.Name, Name: "host-pod-a"}, podA); err != nil {
+		t.Fatalf("failed to get host-pod-a: %v", err)
+	}
+	if err := te.k8sClient.Delete(ctx, podA); err != nil {
+		t.Fatalf("failed to delete host-pod-a: %v", err)
+	}
+
+	// Wait a reasonable time for the delete to process
+	time.Sleep(3 * time.Second)
+
+	// Verify: shared IP must still be present (host-pod-b still contributes)
+	eventually(t, 10*time.Second, 300*time.Millisecond, func() bool {
+		ps, err := te.fakeClient.Get(ctx, "sub1", "rg1", "asg1", ownershipKey)
+		if err != nil || ps.Properties == nil {
+			return false
+		}
+		for _, ip := range ps.Properties.AddressPrefixes {
+			if ip == expectedCIDR {
+				return true
+			}
+		}
+		return false
+	}, "Phase 5: shared IP must be retained when one contributor pod is deleted (other still contributes)")
+}
+
+// ===========================================================================
+// Phase 5: Cross-Module — Pending IP Pod Eventual Convergence
+// ===========================================================================
+
+// ---------------------------------------------------------------------------
+// TestPhase5_CrossModule_PendingIPPod_GetsIP_EventuallyConverges
+// A pod is created without an IP (pending scheduling), then gets an IP via
+// status update. The incremental cache path must eventually include the IP
+// in the prefix set without requiring a full resync. This validates design
+// edge case #1 end-to-end.
+// ---------------------------------------------------------------------------
+func TestPhase5_CrossModule_PendingIPPod_GetsIP_EventuallyConverges(t *testing.T) {
+	te := setupTestEnv(t)
+	defer te.teardown(t)
+	ctx := context.Background()
+
+	ns := &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: "test-pending-converge"}}
+	if err := te.k8sClient.Create(ctx, ns); err != nil {
+		t.Fatalf("failed to create namespace: %v", err)
+	}
+
+	mapping := &v1alpha1.PodASGMapping{
+		ObjectMeta: metav1.ObjectMeta{Name: "pending-mapping", Namespace: ns.Name},
+		Spec: v1alpha1.PodASGMappingSpec{
+			Mappings: []v1alpha1.Mapping{
+				{
+					PodSelector: v1alpha1.PodSelector{MatchLabels: map[string]string{"app": "pending-test"}},
+					ApplicationSecurityGroups: []v1alpha1.ASGReference{
+						{ResourceID: asgResourceID("sub1", "rg1", "asg1")},
+					},
+				},
+			},
+		},
+	}
+	if err := te.k8sClient.Create(ctx, mapping); err != nil {
+		t.Fatalf("failed to create mapping: %v", err)
+	}
+
+	// Create a pod that initially has an IP (to establish the prefix set)
+	readyPod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "ready-pod", Namespace: ns.Name,
+			Labels: map[string]string{"app": "pending-test"},
+		},
+		Spec: corev1.PodSpec{Containers: []corev1.Container{{Name: "app", Image: "nginx"}}},
+	}
+	if err := te.k8sClient.Create(ctx, readyPod); err != nil {
+		t.Fatalf("failed to create ready-pod: %v", err)
+	}
+	readyPod.Status.PodIP = "10.0.7.1"
+	if err := te.k8sClient.Status().Update(ctx, readyPod); err != nil {
+		t.Fatalf("failed to set ready-pod IP: %v", err)
+	}
+
+	ownershipKey := "test-cluster-" + ns.Name + "-pending-mapping"
+
+	// Wait for ready pod to appear
+	eventually(t, 15*time.Second, 300*time.Millisecond, func() bool {
+		ps, err := te.fakeClient.Get(ctx, "sub1", "rg1", "asg1", ownershipKey)
+		if err != nil || ps.Properties == nil {
+			return false
+		}
+		for _, ip := range ps.Properties.AddressPrefixes {
+			if ip == "10.0.7.1/32" {
+				return true
+			}
+		}
+		return false
+	}, "expected ready-pod IP to appear")
+
+	// Create pending pod (no IP yet)
+	pendingPod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "pending-pod", Namespace: ns.Name,
+			Labels: map[string]string{"app": "pending-test"},
+		},
+		Spec: corev1.PodSpec{Containers: []corev1.Container{{Name: "app", Image: "nginx"}}},
+	}
+	if err := te.k8sClient.Create(ctx, pendingPod); err != nil {
+		t.Fatalf("failed to create pending-pod: %v", err)
+	}
+	// Status.PodIP is empty — simulating pending scheduling
+
+	// Wait briefly, then assign IP (simulating scheduler + CNI)
+	time.Sleep(500 * time.Millisecond)
+	pendingPod.Status.PodIP = "10.0.7.2"
+	if err := te.k8sClient.Status().Update(ctx, pendingPod); err != nil {
+		t.Fatalf("failed to set pending-pod IP: %v", err)
+	}
+
+	// Assert: eventually both IPs appear (pending pod's IP via incremental update path)
+	eventually(t, 15*time.Second, 300*time.Millisecond, func() bool {
+		ps, err := te.fakeClient.Get(ctx, "sub1", "rg1", "asg1", ownershipKey)
+		if err != nil || ps.Properties == nil {
+			return false
+		}
+		ips := make(map[string]bool)
+		for _, ip := range ps.Properties.AddressPrefixes {
+			ips[ip] = true
+		}
+		return ips["10.0.7.1/32"] && ips["10.0.7.2/32"]
+	}, "Phase 5: pending pod that gets IP must eventually converge into prefix set via incremental path")
+}

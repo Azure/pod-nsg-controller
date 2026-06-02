@@ -1382,6 +1382,428 @@ t.Errorf("HasPendingIPPods mismatch: A=%v, B=%v", gotA.HasPendingIPPods, gotB.Ha
 }
 }
 
+// ===========================================================================
+// Phase 5: Artifact Publish Parity vs Incremental Mutation — Shared-IP
+// ===========================================================================
+
+// ---------------------------------------------------------------------------
+// TestPhase5_ArtifactPublishThenIncremental_ParityWithFreshRecompute_SharedIP
+// Validates the design's parity contract: starting from an artifact-committed
+// cache entry, applying incremental mutations (OnPodAdd/Delete) must produce
+// state semantically equivalent to a fresh full recompute with the same final
+// pod set. This specifically covers shared-IP pods (design edge case #2).
+// ---------------------------------------------------------------------------
+func TestPhase5_ArtifactPublishThenIncremental_ParityWithFreshRecompute_SharedIP(t *testing.T) {
+	asgID := makeASGResourceID("sub1", "rg1", "asg1")
+	mapping := cacheTestMapping("default", "shared-ip-parity", 1,
+		map[string]string{"app": "web"}, asgID)
+
+	target := ASGTarget{
+		SubscriptionID: "sub1",
+		ResourceGroup:  "rg1",
+		ASGName:        "asg1",
+		FullResourceID: asgID,
+		PrefixSetName:  "test-cluster-default-shared-ip-parity",
+	}
+
+	// Two pods that share the same IP (host-network scenario)
+	podA := cacheTestPod("default", "pod-a", map[string]string{"app": "web"}, "10.0.0.1")
+	podB := cacheTestPod("default", "pod-b", map[string]string{"app": "web"}, "10.0.0.1")
+
+	// Path A: Artifact publish then incremental delete of pod-a
+	cacheIncremental := NewDesiredStateCache("test-cluster")
+	_, ver, epoch, _ := cacheIncremental.GetWithVersion(mapping)
+	artifacts := DesiredStateRecomputeArtifacts{
+		Desired: map[ASGTarget]DesiredPrefixSet{
+			target: {IPs: map[string]struct{}{"10.0.0.1/32": {}}},
+		},
+		Snapshot: PodSnapshot{Pods: map[PodIdentity]PodMembership{
+			{Namespace: "default", Name: "pod-a"}: {PodIP: "10.0.0.1"},
+			{Namespace: "default", Name: "pod-b"}: {PodIP: "10.0.0.1"},
+		}},
+		MatchedPodsByIndex: []int{2},
+		HasPendingIPPods:   false,
+		PodRules: map[PodIdentity]map[int]struct{}{
+			{Namespace: "default", Name: "pod-a"}: {0: {}},
+			{Namespace: "default", Name: "pod-b"}: {0: {}},
+		},
+		PendingIPCount: 0,
+	}
+	committed, _, _ := cacheIncremental.SetFromRecomputeArtifactsIfVersion(mapping, artifacts, ver, epoch)
+	if !committed {
+		t.Fatal("artifact commit should succeed on clean cache")
+	}
+
+	// Incrementally delete pod-a (pod-b still contributes 10.0.0.1)
+	cacheIncremental.OnPodDelete(mapping, podA)
+	gotIncremental, ok := cacheIncremental.Get(mapping)
+	if !ok {
+		t.Fatal("expected cache hit after incremental delete")
+	}
+
+	// Path B: Fresh full recompute with only pod-b remaining
+	pods := []corev1.Pod{*podB}
+	freshArtifacts := ComputeDesiredStateRecomputeArtifacts("test-cluster", *mapping, pods)
+
+	// Parity check: shared IP must be retained (pod-b still contributes)
+	if _, hasIP := gotIncremental.Desired[target].IPs["10.0.0.1/32"]; !hasIP {
+		t.Errorf("incremental path must retain shared IP when other contributor exists; got IPs: %v",
+			gotIncremental.Desired[target].IPs)
+	}
+	if _, hasIP := freshArtifacts.Desired[target].IPs["10.0.0.1/32"]; !hasIP {
+		t.Errorf("fresh recompute must retain shared IP for remaining pod; got IPs: %v",
+			freshArtifacts.Desired[target].IPs)
+	}
+
+	// Matched counts must match
+	if gotIncremental.MatchedPodsByIndex[0] != freshArtifacts.MatchedPodsByIndex[0] {
+		t.Errorf("MatchedPodsByIndex parity: incremental=%d, recompute=%d",
+			gotIncremental.MatchedPodsByIndex[0], freshArtifacts.MatchedPodsByIndex[0])
+	}
+
+	_ = podA // used above
+}
+
+// ===========================================================================
+// Phase 5: Artifact Publish Parity — Pending IP Transition
+// ===========================================================================
+
+// ---------------------------------------------------------------------------
+// TestPhase5_ArtifactPublishThenIncremental_PendingIPTransition
+// A pod transitions from pending (no IP) to having an IP via OnPodUpdate.
+// The incremental path must produce state equivalent to a fresh recompute
+// where the pod has the IP. This validates design edge case #1.
+// ---------------------------------------------------------------------------
+func TestPhase5_ArtifactPublishThenIncremental_PendingIPTransition(t *testing.T) {
+	asgID := makeASGResourceID("sub1", "rg1", "asg1")
+	mapping := cacheTestMapping("default", "pending-transition", 1,
+		map[string]string{"app": "web"}, asgID)
+
+	target := ASGTarget{
+		SubscriptionID: "sub1",
+		ResourceGroup:  "rg1",
+		ASGName:        "asg1",
+		FullResourceID: asgID,
+		PrefixSetName:  "test-cluster-default-pending-transition",
+	}
+
+	// Initial state: one pod with IP, one pending
+	cache := NewDesiredStateCache("test-cluster")
+	_, ver, epoch, _ := cache.GetWithVersion(mapping)
+	artifacts := DesiredStateRecomputeArtifacts{
+		Desired: map[ASGTarget]DesiredPrefixSet{
+			target: {IPs: map[string]struct{}{"10.0.0.1/32": {}}},
+		},
+		Snapshot: PodSnapshot{Pods: map[PodIdentity]PodMembership{
+			{Namespace: "default", Name: "pod-ready"}: {PodIP: "10.0.0.1"},
+		}},
+		MatchedPodsByIndex: []int{2}, // both pods matched, one pending
+		HasPendingIPPods:   true,
+		PodRules: map[PodIdentity]map[int]struct{}{
+			{Namespace: "default", Name: "pod-ready"}:   {0: {}},
+			{Namespace: "default", Name: "pod-pending"}: {0: {}},
+		},
+		PendingIPCount: 1,
+	}
+	committed, _, _ := cache.SetFromRecomputeArtifactsIfVersion(mapping, artifacts, ver, epoch)
+	if !committed {
+		t.Fatal("artifact commit should succeed")
+	}
+
+	// Verify pending state
+	gotBefore, _ := cache.Get(mapping)
+	if !gotBefore.HasPendingIPPods {
+		t.Error("expected HasPendingIPPods=true before transition")
+	}
+
+	// Transition: pending pod gets an IP
+	oldPod := cacheTestPod("default", "pod-pending", map[string]string{"app": "web"}, "")
+	newPod := cacheTestPod("default", "pod-pending", map[string]string{"app": "web"}, "10.0.0.2")
+	updated := cache.OnPodUpdate(mapping, oldPod, newPod)
+	if !updated {
+		t.Fatal("OnPodUpdate should succeed for pending->ready transition")
+	}
+
+	got, ok := cache.Get(mapping)
+	if !ok {
+		t.Fatal("expected cache hit after update")
+	}
+
+	// IP should now appear in desired state
+	if _, hasNewIP := got.Desired[target].IPs["10.0.0.2/32"]; !hasNewIP {
+		t.Errorf("pending->ready transition must add IP to desired state; got IPs: %v", got.Desired[target].IPs)
+	}
+
+	// Pending count should be zero now
+	if got.HasPendingIPPods {
+		t.Error("HasPendingIPPods should be false after pending pod gets IP")
+	}
+
+	// Snapshot should include the now-ready pod
+	pendingPodID := PodIdentity{Namespace: "default", Name: "pod-pending"}
+	if _, inSnapshot := got.Snapshot.Pods[pendingPodID]; !inSnapshot {
+		t.Error("pending pod should appear in snapshot after getting IP")
+	}
+}
+
+// ===========================================================================
+// Phase 5: UID Guard for Artifact Path
+// ===========================================================================
+
+// ---------------------------------------------------------------------------
+// TestPhase5_SetFromRecomputeArtifactsIfVersion_UIDGuard_RejectsDifferentUID
+// Validates design edge case #3: Delete/recreate same namespaced name with
+// same generation. UID fence must block stale publish from old incarnation.
+// ---------------------------------------------------------------------------
+func TestPhase5_SetFromRecomputeArtifactsIfVersion_UIDGuard_RejectsDifferentUID(t *testing.T) {
+	asgID := makeASGResourceID("sub1", "rg1", "asg1")
+	target := ASGTarget{
+		SubscriptionID: "sub1",
+		ResourceGroup:  "rg1",
+		ASGName:        "asg1",
+		FullResourceID: asgID,
+		PrefixSetName:  "test-cluster-default-uid-mapping",
+	}
+
+	cache := NewDesiredStateCache("test-cluster")
+
+	// First incarnation with UID-alpha commits
+	mappingAlpha := &v1alpha1.PodASGMapping{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace:  "default",
+			Name:       "uid-mapping",
+			Generation: 1,
+			UID:        "uid-alpha",
+		},
+		Spec: v1alpha1.PodASGMappingSpec{
+			Mappings: []v1alpha1.Mapping{
+				{
+					PodSelector:               v1alpha1.PodSelector{MatchLabels: map[string]string{"app": "web"}},
+					ApplicationSecurityGroups: []v1alpha1.ASGReference{{ResourceID: asgID}},
+				},
+			},
+		},
+	}
+
+	_, ver, epoch, _ := cache.GetWithVersion(mappingAlpha)
+	alphaArtifacts := DesiredStateRecomputeArtifacts{
+		Desired:            map[ASGTarget]DesiredPrefixSet{target: {IPs: map[string]struct{}{"10.0.0.ALPHA/32": {}}}},
+		Snapshot:           PodSnapshot{Pods: map[PodIdentity]PodMembership{{Namespace: "default", Name: "alpha-pod"}: {PodIP: "10.0.0.ALPHA"}}},
+		MatchedPodsByIndex: []int{1},
+		HasPendingIPPods:   false,
+		PodRules:           map[PodIdentity]map[int]struct{}{{Namespace: "default", Name: "alpha-pod"}: {0: {}}},
+		PendingIPCount:     0,
+	}
+	committed, _, _ := cache.SetFromRecomputeArtifactsIfVersion(mappingAlpha, alphaArtifacts, ver, epoch)
+	if !committed {
+		t.Fatal("alpha commit should succeed")
+	}
+
+	// Second incarnation with UID-beta (same name, same generation)
+	mappingBeta := &v1alpha1.PodASGMapping{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace:  "default",
+			Name:       "uid-mapping",
+			Generation: 1,
+			UID:        "uid-beta",
+		},
+		Spec: v1alpha1.PodASGMappingSpec{
+			Mappings: []v1alpha1.Mapping{
+				{
+					PodSelector:               v1alpha1.PodSelector{MatchLabels: map[string]string{"app": "web"}},
+					ApplicationSecurityGroups: []v1alpha1.ASGReference{{ResourceID: asgID}},
+				},
+			},
+		},
+	}
+
+	// Beta tries to publish with same version/epoch (stale from alpha's perspective)
+	_, ver2, epoch2, _ := cache.GetWithVersion(mappingBeta)
+	betaArtifacts := DesiredStateRecomputeArtifacts{
+		Desired:            map[ASGTarget]DesiredPrefixSet{target: {IPs: map[string]struct{}{"10.0.0.BETA/32": {}}}},
+		Snapshot:           PodSnapshot{Pods: map[PodIdentity]PodMembership{{Namespace: "default", Name: "beta-pod"}: {PodIP: "10.0.0.BETA"}}},
+		MatchedPodsByIndex: []int{1},
+		HasPendingIPPods:   false,
+		PodRules:           map[PodIdentity]map[int]struct{}{{Namespace: "default", Name: "beta-pod"}: {0: {}}},
+		PendingIPCount:     0,
+	}
+	committedBeta, _, _ := cache.SetFromRecomputeArtifactsIfVersion(mappingBeta, betaArtifacts, ver2, epoch2)
+
+	// The UID guard must reject beta's publish since alpha's entry has a different UID
+	if committedBeta {
+		t.Error("UID guard must reject artifact publish when existing entry was committed by different UID")
+	}
+
+	// Verify alpha's data is still intact
+	got, ok := cache.Get(mappingAlpha)
+	if !ok {
+		t.Fatal("alpha's cache entry should still exist")
+	}
+	if _, hasAlpha := got.Desired[target].IPs["10.0.0.ALPHA/32"]; !hasAlpha {
+		t.Error("alpha's IP should be preserved after beta's rejected publish")
+	}
+}
+
+// ===========================================================================
+// Phase 5: Generation Rollover via Artifact Path
+// ===========================================================================
+
+// ---------------------------------------------------------------------------
+// TestPhase5_SetFromRecomputeArtifactsIfVersion_GenerationRollover_PrunesOlderEntries
+// Validates design edge case #4: Mapping generation rollover during churn.
+// When a newer generation commits, older generation entries must be pruned.
+// ---------------------------------------------------------------------------
+func TestPhase5_SetFromRecomputeArtifactsIfVersion_GenerationRollover_PrunesOlderEntries(t *testing.T) {
+	asgID := makeASGResourceID("sub1", "rg1", "asg1")
+	target := ASGTarget{
+		SubscriptionID: "sub1",
+		ResourceGroup:  "rg1",
+		ASGName:        "asg1",
+		FullResourceID: asgID,
+		PrefixSetName:  "test-cluster-default-gen-rollover",
+	}
+
+	cache := NewDesiredStateCache("test-cluster")
+
+	// Commit gen=1
+	mappingGen1 := cacheTestMapping("default", "gen-rollover", 1,
+		map[string]string{"app": "web"}, asgID)
+	_, v1, e1, _ := cache.GetWithVersion(mappingGen1)
+	arts1 := DesiredStateRecomputeArtifacts{
+		Desired:            map[ASGTarget]DesiredPrefixSet{target: {IPs: map[string]struct{}{"10.0.0.1/32": {}}}},
+		Snapshot:           PodSnapshot{Pods: map[PodIdentity]PodMembership{{Namespace: "default", Name: "pod-1"}: {PodIP: "10.0.0.1"}}},
+		MatchedPodsByIndex: []int{1},
+		PodRules:           map[PodIdentity]map[int]struct{}{{Namespace: "default", Name: "pod-1"}: {0: {}}},
+	}
+	committed1, _, _ := cache.SetFromRecomputeArtifactsIfVersion(mappingGen1, arts1, v1, e1)
+	if !committed1 {
+		t.Fatal("gen1 commit should succeed")
+	}
+
+	// Commit gen=3 (skipping gen=2)
+	mappingGen3 := cacheTestMapping("default", "gen-rollover", 3,
+		map[string]string{"app": "web-v3"}, asgID)
+	_, v3, e3, _ := cache.GetWithVersion(mappingGen3)
+	arts3 := DesiredStateRecomputeArtifacts{
+		Desired:            map[ASGTarget]DesiredPrefixSet{target: {IPs: map[string]struct{}{"10.0.0.3/32": {}}}},
+		Snapshot:           PodSnapshot{Pods: map[PodIdentity]PodMembership{{Namespace: "default", Name: "pod-3"}: {PodIP: "10.0.0.3"}}},
+		MatchedPodsByIndex: []int{1},
+		PodRules:           map[PodIdentity]map[int]struct{}{{Namespace: "default", Name: "pod-3"}: {0: {}}},
+	}
+	committed3, _, _ := cache.SetFromRecomputeArtifactsIfVersion(mappingGen3, arts3, v3, e3)
+	if !committed3 {
+		t.Fatal("gen3 commit should succeed")
+	}
+
+	// Gen=1 entry should be pruned
+	if _, ok := cache.Get(mappingGen1); ok {
+		t.Error("gen=1 entry should be pruned after gen=3 commit")
+	}
+
+	// Stale gen=2 publish attempt should be rejected
+	mappingGen2 := cacheTestMapping("default", "gen-rollover", 2,
+		map[string]string{"app": "web-v2"}, asgID)
+	_, v2, e2, _ := cache.GetWithVersion(mappingGen2)
+	arts2 := DesiredStateRecomputeArtifacts{
+		Desired:            map[ASGTarget]DesiredPrefixSet{target: {IPs: map[string]struct{}{"10.0.0.2/32": {}}}},
+		Snapshot:           PodSnapshot{},
+		MatchedPodsByIndex: []int{1},
+		PodRules:           map[PodIdentity]map[int]struct{}{},
+	}
+	committed2, _, _ := cache.SetFromRecomputeArtifactsIfVersion(mappingGen2, arts2, v2, e2)
+	if committed2 {
+		t.Error("gen=2 publish must be rejected after gen=3 is committed (generation rollover guard)")
+	}
+
+	// Gen=3 data should still be intact
+	got, ok := cache.Get(mappingGen3)
+	if !ok {
+		t.Fatal("gen=3 entry should still exist")
+	}
+	if _, has := got.Desired[target].IPs["10.0.0.3/32"]; !has {
+		t.Error("gen=3 IP should be preserved")
+	}
+}
+
+// ===========================================================================
+// Phase 5: Concurrent Artifact Mutation + CAS Race
+// ===========================================================================
+
+// ---------------------------------------------------------------------------
+// TestPhase5_ConcurrentArtifactPublish_PodMutation_RaceStability
+// Validates concurrent event mutation via OnPodAdd/Delete racing with
+// SetFromRecomputeArtifactsIfVersion (design test plan item #3 for cache).
+// ---------------------------------------------------------------------------
+func TestPhase5_ConcurrentArtifactPublish_PodMutation_RaceStability(t *testing.T) {
+	asgID := makeASGResourceID("sub1", "rg1", "asg1")
+	mapping := cacheTestMapping("default", "race-mapping", 1,
+		map[string]string{"app": "web"}, asgID)
+
+	target := ASGTarget{
+		SubscriptionID: "sub1",
+		ResourceGroup:  "rg1",
+		ASGName:        "asg1",
+		FullResourceID: asgID,
+		PrefixSetName:  "test-cluster-default-race-mapping",
+	}
+
+	cache := NewDesiredStateCache("test-cluster")
+
+	// Seed initial state
+	seedArtifacts := DesiredStateRecomputeArtifacts{
+		Desired:            map[ASGTarget]DesiredPrefixSet{target: {IPs: map[string]struct{}{"10.0.0.1/32": {}}}},
+		Snapshot:           PodSnapshot{Pods: map[PodIdentity]PodMembership{{Namespace: "default", Name: "pod-1"}: {PodIP: "10.0.0.1"}}},
+		MatchedPodsByIndex: []int{1},
+		PodRules:           map[PodIdentity]map[int]struct{}{{Namespace: "default", Name: "pod-1"}: {0: {}}},
+	}
+	_, v0, e0, _ := cache.GetWithVersion(mapping)
+	cache.SetFromRecomputeArtifactsIfVersion(mapping, seedArtifacts, v0, e0)
+
+	var wg sync.WaitGroup
+	iterations := 200
+
+	// Goroutine 1: Repeated CAS publish attempts via artifact path
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for i := 0; i < iterations; i++ {
+			_, ver, epoch, _ := cache.GetWithVersion(mapping)
+			arts := DesiredStateRecomputeArtifacts{
+				Desired:            map[ASGTarget]DesiredPrefixSet{target: {IPs: map[string]struct{}{"10.0.0.1/32": {}}}},
+				Snapshot:           PodSnapshot{Pods: map[PodIdentity]PodMembership{{Namespace: "default", Name: "pod-1"}: {PodIP: "10.0.0.1"}}},
+				MatchedPodsByIndex: []int{1},
+				PodRules:           map[PodIdentity]map[int]struct{}{{Namespace: "default", Name: "pod-1"}: {0: {}}},
+			}
+			cache.SetFromRecomputeArtifactsIfVersion(mapping, arts, ver, epoch)
+		}
+	}()
+
+	// Goroutine 2: Pod add/delete churn
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		pod := cacheTestPod("default", "churn-pod", map[string]string{"app": "web"}, "10.0.0.99")
+		for i := 0; i < iterations; i++ {
+			cache.OnPodAdd(mapping, pod)
+			cache.OnPodDelete(mapping, pod)
+		}
+	}()
+
+	// Goroutine 3: Invalidate + reseed
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for i := 0; i < iterations; i++ {
+			cache.Invalidate(types.NamespacedName{Namespace: "default", Name: "race-mapping"})
+			_, ver, epoch, _ := cache.GetWithVersion(mapping)
+			cache.SetFromRecomputeArtifactsIfVersion(mapping, seedArtifacts, ver, epoch)
+		}
+	}()
+
+	wg.Wait()
+	// No panic or race = pass (run with -race flag)
+}
+
 // ---------------------------------------------------------------------------
 // TestPhase5_CASFence_VersionAdvancesPreventsStalePublish
 // Verifies that CAS fences correctly reject publishes from stale recomputes

@@ -3837,3 +3837,225 @@ t.Fatal("Phase 5: executor actions do not contain 10.0.0.99/32 which is only pre
 }
 _ = result
 }
+
+// ===========================================================================
+// Phase 5: Reconciler — Forced Resync Repeated CAS Conflict Bounded Requeue
+// ===========================================================================
+
+// ---------------------------------------------------------------------------
+// TestPhase5_Reconcile_ForcedResync_RepeatedCASConflicts_BoundedRequeue
+// Validates design edge case #5: Forced resync under heavy pod churn produces
+// repeated CAS conflicts, but the reconciler must not loop indefinitely. It
+// should yield a bounded requeue (not 0 or negative) after exhausting retries.
+// ---------------------------------------------------------------------------
+func TestPhase5_Reconcile_ForcedResync_RepeatedCASConflicts_BoundedRequeue(t *testing.T) {
+	ctx := context.Background()
+	scheme := testScheme(t)
+	ns := "test-ns"
+
+	cache := engine.NewDesiredStateCache("test-cluster")
+	asgID := asgResourceID("sub1", "rg1", "asg1")
+
+	mappingObj := &v1alpha1.PodASGMapping{
+		ObjectMeta: metav1.ObjectMeta{Namespace: ns, Name: "heavy-churn-mapping", Generation: 1},
+		Spec: v1alpha1.PodASGMappingSpec{
+			Mappings: []v1alpha1.Mapping{
+				{
+					PodSelector:               v1alpha1.PodSelector{MatchLabels: map[string]string{"app": "web"}},
+					ApplicationSecurityGroups: []v1alpha1.ASGReference{{ResourceID: asgID}},
+				},
+			},
+		},
+	}
+
+	target := engine.ASGTarget{
+		SubscriptionID: "sub1",
+		ResourceGroup:  "rg1",
+		ASGName:        "asg1",
+		FullResourceID: asgID,
+		PrefixSetName:  "test-cluster-" + ns + "-heavy-churn-mapping",
+	}
+
+	// Seed cache and then invalidate to force recompute path
+	cache.SetFromRecompute(mappingObj, nil,
+		map[engine.ASGTarget]engine.DesiredPrefixSet{
+			target: {IPs: map[string]struct{}{"10.0.0.1/32": {}}},
+		},
+		engine.PodSnapshot{Pods: map[engine.PodIdentity]engine.PodMembership{
+			{Namespace: ns, Name: "pod-1"}: {PodIP: "10.0.0.1"},
+		}},
+		[]int{1}, false)
+	cache.Invalidate(types.NamespacedName{Namespace: ns, Name: "heavy-churn-mapping"})
+
+	mapping := newTestMapping(ns, "heavy-churn-mapping", mappingObj.Spec.Mappings)
+	mapping.Finalizers = []string{CleanupFinalizer}
+	mapping.Generation = 1
+
+	pod := newTestPod(ns, "pod-1", "10.0.0.1", map[string]string{"app": "web"})
+
+	innerClient := fakeclient.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(mapping, pod).
+		Build()
+
+	// Intercept EVERY List call to bump the version fence, causing repeated CAS conflicts
+	listCallCount := 0
+	wrappedClient := &listInterceptingClient{
+		Client: innerClient,
+		onList: func() {
+			listCallCount++
+			// Always bump version to ensure CAS conflict
+			churnPod := &corev1.Pod{
+				ObjectMeta: metav1.ObjectMeta{
+					Namespace: ns,
+					Name:      fmt.Sprintf("churn-pod-%d", listCallCount),
+					Labels:    map[string]string{"app": "web"},
+				},
+				Status: corev1.PodStatus{PodIP: fmt.Sprintf("10.0.99.%d", listCallCount)},
+			}
+			cache.OnPodAdd(mappingObj, churnPod)
+		},
+	}
+
+	fakeFactory := fake.NewClientFactory()
+	fakeFactory.RegisterClient("sub1", fake.NewClient())
+	exec := &stubExecutor{}
+
+	r := &MappingReconciler{
+		Client:            wrappedClient,
+		Scheme:            scheme,
+		ClusterName:       "test-cluster",
+		ResyncInterval:    2 * time.Second, // short to trigger forced resync
+		PrefixSetFactory:  fakeFactory,
+		Executor:          exec,
+		DesiredStateCache: cache,
+	}
+
+	// Mark an old full recompute so shouldForceDesiredStateRecompute returns true
+	// (last recompute was longer than ResyncInterval ago)
+	r.markDesiredStateFullRecompute(
+		types.NamespacedName{Name: "heavy-churn-mapping", Namespace: ns},
+		1, time.Now().Add(-5*time.Second),
+	)
+
+	result, err := r.Reconcile(ctx, ctrl.Request{
+		NamespacedName: types.NamespacedName{Name: "heavy-churn-mapping", Namespace: ns},
+	})
+
+	// The reconciler must NOT loop indefinitely — it should return with a bounded requeue
+	// Either it returns an error (acceptable) or a positive requeue interval
+	if err == nil && result.RequeueAfter == 0 && !result.Requeue {
+		t.Fatal("Phase 5: forced resync with repeated CAS conflicts must not silently succeed " +
+			"without requeue — expected bounded requeue or error")
+	}
+
+	// List should have been called at most a bounded number of times (not hundreds)
+	// The design says "retry recompute once with refreshed fences, then bounded requeue"
+	if listCallCount > 5 {
+		t.Errorf("Phase 5: reconciler called List %d times (unbounded retry loop); "+
+			"expected bounded retries (max ~2-3 attempts)", listCallCount)
+	}
+
+	// If requeue was returned, it must use the bounded interval (cacheConflictRequeueAfter)
+	if err == nil && result.RequeueAfter > 0 {
+		if result.RequeueAfter > 10*time.Second {
+			t.Errorf("Phase 5: requeue interval too large (%v); expected bounded value", result.RequeueAfter)
+		}
+	}
+}
+
+// ---------------------------------------------------------------------------
+// TestPhase5_Reconcile_CacheHit_UsesArtifactPath_NoListCall
+// Validates that when cache has a valid hit, the reconciler does NOT call
+// List (no pod enumeration), proving O(1) amortized reconcile.
+// ---------------------------------------------------------------------------
+func TestPhase5_Reconcile_CacheHit_UsesArtifactPath_NoListCall(t *testing.T) {
+	ctx := context.Background()
+	scheme := testScheme(t)
+	ns := "test-ns"
+
+	cache := engine.NewDesiredStateCache("test-cluster")
+	asgID := asgResourceID("sub1", "rg1", "asg1")
+
+	mappingObj := &v1alpha1.PodASGMapping{
+		ObjectMeta: metav1.ObjectMeta{Namespace: ns, Name: "hit-mapping", Generation: 1},
+		Spec: v1alpha1.PodASGMappingSpec{
+			Mappings: []v1alpha1.Mapping{
+				{
+					PodSelector:               v1alpha1.PodSelector{MatchLabels: map[string]string{"app": "web"}},
+					ApplicationSecurityGroups: []v1alpha1.ASGReference{{ResourceID: asgID}},
+				},
+			},
+		},
+	}
+
+	target := engine.ASGTarget{
+		SubscriptionID: "sub1",
+		ResourceGroup:  "rg1",
+		ASGName:        "asg1",
+		FullResourceID: asgID,
+		PrefixSetName:  "test-cluster-" + ns + "-hit-mapping",
+	}
+
+	// Seed cache with valid entry (no invalidation)
+	cache.SetFromRecompute(mappingObj, nil,
+		map[engine.ASGTarget]engine.DesiredPrefixSet{
+			target: {IPs: map[string]struct{}{"10.0.0.1/32": {}}},
+		},
+		engine.PodSnapshot{Pods: map[engine.PodIdentity]engine.PodMembership{
+			{Namespace: ns, Name: "pod-1"}: {PodIP: "10.0.0.1"},
+		}},
+		[]int{1}, false)
+
+	mapping := newTestMapping(ns, "hit-mapping", mappingObj.Spec.Mappings)
+	mapping.Finalizers = []string{CleanupFinalizer}
+	mapping.Generation = 1
+
+	pod := newTestPod(ns, "pod-1", "10.0.0.1", map[string]string{"app": "web"})
+
+	innerClient := fakeclient.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(mapping, pod).
+		Build()
+
+	listCallCount := 0
+	wrappedClient := &listInterceptingClient{
+		Client: innerClient,
+		onList: func() {
+			listCallCount++
+		},
+	}
+
+	fakeFactory := fake.NewClientFactory()
+	fakeFactory.RegisterClient("sub1", fake.NewClient())
+	exec := &stubExecutor{}
+
+	r := &MappingReconciler{
+		Client:            wrappedClient,
+		Scheme:            scheme,
+		ClusterName:       "test-cluster",
+		ResyncInterval:    60 * time.Second,
+		PrefixSetFactory:  fakeFactory,
+		Executor:          exec,
+		DesiredStateCache: cache,
+	}
+
+	// Mark recent recompute so forced resync is NOT triggered
+	r.markDesiredStateFullRecompute(
+		types.NamespacedName{Name: "hit-mapping", Namespace: ns},
+		1, time.Now(),
+	)
+
+	_, err := r.Reconcile(ctx, ctrl.Request{
+		NamespacedName: types.NamespacedName{Name: "hit-mapping", Namespace: ns},
+	})
+	if err != nil {
+		t.Fatalf("unexpected reconcile error: %v", err)
+	}
+
+	// With a cache hit, no List should be called (O(1) desired-state resolution)
+	if listCallCount > 0 {
+		t.Errorf("Phase 5: cache hit path must NOT call List (O(1) amortized); "+
+			"but List was called %d times — reconciler bypassed cache", listCallCount)
+	}
+}

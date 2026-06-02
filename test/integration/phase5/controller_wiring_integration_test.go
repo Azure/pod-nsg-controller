@@ -2182,3 +2182,111 @@ ips[ip] = true
 return ips["10.0.1.1/32"] && ips["10.0.1.2/32"]
 }, "Phase 5: expected pod-2 IP to appear via cache-hit path (mutate-before-enqueue)")
 }
+
+// ===========================================================================
+// Phase 5: Incremental Mutation → Resync Parity After Churn
+// ===========================================================================
+
+// ---------------------------------------------------------------------------
+// TestPhase5_IncrementalMutation_ThenResync_ProducesEquivalentState
+// After multiple incremental pod events (add/delete/update), a forced resync
+// (full recompute) must produce state semantically equivalent to what the
+// incremental cache path already has. This validates the parity contract
+// end-to-end through the controller wiring.
+// ---------------------------------------------------------------------------
+func TestPhase5_IncrementalMutation_ThenResync_ProducesEquivalentState(t *testing.T) {
+	te := setupTestEnv(t)
+	defer te.teardown(t)
+	ctx := context.Background()
+
+	ns := &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: "test-resync-parity"}}
+	if err := te.k8sClient.Create(ctx, ns); err != nil {
+		t.Fatalf("failed to create namespace: %v", err)
+	}
+
+	mapping := &v1alpha1.PodASGMapping{
+		ObjectMeta: metav1.ObjectMeta{Name: "parity-mapping", Namespace: ns.Name},
+		Spec: v1alpha1.PodASGMappingSpec{
+			Mappings: []v1alpha1.Mapping{
+				{
+					PodSelector: v1alpha1.PodSelector{MatchLabels: map[string]string{"app": "parity"}},
+					ApplicationSecurityGroups: []v1alpha1.ASGReference{
+						{ResourceID: asgResourceID("sub1", "rg1", "asg1")},
+					},
+				},
+			},
+		},
+	}
+	if err := te.k8sClient.Create(ctx, mapping); err != nil {
+		t.Fatalf("failed to create mapping: %v", err)
+	}
+
+	// Create 3 pods
+	for i := 1; i <= 3; i++ {
+		pod := &corev1.Pod{
+			ObjectMeta: metav1.ObjectMeta{
+				Name: fmt.Sprintf("parity-pod-%d", i), Namespace: ns.Name,
+				Labels: map[string]string{"app": "parity"},
+			},
+			Spec: corev1.PodSpec{Containers: []corev1.Container{{Name: "app", Image: "nginx"}}},
+		}
+		if err := te.k8sClient.Create(ctx, pod); err != nil {
+			t.Fatalf("failed to create pod-%d: %v", i, err)
+		}
+		pod.Status.PodIP = fmt.Sprintf("10.0.5.%d", i)
+		if err := te.k8sClient.Status().Update(ctx, pod); err != nil {
+			t.Fatalf("failed to set pod-%d IP: %v", i, err)
+		}
+	}
+
+	ownershipKey := "test-cluster-" + ns.Name + "-parity-mapping"
+
+	// Wait for initial convergence (all 3 IPs)
+	eventually(t, 15*time.Second, 300*time.Millisecond, func() bool {
+		ps, err := te.fakeClient.Get(ctx, "sub1", "rg1", "asg1", ownershipKey)
+		if err != nil || ps.Properties == nil {
+			return false
+		}
+		return len(ps.Properties.AddressPrefixes) == 3
+	}, "expected initial 3 pods to converge")
+
+	// Delete pod-2 (incremental mutation)
+	pod2 := &corev1.Pod{}
+	if err := te.k8sClient.Get(ctx, types.NamespacedName{Namespace: ns.Name, Name: "parity-pod-2"}, pod2); err != nil {
+		t.Fatalf("failed to get pod-2: %v", err)
+	}
+	if err := te.k8sClient.Delete(ctx, pod2); err != nil {
+		t.Fatalf("failed to delete pod-2: %v", err)
+	}
+
+	// Wait for deletion to propagate
+	eventually(t, 15*time.Second, 300*time.Millisecond, func() bool {
+		ps, err := te.fakeClient.Get(ctx, "sub1", "rg1", "asg1", ownershipKey)
+		if err != nil || ps.Properties == nil {
+			return false
+		}
+		ips := make(map[string]bool)
+		for _, ip := range ps.Properties.AddressPrefixes {
+			ips[ip] = true
+		}
+		return ips["10.0.5.1/32"] && !ips["10.0.5.2/32"] && ips["10.0.5.3/32"]
+	}, "expected pod-2 IP to be removed incrementally")
+
+	// Wait for forced resync (ResyncInterval=2s in test env)
+	time.Sleep(3 * time.Second)
+
+	// After resync, state should still be [pod-1, pod-3] — no stale data reintroduced
+	eventually(t, 10*time.Second, 300*time.Millisecond, func() bool {
+		ps, err := te.fakeClient.Get(ctx, "sub1", "rg1", "asg1", ownershipKey)
+		if err != nil || ps.Properties == nil {
+			return false
+		}
+		ips := make(map[string]bool)
+		for _, ip := range ps.Properties.AddressPrefixes {
+			ips[ip] = true
+		}
+		// Must have exactly 2 IPs: pod-1 and pod-3 (not pod-2)
+		return len(ps.Properties.AddressPrefixes) == 2 &&
+			ips["10.0.5.1/32"] && ips["10.0.5.3/32"] && !ips["10.0.5.2/32"]
+	}, "Phase 5: resync after incremental churn must produce equivalent state (no stale reintroduction)")
+}

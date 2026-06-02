@@ -28,6 +28,9 @@ type DesiredStateCache struct {
 
 	// keyVersions is a per-key version floor bumped by pod events and invalidation.
 	keyVersions map[types.NamespacedName]uint64
+	// namespaceEpoch is a namespace-scoped fence bumped by InvalidateNamespace.
+	// It fences in-flight recomputes for keys that have no entry yet.
+	namespaceEpoch map[string]uint64
 	// lifecycleEpoch is a terminal lifecycle fence bumped on Delete; survives entry removal.
 	lifecycleEpoch map[types.NamespacedName]uint64
 	// knownGenerations tracks which generations have had entries committed for a key.
@@ -59,6 +62,7 @@ func NewDesiredStateCache(clusterName string) *DesiredStateCache {
 		clusterName:      clusterName,
 		entries:          make(map[cacheKey]*cacheEntry),
 		keyVersions:      make(map[types.NamespacedName]uint64),
+		namespaceEpoch:   make(map[string]uint64),
 		lifecycleEpoch:   make(map[types.NamespacedName]uint64),
 		knownGenerations: make(map[types.NamespacedName]map[int64]struct{}),
 		latestGeneration: make(map[types.NamespacedName]int64),
@@ -567,9 +571,13 @@ func (c *DesiredStateCache) Invalidate(key types.NamespacedName) {
 }
 
 // InvalidateNamespace removes all cached entries for the given namespace.
+// It also bumps a namespace-scoped epoch so that in-flight recomputes for keys
+// that have no entry yet are fenced from publishing stale data.
 func (c *DesiredStateCache) InvalidateNamespace(namespace string) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+
+	c.namespaceEpoch[namespace]++
 
 	for k := range c.entries {
 		if k.key.Namespace == namespace {
@@ -610,7 +618,7 @@ func (c *DesiredStateCache) GetWithVersion(mapping *v1alpha1.PodASGMapping) (Cac
 	defer c.mu.RUnlock()
 
 	nsName := types.NamespacedName{Namespace: mapping.Namespace, Name: mapping.Name}
-	currentVersion := c.keyVersions[nsName]
+	currentVersion := c.keyVersions[nsName] + c.namespaceEpoch[nsName.Namespace]
 	currentLifecycleEpoch := c.lifecycleEpoch[nsName]
 
 	key := cacheKey{key: nsName, generation: mapping.Generation}
@@ -641,7 +649,7 @@ func (c *DesiredStateCache) SetFromRecomputeIfVersion(
 	defer c.mu.Unlock()
 
 	nsName := types.NamespacedName{Namespace: mapping.Namespace, Name: mapping.Name}
-	currentVersion = c.keyVersions[nsName]
+	currentVersion = c.keyVersions[nsName] + c.namespaceEpoch[nsName.Namespace]
 	currentLifecycleEpoch = c.lifecycleEpoch[nsName]
 
 	if expectedLifecycleEpoch != currentLifecycleEpoch {
@@ -703,7 +711,7 @@ func (c *DesiredStateCache) SetFromRecomputeArtifactsIfVersion(
 	defer c.mu.Unlock()
 
 	nsName := types.NamespacedName{Namespace: mapping.Namespace, Name: mapping.Name}
-	currentVersion = c.keyVersions[nsName]
+	currentVersion = c.keyVersions[nsName] + c.namespaceEpoch[nsName.Namespace]
 	currentLifecycleEpoch = c.lifecycleEpoch[nsName]
 
 	if expectedLifecycleEpoch != currentLifecycleEpoch {
