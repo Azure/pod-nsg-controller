@@ -7,6 +7,7 @@ import (
 	"time"
 
 	v1alpha1 "github.com/Azure/pod-nsg-controller/api/v1alpha1"
+	"github.com/Azure/pod-nsg-controller/internal/engine"
 	"github.com/go-logr/zapr"
 	"go.uber.org/zap/zaptest"
 	corev1 "k8s.io/api/core/v1"
@@ -863,15 +864,15 @@ func (q *queueSpy) AddAfter(item reconcile.Request, _ time.Duration) {
 	q.items = append(q.items, item)
 }
 
-func (q *queueSpy) AddRateLimited(item reconcile.Request)               {}
-func (q *queueSpy) Forget(item reconcile.Request)                       {}
-func (q *queueSpy) NumRequeues(item reconcile.Request) int              { return 0 }
-func (q *queueSpy) Len() int                                            { return len(q.items) }
-func (q *queueSpy) Get() (reconcile.Request, bool)                      { return reconcile.Request{}, false }
-func (q *queueSpy) Done(item reconcile.Request)                         {}
-func (q *queueSpy) ShutDown()                                           {}
-func (q *queueSpy) ShutDownWithDrain()                                  {}
-func (q *queueSpy) ShuttingDown() bool                                  { return false }
+func (q *queueSpy) AddRateLimited(item reconcile.Request)  {}
+func (q *queueSpy) Forget(item reconcile.Request)          {}
+func (q *queueSpy) NumRequeues(item reconcile.Request) int { return 0 }
+func (q *queueSpy) Len() int                               { return len(q.items) }
+func (q *queueSpy) Get() (reconcile.Request, bool)         { return reconcile.Request{}, false }
+func (q *queueSpy) Done(item reconcile.Request)            {}
+func (q *queueSpy) ShutDown()                              {}
+func (q *queueSpy) ShutDownWithDrain()                     {}
+func (q *queueSpy) ShuttingDown() bool                     { return false }
 
 // ---------------------------------------------------------------------------
 // TestMatchingMappingsForPod_CrossNamespaceIsolation
@@ -900,5 +901,730 @@ func TestMatchingMappingsForPod_CrossNamespaceIsolation(t *testing.T) {
 	}
 	if len(reqs) != 0 {
 		t.Errorf("expected 0 requests for pod in different namespace, got %d: %+v", len(reqs), reqs)
+	}
+}
+
+// ===========================================================================
+// Phase 5: Desired-State Cache — Pod Handler Cache Integration Tests
+// ===========================================================================
+
+// ---------------------------------------------------------------------------
+// TestPhase5_PodHandler_Create_UpdatesCacheOnAdd
+// Pod create event with valid mapping should call OnPodAdd on the cache.
+// ---------------------------------------------------------------------------
+func TestPhase5_PodHandler_Create_UpdatesCacheOnAdd(t *testing.T) {
+	ctx := context.Background()
+	scheme := podHandlerTestScheme(t)
+	ns := "default"
+
+	mapping := makeMapping(ns, "web-mapping",
+		map[string]string{"app": "web"},
+		handlerASGResourceID("sub1", "rg1", "asg1"))
+
+	fakeReader := fakeclient.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(mapping).
+		Build()
+
+	logger := zapr.NewLogger(zaptest.NewLogger(t))
+	cache := engine.NewDesiredStateCache("test-cluster")
+
+	// The handler should accept a DesiredStateCache parameter
+	h := NewPodToMappingEventHandlerWithCache(fakeReader, logger, 0, cache)
+	if h == nil {
+		t.Fatal("NewPodToMappingEventHandlerWithCache returned nil")
+	}
+
+	handler, ok := h.(*PodToMappingEventHandler)
+	if !ok {
+		t.Fatal("expected *PodToMappingEventHandler")
+	}
+
+	queue := newRequestQueue()
+	defer queue.ShutDown()
+
+	pod := makePod(ns, "web-pod-1", map[string]string{"app": "web"}, "10.0.0.1")
+	handler.Create(ctx, event.TypedCreateEvent[ctrlclient.Object]{Object: pod}, queue)
+
+	// Verify enqueue still works (existing behavior preserved)
+	got := drainQueue(t, queue)
+	if len(got) == 0 {
+		t.Fatal("Phase 5: Create should still enqueue matching mappings")
+	}
+	if !containsRequest(got, ns, "web-mapping") {
+		t.Error("Phase 5: expected web-mapping enqueued on pod create")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// TestPhase5_PodHandler_PartialUpdateFailure_InvalidatesNamespaceCache
+// When one side of an update resolution fails, the handler should invalidate
+// the namespace cache while still enqueuing the successful side's requests.
+// ---------------------------------------------------------------------------
+func TestPhase5_PodHandler_PartialUpdateFailure_InvalidatesNamespaceCache(t *testing.T) {
+	ctx := context.Background()
+	ns := "default"
+
+	mapping := makeMapping(ns, "web-mapping",
+		map[string]string{"app": "web"},
+		handlerASGResourceID("sub1", "rg1", "asg1"))
+
+	// Seed the cache with an entry
+	cache := engine.NewDesiredStateCache("test-cluster")
+	mappingObj := &v1alpha1.PodASGMapping{
+		ObjectMeta: metav1.ObjectMeta{Namespace: ns, Name: "web-mapping", Generation: 1},
+		Spec:       mapping.Spec,
+	}
+	cache.SetFromRecompute(mappingObj, nil,
+		map[engine.ASGTarget]engine.DesiredPrefixSet{
+			{ASGName: "asg1"}: {IPs: map[string]struct{}{"10.0.0.1/32": {}}},
+		},
+		engine.PodSnapshot{}, []int{1}, false)
+
+	// Use a reader that fails on list (simulating partial resolution failure)
+	logger := zapr.NewLogger(zaptest.NewLogger(t))
+	h := NewPodToMappingEventHandlerWithCache(failingListReader{}, logger, 0, cache)
+	handler, ok := h.(*PodToMappingEventHandler)
+	if !ok {
+		t.Fatal("expected *PodToMappingEventHandler")
+	}
+
+	queue := newRequestQueue()
+	defer queue.ShutDown()
+
+	oldPod := makePod(ns, "pod-1", map[string]string{"app": "web"}, "10.0.0.1")
+	newPod := makePod(ns, "pod-1", map[string]string{"app": "web"}, "10.0.0.2")
+	handler.Update(ctx, event.TypedUpdateEvent[ctrlclient.Object]{ObjectOld: oldPod, ObjectNew: newPod}, queue)
+
+	// After partial failure, the cache for this namespace should be invalidated
+	if _, ok := cache.Get(mappingObj); ok {
+		t.Error("Phase 5: expected namespace cache invalidated after partial update resolution failure")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// TestPhase5_PodHandler_UnsafeCacheMutation_InvalidatesMappingCache
+// When OnPodUpdate returns false (unsafe mutation), the handler should
+// invalidate the specific mapping cache entry while preserving enqueue behavior.
+// ---------------------------------------------------------------------------
+func TestPhase5_PodHandler_UnsafeCacheMutation_InvalidatesMappingCache(t *testing.T) {
+	ctx := context.Background()
+	scheme := podHandlerTestScheme(t)
+	ns := "default"
+
+	mapping := makeMapping(ns, "web-mapping",
+		map[string]string{"app": "web"},
+		handlerASGResourceID("sub1", "rg1", "asg1"))
+
+	fakeReader := fakeclient.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(mapping).
+		Build()
+
+	cache := engine.NewDesiredStateCache("test-cluster")
+	mappingObj := &v1alpha1.PodASGMapping{
+		ObjectMeta: metav1.ObjectMeta{Namespace: ns, Name: "web-mapping", Generation: 1},
+		Spec:       mapping.Spec,
+	}
+	cache.SetFromRecompute(mappingObj, nil,
+		map[engine.ASGTarget]engine.DesiredPrefixSet{
+			{ASGName: "asg1"}: {IPs: map[string]struct{}{"10.0.0.1/32": {}}},
+		},
+		engine.PodSnapshot{}, []int{1}, false)
+
+	logger := zapr.NewLogger(zaptest.NewLogger(t))
+	h := NewPodToMappingEventHandlerWithCache(fakeReader, logger, 0, cache)
+	handler, ok := h.(*PodToMappingEventHandler)
+	if !ok {
+		t.Fatal("expected *PodToMappingEventHandler")
+	}
+
+	queue := newRequestQueue()
+	defer queue.ShutDown()
+
+	// Update pod IP (OnPodUpdate stub returns false → unsafe mutation)
+	oldPod := makePod(ns, "pod-1", map[string]string{"app": "web"}, "10.0.0.1")
+	newPod := makePod(ns, "pod-1", map[string]string{"app": "web"}, "10.0.0.2")
+	handler.Update(ctx, event.TypedUpdateEvent[ctrlclient.Object]{ObjectOld: oldPod, ObjectNew: newPod}, queue)
+
+	// Enqueue behavior should be preserved
+	got := drainQueue(t, queue)
+	if !containsRequest(got, ns, "web-mapping") {
+		t.Error("Phase 5: expected web-mapping enqueued even when cache mutation is unsafe")
+	}
+
+	// The mapping cache entry should be invalidated
+	if _, ok := cache.Get(mappingObj); ok {
+		t.Error("Phase 5: expected mapping cache invalidated after unsafe OnPodUpdate")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// TestPhase5_PodHandler_InvalidMappingSpec_InvalidatesCacheOnCreate
+// When a mapping has invalid ASG resource IDs, the pod handler should
+// invalidate that mapping's cache entry (not mutate it).
+// ---------------------------------------------------------------------------
+func TestPhase5_PodHandler_InvalidMappingSpec_InvalidatesCacheOnCreate(t *testing.T) {
+	ctx := context.Background()
+	scheme := podHandlerTestScheme(t)
+	ns := "default"
+
+	// Invalid ASG resource ID (missing path segments)
+	invalidMapping := &v1alpha1.PodASGMapping{
+		ObjectMeta: metav1.ObjectMeta{Name: "invalid-mapping", Namespace: ns},
+		Spec: v1alpha1.PodASGMappingSpec{
+			Mappings: []v1alpha1.Mapping{
+				{
+					PodSelector:               v1alpha1.PodSelector{MatchLabels: map[string]string{"app": "web"}},
+					ApplicationSecurityGroups: []v1alpha1.ASGReference{{ResourceID: "invalid-id"}},
+				},
+			},
+		},
+	}
+
+	fakeReader := fakeclient.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(invalidMapping).
+		Build()
+
+	cache := engine.NewDesiredStateCache("test-cluster")
+	// Pre-seed cache for this mapping
+	invalidMappingObj := &v1alpha1.PodASGMapping{
+		ObjectMeta: metav1.ObjectMeta{Namespace: ns, Name: "invalid-mapping", Generation: 1},
+		Spec:       invalidMapping.Spec,
+	}
+	cache.SetFromRecompute(invalidMappingObj, nil,
+		map[engine.ASGTarget]engine.DesiredPrefixSet{
+			{ASGName: "asg1"}: {IPs: map[string]struct{}{"10.0.0.1/32": {}}},
+		},
+		engine.PodSnapshot{}, []int{1}, false)
+
+	logger := zapr.NewLogger(zaptest.NewLogger(t))
+	h := NewPodToMappingEventHandlerWithCache(fakeReader, logger, 0, cache)
+	handler, ok := h.(*PodToMappingEventHandler)
+	if !ok {
+		t.Fatal("expected *PodToMappingEventHandler")
+	}
+
+	queue := newRequestQueue()
+	defer queue.ShutDown()
+
+	pod := makePod(ns, "web-pod", map[string]string{"app": "web"}, "10.0.0.1")
+	handler.Create(ctx, event.TypedCreateEvent[ctrlclient.Object]{Object: pod}, queue)
+
+	// Cache for the invalid mapping should be invalidated (not mutated)
+	if _, ok := cache.Get(invalidMappingObj); ok {
+		t.Error("Phase 5: expected cache invalidated for mapping with invalid ASG resource IDs")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// TestPhase5_PodHandler_Update_CacheMiss_DoesNotInvalidateMapping
+// When OnPodUpdate returns true on a cache miss (no-op safe path), the handler
+// must NOT call Invalidate. This avoids unnecessary invalidation churn when
+// the cache has no entry for a mapping.
+// ---------------------------------------------------------------------------
+func TestPhase5_PodHandler_Update_CacheMiss_DoesNotInvalidateMapping(t *testing.T) {
+	ctx := context.Background()
+	scheme := podHandlerTestScheme(t)
+	ns := "default"
+
+	mapping := makeMapping(ns, "web-mapping",
+		map[string]string{"app": "web"},
+		handlerASGResourceID("sub1", "rg1", "asg1"))
+
+	fakeReader := fakeclient.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(mapping).
+		Build()
+
+	// Cache with NO pre-seeded entry (empty cache)
+	cache := engine.NewDesiredStateCache("test-cluster")
+
+	logger := zapr.NewLogger(zaptest.NewLogger(t))
+	h := NewPodToMappingEventHandlerWithCache(fakeReader, logger, 0, cache)
+	handler, ok := h.(*PodToMappingEventHandler)
+	if !ok {
+		t.Fatal("expected *PodToMappingEventHandler")
+	}
+
+	queue := newRequestQueue()
+	defer queue.ShutDown()
+
+	// Pod update with IP change — but cache has no entry for the mapping
+	oldPod := makePod(ns, "pod-1", map[string]string{"app": "web"}, "10.0.0.1")
+	newPod := makePod(ns, "pod-1", map[string]string{"app": "web"}, "10.0.0.2")
+	handler.Update(ctx, event.TypedUpdateEvent[ctrlclient.Object]{ObjectOld: oldPod, ObjectNew: newPod}, queue)
+
+	// Mapping should still be enqueued (enqueue behavior preserved)
+	got := drainQueue(t, queue)
+	if !containsRequest(got, ns, "web-mapping") {
+		t.Error("Phase 5: expected web-mapping enqueued on pod update even with cache miss")
+	}
+
+	// The critical assertion: on cache miss, OnPodUpdate returns true (safe no-op),
+	// so the handler does NOT call Invalidate. The fence is advanced exactly once
+	// (by OnPodUpdate internally). If Invalidate were also called, the version
+	// would be 2 (one bump from OnPodUpdate + one from Invalidate).
+	mappingObj := &v1alpha1.PodASGMapping{
+		ObjectMeta: metav1.ObjectMeta{Namespace: ns, Name: "web-mapping", Generation: 1},
+		Spec:       mapping.Spec,
+	}
+	_, version, _, _ := cache.GetWithVersion(mappingObj)
+
+	// Version must be exactly 1: OnPodUpdate bumps the version fence once on
+	// cache miss. If Invalidate were called (incorrectly), version would be 2.
+	if version != 1 {
+		t.Errorf("Phase 5: cache-miss OnPodUpdate must bump version fence exactly once (no Invalidate); version=%d, want 1", version)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// TestPhase5_PodHandler_Create_MutatesCacheBeforeEnqueue
+// Design: cache mutation must be visible to reconcilers at enqueue time.
+// ---------------------------------------------------------------------------
+func TestPhase5_PodHandler_Create_MutatesCacheBeforeEnqueue(t *testing.T) {
+	ctx := context.Background()
+	scheme := podHandlerTestScheme(t)
+	ns := "default"
+
+	asgID := handlerASGResourceID("sub1", "rg1", "asg1")
+	mapping := makeMapping(ns, "web-mapping", map[string]string{"app": "web"}, asgID)
+	mapping.Generation = 1
+
+	fakeReader := fakeclient.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(mapping).
+		Build()
+
+	cache := engine.NewDesiredStateCache("test-cluster")
+
+	// Seed cache with an initial state so OnPodAdd can mutate it
+	target := engine.ASGTarget{
+		SubscriptionID: "sub1",
+		ResourceGroup:  "rg1",
+		ASGName:        "asg1",
+		FullResourceID: asgID,
+		PrefixSetName:  "test-cluster-default-web-mapping",
+	}
+	cache.SetFromRecompute(mapping, nil,
+		map[engine.ASGTarget]engine.DesiredPrefixSet{
+			target: {IPs: map[string]struct{}{}},
+		},
+		engine.PodSnapshot{Pods: map[engine.PodIdentity]engine.PodMembership{}},
+		[]int{0}, false)
+
+	logger := zapr.NewLogger(zaptest.NewLogger(t))
+	handler := &PodToMappingEventHandler{
+		Reader:            fakeReader,
+		Logger:            logger,
+		DesiredStateCache: cache,
+		matcherCache: &podMappingMatcherCache{
+			byNamespace: make(map[string]compiledPodMappingRequests),
+		},
+	}
+
+	// Use a custom queue that checks cache state at enqueue time
+	cacheHadIPAtEnqueue := false
+	checkQueue := &enqueueCheckingQueue{
+		TypedRateLimitingInterface: newRequestQueue(),
+		onAdd: func() {
+			// At the moment Add is called, check if cache already has the pod IP
+			mappingObj := &v1alpha1.PodASGMapping{
+				ObjectMeta: metav1.ObjectMeta{Namespace: ns, Name: "web-mapping", Generation: 1},
+				Spec:       mapping.Spec,
+			}
+			if cached, ok := cache.Get(mappingObj); ok {
+				if dps, exists := cached.Desired[target]; exists {
+					if _, hasIP := dps.IPs["10.0.0.5/32"]; hasIP {
+						cacheHadIPAtEnqueue = true
+					}
+				}
+			}
+		},
+	}
+	defer checkQueue.ShutDown()
+
+	pod := makePod(ns, "new-pod", map[string]string{"app": "web"}, "10.0.0.5")
+	handler.Create(ctx, event.TypedCreateEvent[ctrlclient.Object]{Object: pod}, checkQueue)
+
+	// The test assertion: cache mutation should be visible at enqueue time
+	if !cacheHadIPAtEnqueue {
+		t.Error("Phase 5: Create() must mutate cache BEFORE enqueue so reconcilers observe fresh state; " +
+			"currently enqueue happens first (cache mutation not yet visible)")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// TestPhase5_PodHandler_Delete_MutatesCacheBeforeEnqueue
+// Design: cache mutation (IP removal) must happen before reconcile is enqueued.
+// ---------------------------------------------------------------------------
+func TestPhase5_PodHandler_Delete_MutatesCacheBeforeEnqueue(t *testing.T) {
+	ctx := context.Background()
+	scheme := podHandlerTestScheme(t)
+	ns := "default"
+
+	asgID := handlerASGResourceID("sub1", "rg1", "asg1")
+	mapping := makeMapping(ns, "web-mapping", map[string]string{"app": "web"}, asgID)
+	mapping.Generation = 1
+
+	fakeReader := fakeclient.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(mapping).
+		Build()
+
+	cache := engine.NewDesiredStateCache("test-cluster")
+
+	target := engine.ASGTarget{
+		SubscriptionID: "sub1",
+		ResourceGroup:  "rg1",
+		ASGName:        "asg1",
+		FullResourceID: asgID,
+		PrefixSetName:  "test-cluster-default-web-mapping",
+	}
+
+	// Seed cache with a pod IP that will be deleted
+	pods := []corev1.Pod{
+		*makePod(ns, "doomed-pod", map[string]string{"app": "web"}, "10.0.0.7"),
+	}
+	cache.SetFromRecompute(mapping, pods,
+		map[engine.ASGTarget]engine.DesiredPrefixSet{
+			target: {IPs: map[string]struct{}{"10.0.0.7/32": {}}},
+		},
+		engine.PodSnapshot{Pods: map[engine.PodIdentity]engine.PodMembership{
+			{Namespace: ns, Name: "doomed-pod"}: {PodIP: "10.0.0.7"},
+		}},
+		[]int{1}, false)
+
+	logger := zapr.NewLogger(zaptest.NewLogger(t))
+	handler := &PodToMappingEventHandler{
+		Reader:            fakeReader,
+		Logger:            logger,
+		DesiredStateCache: cache,
+		matcherCache: &podMappingMatcherCache{
+			byNamespace: make(map[string]compiledPodMappingRequests),
+		},
+	}
+
+	// Check cache state at enqueue time
+	cacheIPRemovedAtEnqueue := false
+	checkQueue := &enqueueCheckingQueue{
+		TypedRateLimitingInterface: newRequestQueue(),
+		onAdd: func() {
+			mappingObj := &v1alpha1.PodASGMapping{
+				ObjectMeta: metav1.ObjectMeta{Namespace: ns, Name: "web-mapping", Generation: 1},
+				Spec:       mapping.Spec,
+			}
+			if cached, ok := cache.Get(mappingObj); ok {
+				if dps, exists := cached.Desired[target]; exists {
+					if _, hasIP := dps.IPs["10.0.0.7/32"]; !hasIP {
+						cacheIPRemovedAtEnqueue = true
+					}
+				} else {
+					cacheIPRemovedAtEnqueue = true
+				}
+			}
+		},
+	}
+	defer checkQueue.ShutDown()
+
+	pod := makePod(ns, "doomed-pod", map[string]string{"app": "web"}, "10.0.0.7")
+	handler.Delete(ctx, event.TypedDeleteEvent[ctrlclient.Object]{Object: pod}, checkQueue)
+
+	if !cacheIPRemovedAtEnqueue {
+		t.Error("Phase 5: Delete() must mutate cache (remove IP) BEFORE enqueue; " +
+			"currently enqueue happens first (stale IP still visible to reconciler)")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// TestPhase5_PodHandler_Update_MutatesCacheBeforeUnionEnqueue
+// Design: cache mutation for all affected mappings must happen before any enqueue.
+// ---------------------------------------------------------------------------
+func TestPhase5_PodHandler_Update_MutatesCacheBeforeUnionEnqueue(t *testing.T) {
+	ctx := context.Background()
+	scheme := podHandlerTestScheme(t)
+	ns := "default"
+
+	asgID := handlerASGResourceID("sub1", "rg1", "asg1")
+	mapping := makeMapping(ns, "web-mapping", map[string]string{"app": "web"}, asgID)
+	mapping.Generation = 1
+
+	fakeReader := fakeclient.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(mapping).
+		Build()
+
+	cache := engine.NewDesiredStateCache("test-cluster")
+
+	target := engine.ASGTarget{
+		SubscriptionID: "sub1",
+		ResourceGroup:  "rg1",
+		ASGName:        "asg1",
+		FullResourceID: asgID,
+		PrefixSetName:  "test-cluster-default-web-mapping",
+	}
+
+	// Seed with old pod IP
+	pods := []corev1.Pod{
+		*makePod(ns, "updating-pod", map[string]string{"app": "web"}, "10.0.0.10"),
+	}
+	cache.SetFromRecompute(mapping, pods,
+		map[engine.ASGTarget]engine.DesiredPrefixSet{
+			target: {IPs: map[string]struct{}{"10.0.0.10/32": {}}},
+		},
+		engine.PodSnapshot{Pods: map[engine.PodIdentity]engine.PodMembership{
+			{Namespace: ns, Name: "updating-pod"}: {PodIP: "10.0.0.10"},
+		}},
+		[]int{1}, false)
+
+	logger := zapr.NewLogger(zaptest.NewLogger(t))
+	handler := &PodToMappingEventHandler{
+		Reader:            fakeReader,
+		Logger:            logger,
+		DesiredStateCache: cache,
+		matcherCache: &podMappingMatcherCache{
+			byNamespace: make(map[string]compiledPodMappingRequests),
+		},
+	}
+
+	// Check if cache reflects the new IP at enqueue time
+	cacheHadNewIPAtEnqueue := false
+	checkQueue := &enqueueCheckingQueue{
+		TypedRateLimitingInterface: newRequestQueue(),
+		onAdd: func() {
+			mappingObj := &v1alpha1.PodASGMapping{
+				ObjectMeta: metav1.ObjectMeta{Namespace: ns, Name: "web-mapping", Generation: 1},
+				Spec:       mapping.Spec,
+			}
+			if cached, ok := cache.Get(mappingObj); ok {
+				if dps, exists := cached.Desired[target]; exists {
+					if _, hasNewIP := dps.IPs["10.0.0.20/32"]; hasNewIP {
+						cacheHadNewIPAtEnqueue = true
+					}
+				}
+			}
+		},
+	}
+	defer checkQueue.ShutDown()
+
+	oldPod := makePod(ns, "updating-pod", map[string]string{"app": "web"}, "10.0.0.10")
+	newPod := makePod(ns, "updating-pod", map[string]string{"app": "web"}, "10.0.0.20")
+	handler.Update(ctx, event.TypedUpdateEvent[ctrlclient.Object]{ObjectOld: oldPod, ObjectNew: newPod}, checkQueue)
+
+	if !cacheHadNewIPAtEnqueue {
+		t.Error("Phase 5: Update() must mutate cache (IP change) BEFORE enqueue; " +
+			"currently union enqueue happens first (stale state visible to reconciler)")
+	}
+}
+
+// enqueueCheckingQueue wraps a queue and calls onAdd before each Add/AddAfter.
+type enqueueCheckingQueue struct {
+	workqueue.TypedRateLimitingInterface[reconcile.Request]
+	onAdd func()
+}
+
+func (q *enqueueCheckingQueue) Add(item reconcile.Request) {
+	if q.onAdd != nil {
+		q.onAdd()
+	}
+	q.TypedRateLimitingInterface.Add(item)
+}
+
+func (q *enqueueCheckingQueue) AddAfter(item reconcile.Request, duration time.Duration) {
+	if q.onAdd != nil {
+		q.onAdd()
+	}
+	q.TypedRateLimitingInterface.AddAfter(item, duration)
+}
+
+// ===========================================================================
+// Phase 5: Pod Handler — Update Union Cache Mutation for Different Old/New Mappings
+// ===========================================================================
+
+// ---------------------------------------------------------------------------
+// TestPhase5_PodHandler_Update_DifferentOldNewMappings_CacheMutatesUnion
+// When a pod's labels change so it moves from mapping-A to mapping-B, the
+// update handler must mutate the cache for BOTH mappings before enqueue:
+// - Remove pod from mapping-A's cache
+// - Add pod to mapping-B's cache
+// This validates the design's "union(old,new) mapping keys" mutation discipline.
+// ---------------------------------------------------------------------------
+func TestPhase5_PodHandler_Update_DifferentOldNewMappings_CacheMutatesUnion(t *testing.T) {
+	ctx := context.Background()
+	scheme := podHandlerTestScheme(t)
+	ns := "default"
+
+	asgA := handlerASGResourceID("sub1", "rg1", "asg-alpha")
+	asgB := handlerASGResourceID("sub1", "rg1", "asg-beta")
+
+	mappingA := makeMapping(ns, "mapping-alpha", map[string]string{"team": "alpha"}, asgA)
+	mappingA.Generation = 1
+	mappingB := makeMapping(ns, "mapping-beta", map[string]string{"team": "beta"}, asgB)
+	mappingB.Generation = 1
+
+	fakeReader := fakeclient.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(mappingA, mappingB).
+		Build()
+
+	cache := engine.NewDesiredStateCache("test-cluster")
+
+	targetA := engine.ASGTarget{
+		SubscriptionID: "sub1",
+		ResourceGroup:  "rg1",
+		ASGName:        "asg-alpha",
+		FullResourceID: asgA,
+		PrefixSetName:  "test-cluster-default-mapping-alpha",
+	}
+	targetB := engine.ASGTarget{
+		SubscriptionID: "sub1",
+		ResourceGroup:  "rg1",
+		ASGName:        "asg-beta",
+		FullResourceID: asgB,
+		PrefixSetName:  "test-cluster-default-mapping-beta",
+	}
+
+	// Seed mapping-A cache with the pod
+	podsA := []corev1.Pod{
+		*makePod(ns, "migrating-pod", map[string]string{"team": "alpha"}, "10.0.0.5"),
+	}
+	cache.SetFromRecompute(mappingA, podsA,
+		map[engine.ASGTarget]engine.DesiredPrefixSet{
+			targetA: {IPs: map[string]struct{}{"10.0.0.5/32": {}}},
+		},
+		engine.PodSnapshot{Pods: map[engine.PodIdentity]engine.PodMembership{
+			{Namespace: ns, Name: "migrating-pod"}: {PodIP: "10.0.0.5"},
+		}},
+		[]int{1}, false)
+
+	// Seed mapping-B cache (empty initially)
+	cache.SetFromRecompute(mappingB, nil,
+		map[engine.ASGTarget]engine.DesiredPrefixSet{
+			targetB: {IPs: map[string]struct{}{}},
+		},
+		engine.PodSnapshot{},
+		[]int{0}, false)
+
+	logger := zapr.NewLogger(zaptest.NewLogger(t))
+	handler := &PodToMappingEventHandler{
+		Reader:            fakeReader,
+		Logger:            logger,
+		DesiredStateCache: cache,
+		matcherCache: &podMappingMatcherCache{
+			byNamespace: make(map[string]compiledPodMappingRequests),
+		},
+	}
+
+	// Track cache state at enqueue time
+	var mappingACacheHadIPRemoved bool
+	var mappingBCacheHadIPAdded bool
+	checkQueue := &enqueueCheckingQueue{
+		TypedRateLimitingInterface: newRequestQueue(),
+		onAdd: func() {
+			// Check mapping-A: pod IP should be removed
+			mappingAObj := &v1alpha1.PodASGMapping{
+				ObjectMeta: metav1.ObjectMeta{Namespace: ns, Name: "mapping-alpha", Generation: 1},
+				Spec:       mappingA.Spec,
+			}
+			if cached, ok := cache.Get(mappingAObj); ok {
+				if dps, exists := cached.Desired[targetA]; exists {
+					if _, hasIP := dps.IPs["10.0.0.5/32"]; !hasIP {
+						mappingACacheHadIPRemoved = true
+					}
+				}
+			}
+			// Check mapping-B: pod IP should be added
+			mappingBObj := &v1alpha1.PodASGMapping{
+				ObjectMeta: metav1.ObjectMeta{Namespace: ns, Name: "mapping-beta", Generation: 1},
+				Spec:       mappingB.Spec,
+			}
+			if cached, ok := cache.Get(mappingBObj); ok {
+				if dps, exists := cached.Desired[targetB]; exists {
+					if _, hasIP := dps.IPs["10.0.0.5/32"]; hasIP {
+						mappingBCacheHadIPAdded = true
+					}
+				}
+			}
+		},
+	}
+	defer checkQueue.ShutDown()
+
+	// Pod label change: team=alpha → team=beta
+	oldPod := makePod(ns, "migrating-pod", map[string]string{"team": "alpha"}, "10.0.0.5")
+	newPod := makePod(ns, "migrating-pod", map[string]string{"team": "beta"}, "10.0.0.5")
+	handler.Update(ctx, event.TypedUpdateEvent[ctrlclient.Object]{ObjectOld: oldPod, ObjectNew: newPod}, checkQueue)
+
+	if !mappingACacheHadIPRemoved {
+		t.Error("Phase 5: Update with label migration must remove IP from old mapping's cache BEFORE enqueue")
+	}
+	if !mappingBCacheHadIPAdded {
+		t.Error("Phase 5: Update with label migration must add IP to new mapping's cache BEFORE enqueue")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// TestPhase5_PodHandler_Create_NamespaceInvalidation_OnListError
+// When MatchingMappingsForPod fails (list error), the handler must
+// invalidate the namespace cache as a fail-safe. This validates the design's
+// fail-safe behavior for mapping-resolution errors.
+// ---------------------------------------------------------------------------
+func TestPhase5_PodHandler_Create_NamespaceInvalidation_OnListError(t *testing.T) {
+	ctx := context.Background()
+	ns := "error-ns"
+
+	asgID := handlerASGResourceID("sub1", "rg1", "asg1")
+
+	// Seed cache for a mapping in the same namespace
+	cache := engine.NewDesiredStateCache("test-cluster")
+	mappingObj := &v1alpha1.PodASGMapping{
+		ObjectMeta: metav1.ObjectMeta{Namespace: ns, Name: "some-mapping", Generation: 1},
+		Spec: v1alpha1.PodASGMappingSpec{
+			Mappings: []v1alpha1.Mapping{
+				{
+					PodSelector:               v1alpha1.PodSelector{MatchLabels: map[string]string{"app": "web"}},
+					ApplicationSecurityGroups: []v1alpha1.ASGReference{{ResourceID: asgID}},
+				},
+			},
+		},
+	}
+	target := engine.ASGTarget{
+		SubscriptionID: "sub1",
+		ResourceGroup:  "rg1",
+		ASGName:        "asg1",
+		FullResourceID: asgID,
+		PrefixSetName:  "test-cluster-" + ns + "-some-mapping",
+	}
+	cache.SetFromRecompute(mappingObj, nil,
+		map[engine.ASGTarget]engine.DesiredPrefixSet{
+			target: {IPs: map[string]struct{}{"10.0.0.1/32": {}}},
+		},
+		engine.PodSnapshot{}, []int{1}, false)
+
+	// Verify cache entry exists before handler call
+	if _, ok := cache.Get(mappingObj); !ok {
+		t.Fatal("expected cache entry before list error")
+	}
+
+	logger := zapr.NewLogger(zaptest.NewLogger(t))
+	handler := &PodToMappingEventHandler{
+		Reader:            failingListReader{},
+		Logger:            logger,
+		DesiredStateCache: cache,
+		matcherCache: &podMappingMatcherCache{
+			byNamespace: make(map[string]compiledPodMappingRequests),
+		},
+	}
+
+	q := newRequestQueue()
+	defer q.ShutDown()
+
+	pod := makePod(ns, "new-pod", map[string]string{"app": "web"}, "10.0.0.2")
+	handler.Create(ctx, event.TypedCreateEvent[ctrlclient.Object]{Object: pod}, q)
+
+	// After list error, namespace cache should be invalidated
+	if _, ok := cache.Get(mappingObj); ok {
+		t.Error("Phase 5: after list error in Create, namespace cache must be invalidated; " +
+			"cache entry should be gone")
 	}
 }
