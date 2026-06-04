@@ -1,0 +1,189 @@
+THIRD-PARTY SOFTWARE NOTICES AND INFORMATION
+
+This project incorporates components from the projects listed below. The
+original copyright notices and the licenses under which Microsoft received
+such components are set forth below. Microsoft reserves all rights not
+expressly granted herein, whether by implication, estoppel or otherwise.
+
+========================================================================
+
+1.  github.com/Azure/azure-sdk-for-go/sdk/azcore (MIT)
+2.  github.com/Azure/azure-sdk-for-go/sdk/azidentity (MIT)
+3.  github.com/Azure/azure-sdk-for-go/sdk/resourcemanager/network/armnetwork/v6 (MIT)
+4.  github.com/Azure/azure-sdk-for-go/sdk/internal (MIT)
+5.  github.com/AzureAD/microsoft-authentication-library-for-go (MIT)
+6.  github.com/beorn7/perks (MIT)
+7.  github.com/cespare/xxhash/v2 (MIT)
+8.  github.com/davecgh/go-spew (ISC)
+9.  github.com/emicklei/go-restful/v3 (MIT)
+10. github.com/evanphx/json-patch/v5 (BSD-3-Clause)
+11. github.com/fsnotify/fsnotify (BSD-3-Clause)
+12. github.com/fxamacker/cbor/v2 (MIT)
+13. github.com/go-logr/logr (Apache-2.0)
+14. github.com/go-logr/zapr (Apache-2.0)
+15. github.com/go-openapi/jsonpointer (Apache-2.0)
+16. github.com/go-openapi/jsonreference (Apache-2.0)
+17. github.com/go-openapi/swag (Apache-2.0)
+18. github.com/gogo/protobuf (BSD-3-Clause)
+19. github.com/golang-jwt/jwt/v5 (MIT)
+20. github.com/golang/groupcache (Apache-2.0)
+21. github.com/golang/protobuf (BSD-3-Clause)
+22. github.com/google/gnostic-models (Apache-2.0)
+23. github.com/google/go-cmp (BSD-3-Clause)
+24. github.com/google/gofuzz (Apache-2.0)
+25. github.com/google/uuid (BSD-3-Clause)
+26. github.com/imdario/mergo (BSD-3-Clause)
+27. github.com/josharian/intern (MIT)
+28. github.com/json-iterator/go (MIT)
+29. github.com/kylelemons/godebug (Apache-2.0)
+30. github.com/mailru/easyjson (MIT)
+31. github.com/modern-go/concurrent (Apache-2.0)
+32. github.com/modern-go/reflect2 (Apache-2.0)
+33. github.com/munnerz/goautoneg (BSD-3-Clause)
+34. github.com/pkg/browser (BSD-2-Clause)
+35. github.com/pkg/errors (BSD-2-Clause)
+36. github.com/prometheus/client_golang (Apache-2.0)
+37. github.com/prometheus/client_model (Apache-2.0)
+38. github.com/prometheus/common (Apache-2.0)
+39. github.com/prometheus/procfs (Apache-2.0)
+40. github.com/spf13/pflag (BSD-3-Clause)
+41. github.com/x448/float16 (MIT)
+42. go.uber.org/multierr (MIT)
+43. go.uber.org/zap (MIT)
+44. golang.org/x/crypto (BSD-3-Clause)
+45. golang.org/x/exp (BSD-3-Clause)
+46. golang.org/x/net (BSD-3-Clause)
+47. golang.org/x/oauth2 (BSD-3-Clause)
+48. golang.org/x/sys (BSD-3-Clause)
+49. golang.org/x/term (BSD-3-Clause)
+50. golang.org/x/text (BSD-3-Clause)
+51. golang.org/x/time (BSD-3-Clause)
+52. gomodules.xyz/jsonpatch/v2 (Apache-2.0)
+53. google.golang.org/protobuf (BSD-3-Clause)
+54. gopkg.in/evanphx/json-patch.v4 (BSD-3-Clause)
+55. gopkg.in/inf.v0 (BSD-3-Clause)
+56. gopkg.in/yaml.v2 (Apache-2.0)
+57. gopkg.in/yaml.v3 (MIT)
+58. k8s.io/api (Apache-2.0)
+59. k8s.io/apiextensions-apiserver (Apache-2.0)
+60. k8s.io/apimachinery (Apache-2.0)
+61. k8s.io/client-go (Apache-2.0)
+62. k8s.io/klog/v2 (Apache-2.0)
+63. k8s.io/kube-openapi (Apache-2.0)
+64. k8s.io/utils (Apache-2.0)
+65. sigs.k8s.io/controller-runtime (Apache-2.0)
+66. sigs.k8s.io/json (Apache-2.0 AND BSD-3-Clause)
+67. sigs.k8s.io/structured-merge-diff/v4 (Apache-2.0)
+68. sigs.k8s.io/yaml (MIT AND Apache-2.0)
+
+========================================================================
+
+MIT License
+
+Permission is hereby granted, free of charge, to any person obtaining a
+copy of this software and associated documentation files (the "Software"),
+to deal in the Software without restriction, including without limitation
+the rights to use, copy, modify, merge, publish, distribute, sublicense,
+and/or sell copies of the Software, and to permit persons to whom the
+Software is furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included
+in all copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS
+OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL
+THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
+FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
+DEALINGS IN THE SOFTWARE.
+
+========================================================================
+
+Apache License, Version 2.0
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+
+========================================================================
+
+BSD 2-Clause "Simplified" License
+
+Redistribution and use in source and binary forms, with or without
+modification, are permitted provided that the following conditions are met:
+
+1. Redistributions of source code must retain the above copyright notice,
+   this list of conditions and the following disclaimer.
+
+2. Redistributions in binary form must reproduce the above copyright notice,
+   this list of conditions and the following disclaimer in the documentation
+   and/or other materials provided with the distribution.
+
+THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
+ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE
+LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
+CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
+SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
+INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
+CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
+ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
+POSSIBILITY OF SUCH DAMAGE.
+
+========================================================================
+
+BSD 3-Clause "New" or "Revised" License
+
+Redistribution and use in source and binary forms, with or without
+modification, are permitted provided that the following conditions are met:
+
+1. Redistributions of source code must retain the above copyright notice,
+   this list of conditions and the following disclaimer.
+
+2. Redistributions in binary form must reproduce the above copyright notice,
+   this list of conditions and the following disclaimer in the documentation
+   and/or other materials provided with the distribution.
+
+3. Neither the name of the copyright holder nor the names of its contributors
+   may be used to endorse or promote products derived from this software
+   without specific prior written permission.
+
+THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
+ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE
+LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
+CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
+SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
+INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
+CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
+ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
+POSSIBILITY OF SUCH DAMAGE.
+
+========================================================================
+
+ISC License
+
+Permission to use, copy, modify, and/or distribute this software for any
+purpose with or without fee is hereby granted, provided that the above
+copyright notice and this permission notice appear in all copies.
+
+THE SOFTWARE IS PROVIDED "AS IS" AND THE AUTHOR DISCLAIMS ALL WARRANTIES
+WITH REGARD TO THIS SOFTWARE INCLUDING ALL IMPLIED WARRANTIES OF
+MERCHANTABILITY AND FITNESS. IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR ANY
+SPECIAL, DIRECT, INDIRECT, OR CONSEQUENTIAL DAMAGES OR ANY DAMAGES
+WHATSOEVER RESULTING FROM LOSS OF USE, DATA OR PROFITS, WHETHER IN AN
+ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF OR
+IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
+
+========================================================================
