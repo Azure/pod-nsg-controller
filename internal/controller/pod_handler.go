@@ -65,23 +65,31 @@ func (h *PodToMappingEventHandler) Create(ctx context.Context, e event.TypedCrea
 	if !ok {
 		return
 	}
+	if h.DesiredStateCache == nil {
+		reqs, err := h.matchingMappingsForPod(ctx, pod)
+		if err != nil {
+			h.Logger.Error(err, "failed to match mappings for created pod",
+				"pod", pod.Name, "podNamespace", pod.Namespace)
+			return
+		}
+		for _, req := range reqs {
+			h.enqueueRequest(q, req)
+		}
+		return
+	}
 	matched, err := h.matchingMappingsForPodDetailed(ctx, pod)
 	if err != nil {
 		h.Logger.Error(err, "failed to match mappings for created pod",
 			"pod", pod.Name, "podNamespace", pod.Namespace)
-		if h.DesiredStateCache != nil {
-			h.DesiredStateCache.InvalidateNamespace(pod.Namespace)
-		}
+		h.DesiredStateCache.InvalidateNamespace(pod.Namespace)
 		return
 	}
 	for _, m := range matched {
-		if h.DesiredStateCache != nil {
-			issues := validateASGResourceIDs(m.Mapping.Spec.Mappings)
-			if len(issues) > 0 {
-				h.DesiredStateCache.Invalidate(m.Request.NamespacedName)
-			} else {
-				h.DesiredStateCache.OnPodAdd(m.Mapping, pod)
-			}
+		issues := validateASGResourceIDs(m.Mapping.Spec.Mappings)
+		if len(issues) > 0 {
+			h.DesiredStateCache.Invalidate(m.Request.NamespacedName)
+		} else {
+			h.DesiredStateCache.OnPodAdd(m.Mapping, pod)
 		}
 		h.enqueueRequest(q, m.Request)
 	}
@@ -92,6 +100,23 @@ func (h *PodToMappingEventHandler) Update(ctx context.Context, e event.TypedUpda
 	oldPod, ok1 := e.ObjectOld.(*corev1.Pod)
 	newPod, ok2 := e.ObjectNew.(*corev1.Pod)
 	if !ok1 || !ok2 {
+		return
+	}
+
+	if h.DesiredStateCache == nil {
+		oldReqs, err1 := h.matchingMappingsForPod(ctx, oldPod)
+		if err1 != nil {
+			h.Logger.Error(err1, "failed to match mappings for old pod",
+				"oldPodName", oldPod.Name, "podNamespace", oldPod.Namespace)
+		}
+		newReqs, err2 := h.matchingMappingsForPod(ctx, newPod)
+		if err2 != nil {
+			h.Logger.Error(err2, "failed to match mappings for new pod",
+				"newPodName", newPod.Name, "podNamespace", newPod.Namespace)
+		}
+		for _, req := range UnionRequests(oldReqs, newReqs) {
+			h.enqueueRequest(q, req)
+		}
 		return
 	}
 
@@ -107,7 +132,7 @@ func (h *PodToMappingEventHandler) Update(ctx context.Context, e event.TypedUpda
 	}
 
 	// Invalidate namespace cache on partial resolution failure
-	if h.DesiredStateCache != nil && (err1 != nil || err2 != nil) {
+	if err1 != nil || err2 != nil {
 		ns := oldPod.Namespace
 		if ns == "" {
 			ns = newPod.Namespace
@@ -115,9 +140,9 @@ func (h *PodToMappingEventHandler) Update(ctx context.Context, e event.TypedUpda
 		h.DesiredStateCache.InvalidateNamespace(ns)
 	}
 
-	// Cache mutation logic (only when no resolution errors and cache exists)
+	// Cache mutation logic (only when no resolution errors)
 	// Must happen BEFORE enqueue so reconcilers observe fresh state.
-	if h.DesiredStateCache != nil && err1 == nil && err2 == nil {
+	if err1 == nil && err2 == nil {
 		oldSet := matchedMappingsByKey(oldMatched)
 		newSet := matchedMappingsByKey(newMatched)
 
@@ -174,23 +199,31 @@ func (h *PodToMappingEventHandler) Delete(ctx context.Context, e event.TypedDele
 	if !ok {
 		return
 	}
+	if h.DesiredStateCache == nil {
+		reqs, err := h.matchingMappingsForPod(ctx, pod)
+		if err != nil {
+			h.Logger.Error(err, "failed to match mappings for deleted pod",
+				"pod", pod.Name, "podNamespace", pod.Namespace)
+			return
+		}
+		for _, req := range reqs {
+			h.enqueueRequest(q, req)
+		}
+		return
+	}
 	matched, err := h.matchingMappingsForPodDetailed(ctx, pod)
 	if err != nil {
 		h.Logger.Error(err, "failed to match mappings for deleted pod",
 			"pod", pod.Name, "podNamespace", pod.Namespace)
-		if h.DesiredStateCache != nil {
-			h.DesiredStateCache.InvalidateNamespace(pod.Namespace)
-		}
+		h.DesiredStateCache.InvalidateNamespace(pod.Namespace)
 		return
 	}
 	for _, m := range matched {
-		if h.DesiredStateCache != nil {
-			issues := validateASGResourceIDs(m.Mapping.Spec.Mappings)
-			if len(issues) > 0 {
-				h.DesiredStateCache.Invalidate(m.Request.NamespacedName)
-			} else {
-				h.DesiredStateCache.OnPodDelete(m.Mapping, pod)
-			}
+		issues := validateASGResourceIDs(m.Mapping.Spec.Mappings)
+		if len(issues) > 0 {
+			h.DesiredStateCache.Invalidate(m.Request.NamespacedName)
+		} else {
+			h.DesiredStateCache.OnPodDelete(m.Mapping, pod)
 		}
 		h.enqueueRequest(q, m.Request)
 	}
