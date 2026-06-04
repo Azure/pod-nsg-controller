@@ -235,7 +235,10 @@ func LoadARMTuningConfig() (ARMTuningConfig, error) {
 			}
 			return ARMTuningConfig{}, errors.Wrap(concErr, "ARM_TUNING_DIR/MAX_CONCURRENT_ACTIONS")
 		}
-		// Both files absent in the directory — fall through to env/defaults.
+		// Both files absent in the directory — return error for runtime reload safety.
+		// At startup (no prior state), the caller handles this by falling back appropriately.
+		// At runtime, the reloader will keep last-good values on error.
+		return ARMTuningConfig{}, fmt.Errorf("ARM_TUNING_DIR is set but both tuning files are absent in %s", tuningDir)
 	}
 
 	// Fall back to environment variables.

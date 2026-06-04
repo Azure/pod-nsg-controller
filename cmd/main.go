@@ -66,6 +66,14 @@ func main() {
 		os.Exit(1)
 	}
 
+	// Load ARM tuning from file-backed source (ConfigMap mount) at startup,
+	// so the controller respects mounted tuning values from the first request.
+	armTuning, err := config.LoadARMTuningConfig()
+	if err != nil {
+		setupLog.Error(err, "unable to load ARM tuning configuration")
+		os.Exit(1)
+	}
+
 	// Register metrics with the controller-runtime Prometheus registry.
 	rec, err := metrics.RegisterWith(ctrlmetrics.Registry)
 	if err != nil {
@@ -87,7 +95,7 @@ func main() {
 
 	rateLimiter := azure.NewARMRateLimiter(
 		zapLog.With(zap.String("component", "azure-rate-limiter")),
-		cfg.ARMRateLimitRPS,
+		armTuning.ARMRateLimitRPS,
 		azure.WithRateLimitMetrics(rec.ARM),
 	)
 
@@ -101,8 +109,9 @@ func main() {
 	executor := azure.NewExecutor(
 		zapLog.With(zap.String("component", "azure-executor")),
 		prefixSetFactory,
-		cfg.MaxConcurrentActions,
+		armTuning.MaxConcurrentActions,
 		azure.WithExecutorRetryMetrics(rec.ARM),
+		azure.WithExecutorMetrics(rec.ARM),
 		azure.WithPatchThresholdPercent(cfg.PatchThresholdPercent),
 	)
 
@@ -184,10 +193,7 @@ func main() {
 	tuningReloader := newARMTuningReloader(
 		ctrl.Log.WithName("arm-tuning-reloader"),
 		30*time.Second,
-		config.ARMTuningConfig{
-			ARMRateLimitRPS:      cfg.ARMRateLimitRPS,
-			MaxConcurrentActions: cfg.MaxConcurrentActions,
-		},
+		armTuning,
 		executor,
 		rateLimiter,
 	)
