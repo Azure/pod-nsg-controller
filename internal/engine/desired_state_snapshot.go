@@ -26,6 +26,8 @@ type PodSnapshot struct {
 
 // matchPodToRuleIndices returns the indices of mapping rules whose selectors
 // match the given pod labels. Rules with invalid selectors are skipped.
+// Used by incremental cache paths (OnPodAdd/Update/Delete) where per-event
+// overhead is negligible. Batch paths should use precompiledMapping instead.
 func matchPodToRuleIndices(mapping *v1alpha1.PodASGMapping, podLabels labels.Set) []int {
 	var indices []int
 	for i, rule := range mapping.Spec.Mappings {
@@ -42,6 +44,8 @@ func matchPodToRuleIndices(mapping *v1alpha1.PodASGMapping, podLabels labels.Set
 
 // resolveRuleTargets resolves the ASG targets for a mapping rule, skipping
 // entries with invalid resource IDs.
+// Used by incremental cache paths (OnPodAdd/Update/Delete) where per-event
+// overhead is negligible. Batch paths should use precompiledMapping instead.
 func resolveRuleTargets(rule v1alpha1.Mapping, prefixSetName string) []ASGTarget {
 	var targets []ASGTarget
 	for _, asgRef := range rule.ApplicationSecurityGroups {
@@ -60,10 +64,49 @@ func resolveRuleTargets(rule v1alpha1.Mapping, prefixSetName string) []ASGTarget
 	return targets
 }
 
+// precompiledMapping holds precompiled selectors and pre-resolved ASG targets
+// for a PodASGMapping, avoiding repeated compilation/parsing in batch paths.
+// Indexed by original rule index; a nil selector means compilation failed
+// (that rule is skipped during matching, preserving parity with
+// matchPodToRuleIndices).
+type precompiledMapping struct {
+	selectors []labels.Selector // one per rule; nil = compile error, skip
+	targets   [][]ASGTarget     // pre-resolved targets per rule (read-only)
+}
+
+// precompileMapping compiles selectors and resolves ASG targets once per rule.
+func precompileMapping(mapping *v1alpha1.PodASGMapping, prefixSetName string) precompiledMapping {
+	n := len(mapping.Spec.Mappings)
+	pc := precompiledMapping{
+		selectors: make([]labels.Selector, n),
+		targets:   make([][]ASGTarget, n),
+	}
+	for i, rule := range mapping.Spec.Mappings {
+		sel, err := model.CompileSelector(rule.PodSelector)
+		if err == nil {
+			pc.selectors[i] = sel
+		}
+		pc.targets[i] = resolveRuleTargets(rule, prefixSetName)
+	}
+	return pc
+}
+
+// matchPod returns the rule indices whose precompiled selectors match podLabels.
+func (pc *precompiledMapping) matchPod(podLabels labels.Set) []int {
+	var indices []int
+	for i, sel := range pc.selectors {
+		if sel != nil && sel.Matches(podLabels) {
+			indices = append(indices, i)
+		}
+	}
+	return indices
+}
+
 // ComputeDesiredStateWithSnapshot computes desired state and returns a PodSnapshot
 // of all matched pods. This is the snapshot-aware variant of ComputeDesiredState.
-// It uses the shared matchPodToRuleIndices and resolveRuleTargets helpers to keep
-// selector/target evaluation aligned with the incremental cache paths.
+// It precompiles selectors and ASG targets once per mapping to avoid redundant
+// compilation during the per-pod loop, while preserving parity with the
+// incremental cache paths (which use the same CompileSelector / ParseASGResourceID).
 func ComputeDesiredStateWithSnapshot(
 	clusterName string,
 	mappings []v1alpha1.PodASGMapping,
@@ -81,6 +124,7 @@ func ComputeDesiredStateWithSnapshot(
 	for i := range mappings {
 		m := &mappings[i]
 		prefixSetName := model.OwnershipKey(clusterName, m.Namespace, m.Name)
+		pc := precompileMapping(m, prefixSetName)
 		namespacePods := podsByNamespace[m.Namespace]
 
 		for _, pod := range namespacePods {
@@ -88,7 +132,7 @@ func ComputeDesiredStateWithSnapshot(
 				continue
 			}
 
-			matchedIndices := matchPodToRuleIndices(m, labels.Set(pod.Labels))
+			matchedIndices := pc.matchPod(labels.Set(pod.Labels))
 			if len(matchedIndices) == 0 {
 				continue
 			}
@@ -102,9 +146,7 @@ func ComputeDesiredStateWithSnapshot(
 			snapshot.Pods[id] = PodMembership{PodIP: pod.Status.PodIP}
 
 			for _, ruleIdx := range matchedIndices {
-				rule := m.Spec.Mappings[ruleIdx]
-				targets := resolveRuleTargets(rule, prefixSetName)
-				for _, target := range targets {
+				for _, target := range pc.targets[ruleIdx] {
 					normKey := targetIdentityKey(target.FullResourceID, prefixSetName)
 
 					entry, exists := internal[normKey]
@@ -155,6 +197,7 @@ func ComputeDesiredStateRecomputeArtifacts(
 ) DesiredStateRecomputeArtifacts {
 	internal := make(map[string]*internalEntry)
 	prefixSetName := model.OwnershipKey(clusterName, mapping.Namespace, mapping.Name)
+	pc := precompileMapping(&mapping, prefixSetName)
 
 	arts := DesiredStateRecomputeArtifacts{
 		Desired:            make(map[ASGTarget]DesiredPrefixSet),
@@ -171,7 +214,7 @@ func ComputeDesiredStateRecomputeArtifacts(
 			continue
 		}
 
-		matchedIndices := matchPodToRuleIndices(&mapping, labels.Set(pod.Labels))
+		matchedIndices := pc.matchPod(labels.Set(pod.Labels))
 		if len(matchedIndices) == 0 {
 			continue
 		}
@@ -197,9 +240,7 @@ func ComputeDesiredStateRecomputeArtifacts(
 		arts.Snapshot.Pods[podID] = PodMembership{PodIP: pod.Status.PodIP}
 
 		for _, ruleIdx := range matchedIndices {
-			rule := mapping.Spec.Mappings[ruleIdx]
-			targets := resolveRuleTargets(rule, prefixSetName)
-			for _, target := range targets {
+			for _, target := range pc.targets[ruleIdx] {
 				normKey := targetIdentityKey(target.FullResourceID, prefixSetName)
 				entry, exists := internal[normKey]
 				if !exists {
