@@ -1322,8 +1322,8 @@ func (r *MappingReconciler) clearDesiredStateResyncState(key types.NamespacedNam
 // conflict occurs during cache-first reconciliation. This prevents hot loops
 // when pod churn keeps advancing the version.
 //
-// TODO(phase5): Implement bounded retry delay policy.
-// Currently returns 500ms fallback - tests will verify bounds.
+// Priority: MinReconcileInterval if set, otherwise ResyncInterval/4 clamped to
+// [200ms, 2s], otherwise 500ms fallback.
 func (r *MappingReconciler) cacheConflictRequeueAfter() time.Duration {
 	if r.MinReconcileInterval > 0 {
 		return r.MinReconcileInterval
