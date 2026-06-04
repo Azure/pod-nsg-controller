@@ -634,53 +634,53 @@ func TestPhase5_ComputeDesiredStateWithSnapshot_PendingIPPods_Tracked(t *testing
 // This ensures parity with the incremental cache pending tracking.
 // ---------------------------------------------------------------------------
 func TestPhase5_RecomputeArtifacts_PendingIPPods_TrackedInArtifacts(t *testing.T) {
-mapping := makeMapping("default", "pending-mapping", []v1alpha1.Mapping{
-{
-PodSelector: v1alpha1.PodSelector{
-MatchLabels: map[string]string{"app": "web"},
-},
-ApplicationSecurityGroups: []v1alpha1.ASGReference{
-{ResourceID: makeASGResourceID("sub-1", "rg-1", "asg-1")},
-},
-},
-})
+	mapping := makeMapping("default", "pending-mapping", []v1alpha1.Mapping{
+		{
+			PodSelector: v1alpha1.PodSelector{
+				MatchLabels: map[string]string{"app": "web"},
+			},
+			ApplicationSecurityGroups: []v1alpha1.ASGReference{
+				{ResourceID: makeASGResourceID("sub-1", "rg-1", "asg-1")},
+			},
+		},
+	})
 
-pods := []corev1.Pod{
-makePod("default", "pod-with-ip", map[string]string{"app": "web"}, "10.0.0.1"),
-// Two pods without IP (pending scheduling)
-{
-ObjectMeta: metav1.ObjectMeta{Namespace: "default", Name: "pod-pending-1", Labels: map[string]string{"app": "web"}},
-Status:     corev1.PodStatus{PodIP: ""},
-},
-{
-ObjectMeta: metav1.ObjectMeta{Namespace: "default", Name: "pod-pending-2", Labels: map[string]string{"app": "web"}},
-Status:     corev1.PodStatus{PodIP: ""},
-},
-}
+	pods := []corev1.Pod{
+		makePod("default", "pod-with-ip", map[string]string{"app": "web"}, "10.0.0.1"),
+		// Two pods without IP (pending scheduling)
+		{
+			ObjectMeta: metav1.ObjectMeta{Namespace: "default", Name: "pod-pending-1", Labels: map[string]string{"app": "web"}},
+			Status:     corev1.PodStatus{PodIP: ""},
+		},
+		{
+			ObjectMeta: metav1.ObjectMeta{Namespace: "default", Name: "pod-pending-2", Labels: map[string]string{"app": "web"}},
+			Status:     corev1.PodStatus{PodIP: ""},
+		},
+	}
 
-artifacts := ComputeDesiredStateRecomputeArtifacts("test-cluster", mapping, pods)
+	artifacts := ComputeDesiredStateRecomputeArtifacts("test-cluster", mapping, pods)
 
-if !artifacts.HasPendingIPPods {
-t.Error("HasPendingIPPods should be true when pods without IPs match selectors")
-}
-if artifacts.PendingIPCount != 2 {
-t.Errorf("PendingIPCount = %d, want 2", artifacts.PendingIPCount)
-}
+	if !artifacts.HasPendingIPPods {
+		t.Error("HasPendingIPPods should be true when pods without IPs match selectors")
+	}
+	if artifacts.PendingIPCount != 2 {
+		t.Errorf("PendingIPCount = %d, want 2", artifacts.PendingIPCount)
+	}
 
-// Only the pod with IP should be in the snapshot
-if len(artifacts.Snapshot.Pods) != 1 {
-t.Errorf("Snapshot.Pods length = %d, want 1 (only pods with IP)", len(artifacts.Snapshot.Pods))
-}
+	// Only the pod with IP should be in the snapshot
+	if len(artifacts.Snapshot.Pods) != 1 {
+		t.Errorf("Snapshot.Pods length = %d, want 1 (only pods with IP)", len(artifacts.Snapshot.Pods))
+	}
 
-// All 3 matched pods should be in PodRules
-if len(artifacts.PodRules) != 3 {
-t.Errorf("PodRules length = %d, want 3 (all matched pods including pending)", len(artifacts.PodRules))
-}
+	// All 3 matched pods should be in PodRules
+	if len(artifacts.PodRules) != 3 {
+		t.Errorf("PodRules length = %d, want 3 (all matched pods including pending)", len(artifacts.PodRules))
+	}
 
-// MatchedPodsByIndex[0] should be 3 (all three pods match the single rule)
-if len(artifacts.MatchedPodsByIndex) != 1 || artifacts.MatchedPodsByIndex[0] != 3 {
-t.Errorf("MatchedPodsByIndex = %v, want [3]", artifacts.MatchedPodsByIndex)
-}
+	// MatchedPodsByIndex[0] should be 3 (all three pods match the single rule)
+	if len(artifacts.MatchedPodsByIndex) != 1 || artifacts.MatchedPodsByIndex[0] != 3 {
+		t.Errorf("MatchedPodsByIndex = %v, want [3]", artifacts.MatchedPodsByIndex)
+	}
 }
 
 // ---------------------------------------------------------------------------
@@ -690,61 +690,61 @@ t.Errorf("MatchedPodsByIndex = %v, want [3]", artifacts.MatchedPodsByIndex)
 // so that the incremental cache can determine when an IP is safe to remove.
 // ---------------------------------------------------------------------------
 func TestPhase5_RecomputeArtifacts_SharedIPContributors_MultipleRules(t *testing.T) {
-asgID1 := makeASGResourceID("sub-1", "rg-1", "asg-frontend")
-asgID2 := makeASGResourceID("sub-1", "rg-1", "asg-all")
+	asgID1 := makeASGResourceID("sub-1", "rg-1", "asg-frontend")
+	asgID2 := makeASGResourceID("sub-1", "rg-1", "asg-all")
 
-mapping := makeMapping("default", "shared-ip-mapping", []v1alpha1.Mapping{
-{
-PodSelector: v1alpha1.PodSelector{
-MatchLabels: map[string]string{"role": "frontend"},
-},
-ApplicationSecurityGroups: []v1alpha1.ASGReference{{ResourceID: asgID1}},
-},
-{
-// Matches ALL pods (superset selector)
-PodSelector: v1alpha1.PodSelector{
-MatchLabels: map[string]string{"tier": "web"},
-},
-ApplicationSecurityGroups: []v1alpha1.ASGReference{{ResourceID: asgID2}},
-},
-})
+	mapping := makeMapping("default", "shared-ip-mapping", []v1alpha1.Mapping{
+		{
+			PodSelector: v1alpha1.PodSelector{
+				MatchLabels: map[string]string{"role": "frontend"},
+			},
+			ApplicationSecurityGroups: []v1alpha1.ASGReference{{ResourceID: asgID1}},
+		},
+		{
+			// Matches ALL pods (superset selector)
+			PodSelector: v1alpha1.PodSelector{
+				MatchLabels: map[string]string{"tier": "web"},
+			},
+			ApplicationSecurityGroups: []v1alpha1.ASGReference{{ResourceID: asgID2}},
+		},
+	})
 
-// Two pods with the SAME IP (host-network scenario) but different labels
-pods := []corev1.Pod{
-makePod("default", "pod-a", map[string]string{"role": "frontend", "tier": "web"}, "192.168.1.1"),
-makePod("default", "pod-b", map[string]string{"role": "backend", "tier": "web"}, "192.168.1.1"),
-}
+	// Two pods with the SAME IP (host-network scenario) but different labels
+	pods := []corev1.Pod{
+		makePod("default", "pod-a", map[string]string{"role": "frontend", "tier": "web"}, "192.168.1.1"),
+		makePod("default", "pod-b", map[string]string{"role": "backend", "tier": "web"}, "192.168.1.1"),
+	}
 
-artifacts := ComputeDesiredStateRecomputeArtifacts("test-cluster", mapping, pods)
+	artifacts := ComputeDesiredStateRecomputeArtifacts("test-cluster", mapping, pods)
 
-// pod-a matches both rules, pod-b matches only rule 1 (tier=web)
-podAID := PodIdentity{Namespace: "default", Name: "pod-a"}
-podBID := PodIdentity{Namespace: "default", Name: "pod-b"}
+	// pod-a matches both rules, pod-b matches only rule 1 (tier=web)
+	podAID := PodIdentity{Namespace: "default", Name: "pod-a"}
+	podBID := PodIdentity{Namespace: "default", Name: "pod-b"}
 
-if rules, ok := artifacts.PodRules[podAID]; !ok || len(rules) != 2 {
-t.Errorf("pod-a should match 2 rules, got PodRules[pod-a]=%v", artifacts.PodRules[podAID])
-}
-if rules, ok := artifacts.PodRules[podBID]; !ok || len(rules) != 1 {
-t.Errorf("pod-b should match 1 rule (tier=web), got PodRules[pod-b]=%v", artifacts.PodRules[podBID])
-}
+	if rules, ok := artifacts.PodRules[podAID]; !ok || len(rules) != 2 {
+		t.Errorf("pod-a should match 2 rules, got PodRules[pod-a]=%v", artifacts.PodRules[podAID])
+	}
+	if rules, ok := artifacts.PodRules[podBID]; !ok || len(rules) != 1 {
+		t.Errorf("pod-b should match 1 rule (tier=web), got PodRules[pod-b]=%v", artifacts.PodRules[podBID])
+	}
 
-// Both pods should be in the snapshot with same IP
-if len(artifacts.Snapshot.Pods) != 2 {
-t.Errorf("Snapshot.Pods length = %d, want 2", len(artifacts.Snapshot.Pods))
-}
+	// Both pods should be in the snapshot with same IP
+	if len(artifacts.Snapshot.Pods) != 2 {
+		t.Errorf("Snapshot.Pods length = %d, want 2", len(artifacts.Snapshot.Pods))
+	}
 
-// The shared IP should appear in both target's desired state
-foundInASGAll := false
-for tgt, dps := range artifacts.Desired {
-if tgt.ASGName == "asg-all" {
-if _, has := dps.IPs["192.168.1.1/32"]; has {
-foundInASGAll = true
-}
-}
-}
-if !foundInASGAll {
-t.Error("shared IP 192.168.1.1/32 should appear in asg-all target (both pods contribute)")
-}
+	// The shared IP should appear in both target's desired state
+	foundInASGAll := false
+	for tgt, dps := range artifacts.Desired {
+		if tgt.ASGName == "asg-all" {
+			if _, has := dps.IPs["192.168.1.1/32"]; has {
+				foundInASGAll = true
+			}
+		}
+	}
+	if !foundInASGAll {
+		t.Error("shared IP 192.168.1.1/32 should appear in asg-all target (both pods contribute)")
+	}
 }
 
 // ===========================================================================

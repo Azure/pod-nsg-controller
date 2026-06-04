@@ -1451,93 +1451,93 @@ func TestPhase5_ArtifactRecomputePath_PendingIPPod_TrackedCorrectly(t *testing.T
 // cache fallback) and use bounded requeue to prevent hot loops.
 // ---------------------------------------------------------------------------
 func TestPhase5_ForcedResync_ChurnScenario_BoundedRequeueAndEventualPublish(t *testing.T) {
-te := setupTestEnv(t)
-defer te.teardown(t)
-ctx := context.Background()
+	te := setupTestEnv(t)
+	defer te.teardown(t)
+	ctx := context.Background()
 
-ns := &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: "test-forced-churn"}}
-if err := te.k8sClient.Create(ctx, ns); err != nil {
-t.Fatalf("failed to create namespace: %v", err)
-}
+	ns := &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: "test-forced-churn"}}
+	if err := te.k8sClient.Create(ctx, ns); err != nil {
+		t.Fatalf("failed to create namespace: %v", err)
+	}
 
-mapping := &v1alpha1.PodASGMapping{
-ObjectMeta: metav1.ObjectMeta{Name: "churn-mapping", Namespace: ns.Name},
-Spec: v1alpha1.PodASGMappingSpec{
-Mappings: []v1alpha1.Mapping{
-{
-PodSelector: v1alpha1.PodSelector{MatchLabels: map[string]string{"app": "churn"}},
-ApplicationSecurityGroups: []v1alpha1.ASGReference{
-{ResourceID: asgResourceID("sub1", "rg1", "asg1")},
-},
-},
-},
-},
-}
-if err := te.k8sClient.Create(ctx, mapping); err != nil {
-t.Fatalf("failed to create mapping: %v", err)
-}
+	mapping := &v1alpha1.PodASGMapping{
+		ObjectMeta: metav1.ObjectMeta{Name: "churn-mapping", Namespace: ns.Name},
+		Spec: v1alpha1.PodASGMappingSpec{
+			Mappings: []v1alpha1.Mapping{
+				{
+					PodSelector: v1alpha1.PodSelector{MatchLabels: map[string]string{"app": "churn"}},
+					ApplicationSecurityGroups: []v1alpha1.ASGReference{
+						{ResourceID: asgResourceID("sub1", "rg1", "asg1")},
+					},
+				},
+			},
+		},
+	}
+	if err := te.k8sClient.Create(ctx, mapping); err != nil {
+		t.Fatalf("failed to create mapping: %v", err)
+	}
 
-// Create initial set of pods
-for i := 1; i <= 3; i++ {
-pod := &corev1.Pod{
-ObjectMeta: metav1.ObjectMeta{
-Name: fmt.Sprintf("churn-pod-%d", i), Namespace: ns.Name,
-Labels: map[string]string{"app": "churn"},
-},
-Spec: corev1.PodSpec{Containers: []corev1.Container{{Name: "app", Image: "nginx"}}},
-}
-if err := te.k8sClient.Create(ctx, pod); err != nil {
-t.Fatalf("failed to create pod-%d: %v", i, err)
-}
-pod.Status.PodIP = fmt.Sprintf("10.0.3.%d", i)
-if err := te.k8sClient.Status().Update(ctx, pod); err != nil {
-t.Fatalf("failed to set pod-%d IP: %v", i, err)
-}
-}
+	// Create initial set of pods
+	for i := 1; i <= 3; i++ {
+		pod := &corev1.Pod{
+			ObjectMeta: metav1.ObjectMeta{
+				Name: fmt.Sprintf("churn-pod-%d", i), Namespace: ns.Name,
+				Labels: map[string]string{"app": "churn"},
+			},
+			Spec: corev1.PodSpec{Containers: []corev1.Container{{Name: "app", Image: "nginx"}}},
+		}
+		if err := te.k8sClient.Create(ctx, pod); err != nil {
+			t.Fatalf("failed to create pod-%d: %v", i, err)
+		}
+		pod.Status.PodIP = fmt.Sprintf("10.0.3.%d", i)
+		if err := te.k8sClient.Status().Update(ctx, pod); err != nil {
+			t.Fatalf("failed to set pod-%d IP: %v", i, err)
+		}
+	}
 
-ownershipKey := "test-cluster-" + ns.Name + "-churn-mapping"
+	ownershipKey := "test-cluster-" + ns.Name + "-churn-mapping"
 
-// Wait for initial convergence
-eventually(t, 15*time.Second, 300*time.Millisecond, func() bool {
-ps, err := te.fakeClient.Get(ctx, "sub1", "rg1", "asg1", ownershipKey)
-if err != nil || ps.Properties == nil {
-return false
-}
-return len(ps.Properties.AddressPrefixes) == 3
-}, "expected initial 3 pods to converge")
+	// Wait for initial convergence
+	eventually(t, 15*time.Second, 300*time.Millisecond, func() bool {
+		ps, err := te.fakeClient.Get(ctx, "sub1", "rg1", "asg1", ownershipKey)
+		if err != nil || ps.Properties == nil {
+			return false
+		}
+		return len(ps.Properties.AddressPrefixes) == 3
+	}, "expected initial 3 pods to converge")
 
-// Wait for forced resync to trigger (ResyncInterval=2s in test env)
-time.Sleep(3 * time.Second)
+	// Wait for forced resync to trigger (ResyncInterval=2s in test env)
+	time.Sleep(3 * time.Second)
 
-// During the forced resync window, add a new pod (simulating churn)
-pod4 := &corev1.Pod{
-ObjectMeta: metav1.ObjectMeta{
-Name: "churn-pod-4", Namespace: ns.Name,
-Labels: map[string]string{"app": "churn"},
-},
-Spec: corev1.PodSpec{Containers: []corev1.Container{{Name: "app", Image: "nginx"}}},
-}
-if err := te.k8sClient.Create(ctx, pod4); err != nil {
-t.Fatalf("failed to create pod-4: %v", err)
-}
-pod4.Status.PodIP = "10.0.3.4"
-if err := te.k8sClient.Status().Update(ctx, pod4); err != nil {
-t.Fatalf("failed to set pod-4 IP: %v", err)
-}
+	// During the forced resync window, add a new pod (simulating churn)
+	pod4 := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "churn-pod-4", Namespace: ns.Name,
+			Labels: map[string]string{"app": "churn"},
+		},
+		Spec: corev1.PodSpec{Containers: []corev1.Container{{Name: "app", Image: "nginx"}}},
+	}
+	if err := te.k8sClient.Create(ctx, pod4); err != nil {
+		t.Fatalf("failed to create pod-4: %v", err)
+	}
+	pod4.Status.PodIP = "10.0.3.4"
+	if err := te.k8sClient.Status().Update(ctx, pod4); err != nil {
+		t.Fatalf("failed to set pod-4 IP: %v", err)
+	}
 
-// Assert: eventually all 4 IPs should appear, proving forced resync
-// correctly publishes fresh recompute data even under churn
-eventually(t, 15*time.Second, 300*time.Millisecond, func() bool {
-ps, err := te.fakeClient.Get(ctx, "sub1", "rg1", "asg1", ownershipKey)
-if err != nil || ps.Properties == nil {
-return false
-}
-ips := make(map[string]bool)
-for _, ip := range ps.Properties.AddressPrefixes {
-ips[ip] = true
-}
-return ips["10.0.3.1/32"] && ips["10.0.3.2/32"] && ips["10.0.3.3/32"] && ips["10.0.3.4/32"]
-}, "Phase 5: forced resync under churn must eventually publish all 4 pods (no stale cache substitution)")
+	// Assert: eventually all 4 IPs should appear, proving forced resync
+	// correctly publishes fresh recompute data even under churn
+	eventually(t, 15*time.Second, 300*time.Millisecond, func() bool {
+		ps, err := te.fakeClient.Get(ctx, "sub1", "rg1", "asg1", ownershipKey)
+		if err != nil || ps.Properties == nil {
+			return false
+		}
+		ips := make(map[string]bool)
+		for _, ip := range ps.Properties.AddressPrefixes {
+			ips[ip] = true
+		}
+		return ips["10.0.3.1/32"] && ips["10.0.3.2/32"] && ips["10.0.3.3/32"] && ips["10.0.3.4/32"]
+	}, "Phase 5: forced resync under churn must eventually publish all 4 pods (no stale cache substitution)")
 }
 
 // ===========================================================================
