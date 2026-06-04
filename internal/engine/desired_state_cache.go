@@ -423,6 +423,13 @@ func (c *DesiredStateCache) OnPodUpdate(mapping *v1alpha1.PodASGMapping, oldPod,
 
 	anyNewMatch := false
 
+	// Capture pre-mutation pending state before the loop modifies podRules.
+	// A pod is "pending" when it is tracked in podRules but absent from
+	// snapshot (which only holds IP-bearing pods).
+	_, priorInPodRules := entry.podRules[podID]
+	_, priorInSnapshot := entry.state.Snapshot.Pods[podID]
+	wasPending := priorInPodRules && !priorInSnapshot
+
 	// Determine which rules each pod version matches using shared helper
 	oldMatchedIndices := matchPodToRuleIndices(mapping, labels.Set(oldPod.Labels))
 	newMatchedIndices := matchPodToRuleIndices(mapping, labels.Set(newPod.Labels))
@@ -517,12 +524,6 @@ func (c *DesiredStateCache) OnPodUpdate(mapping *v1alpha1.PodASGMapping, oldPod,
 			entry.state.Desired[target] = dps
 		}
 	}
-
-	// Determine whether this pod was previously pending (tracked in podRules
-	// but absent from snapshot, since snapshot only holds IP-bearing pods).
-	_, inPodRules := entry.podRules[podID]
-	_, inSnapshot := entry.state.Snapshot.Pods[podID]
-	wasPending := inPodRules && !inSnapshot
 
 	// Update snapshot membership: only IP-bearing matched pods are stored
 	// in the public Snapshot to maintain parity with ComputeDesiredStateWithSnapshot.
