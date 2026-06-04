@@ -67,9 +67,8 @@ Phase 5’s cache path is intended to avoid this by incrementally mutating desir
 - `test/integration/phase5/cross_module_integration_test.go`
 
 ## New files assessment
-- **No new production files are required.**
-- The spec’s “new” cache files already exist (`internal/engine/desired_state_cache.go`, `internal/engine/desired_state_cache_test.go`), so Phase 5 work should stay within existing modules.
-
+- **Production:** Adds `internal/engine/desired_state_cache.go` (desired-state cache implementation).
+- **Tests/docs:** Adds/extends Phase 5 unit + integration coverage and this scope report.
 ## Related spec sections
 - `docs/PERFORMANCE-IMPROVEMENTS.md`:
   - Problem framing for full recompute (`~45-46`, `~301-305`)
