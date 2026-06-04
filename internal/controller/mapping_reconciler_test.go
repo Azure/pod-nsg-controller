@@ -3517,7 +3517,6 @@ func TestPhase5_Reconcile_ForcedResync_ArtifactPath_NoFunctionalRegression(t *te
 // Design: When shouldForceDesiredStateRecompute returns true and the CAS publish
 // fails, the reconciler must NOT fall back to stale cache re-read as a successful
 // forced-resync completion. It should bounded-requeue instead.
-// Currently FAILS because the code at line 291 uses cache.Get() as fallback.
 //
 // To produce a CAS conflict in a synchronous test, we use a wrapping client
 // that injects a cache mutation (OnPodAdd) during the List call, simulating a

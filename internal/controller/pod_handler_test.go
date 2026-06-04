@@ -1182,7 +1182,6 @@ func TestPhase5_PodHandler_Update_CacheMiss_DoesNotInvalidateMapping(t *testing.
 // ---------------------------------------------------------------------------
 // TestPhase5_PodHandler_Create_MutatesCacheBeforeEnqueue
 // Design: cache mutation must be visible to reconcilers at enqueue time.
-// Currently FAILS because enqueue happens BEFORE cache mutation.
 // ---------------------------------------------------------------------------
 func TestPhase5_PodHandler_Create_MutatesCacheBeforeEnqueue(t *testing.T) {
 	ctx := context.Background()
@@ -1259,7 +1258,6 @@ func TestPhase5_PodHandler_Create_MutatesCacheBeforeEnqueue(t *testing.T) {
 // ---------------------------------------------------------------------------
 // TestPhase5_PodHandler_Delete_MutatesCacheBeforeEnqueue
 // Design: cache mutation (IP removal) must happen before reconcile is enqueued.
-// Currently FAILS because enqueue happens BEFORE cache mutation.
 // ---------------------------------------------------------------------------
 func TestPhase5_PodHandler_Delete_MutatesCacheBeforeEnqueue(t *testing.T) {
 	ctx := context.Background()
@@ -1342,7 +1340,6 @@ func TestPhase5_PodHandler_Delete_MutatesCacheBeforeEnqueue(t *testing.T) {
 // ---------------------------------------------------------------------------
 // TestPhase5_PodHandler_Update_MutatesCacheBeforeUnionEnqueue
 // Design: cache mutation for all affected mappings must happen before any enqueue.
-// Currently FAILS because union enqueue happens BEFORE cache mutation.
 // ---------------------------------------------------------------------------
 func TestPhase5_PodHandler_Update_MutatesCacheBeforeUnionEnqueue(t *testing.T) {
 	ctx := context.Background()
