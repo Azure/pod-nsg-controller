@@ -849,8 +849,10 @@ func TestDesiredStateEngine(t *testing.T) {
 | `AZURE_SUBSCRIPTION_ID` | No | — | Default subscription (overridden by per-ASG resource IDs) |
 | `AZURE_RESOURCE_GROUP` | No | — | Default resource group (overridden by per-ASG resource IDs) |
 | `RESYNC_INTERVAL_SECONDS` | No | `60` | Periodic resync interval |
-| `ARM_RATE_LIMIT_RPS` | No | `10` | Per-subscription ARM API rate limit (requests/second) |
-| `MAX_CONCURRENT_ACTIONS` | No | `5` | Maximum parallel ARM calls per reconcile cycle |
+| `ARM_RATE_LIMIT_RPS` | No | `20` | Per-subscription ARM API rate limit (requests/second) |
+| `MAX_CONCURRENT_ACTIONS` | No | `10` | Maximum parallel ARM calls per reconcile cycle |
+
+> **Note:** `ARM_RATE_LIMIT_RPS` and `MAX_CONCURRENT_ACTIONS` support runtime tuning without restart. In-cluster, these values are sourced from a ConfigMap-mounted directory (`ARM_TUNING_DIR`). Updating the ConfigMap applies new values on the next poll cycle (~30s).
 
 > **Note:** `AZURE_NSG_NAME` from the current config is no longer needed — the new design manages ASG addressPrefixSets, not NSG rules directly.
 

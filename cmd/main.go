@@ -1,10 +1,12 @@
 package main
 
 import (
+	"context"
 	"flag"
 	"os"
 	"time"
 
+	"github.com/go-logr/logr"
 	"github.com/go-logr/zapr"
 	"go.uber.org/zap"
 	"go.uber.org/zap/zapcore"
@@ -178,6 +180,22 @@ func main() {
 		os.Exit(1)
 	}
 
+	// Register the ARM tuning reloader as a manager Runnable for runtime updates.
+	tuningReloader := newARMTuningReloader(
+		ctrl.Log.WithName("arm-tuning-reloader"),
+		30*time.Second,
+		config.ARMTuningConfig{
+			ARMRateLimitRPS:      cfg.ARMRateLimitRPS,
+			MaxConcurrentActions: cfg.MaxConcurrentActions,
+		},
+		executor,
+		rateLimiter,
+	)
+	if err := mgr.Add(tuningReloader); err != nil {
+		setupLog.Error(err, "unable to add ARM tuning reloader")
+		os.Exit(1)
+	}
+
 	if err := mgr.AddHealthzCheck("healthz", healthz.Ping); err != nil {
 		setupLog.Error(err, "unable to set up health check")
 		os.Exit(1)
@@ -204,4 +222,75 @@ func main() {
 		setupLog.Error(err, "problem running manager")
 		os.Exit(1)
 	}
+}
+
+// armTuningReloader polls the ARM tuning source and applies runtime updates
+// to the executor and rate limiter without requiring a controller restart.
+type armTuningReloader struct {
+	log      logr.Logger
+	interval time.Duration
+	current  config.ARMTuningConfig
+	executor *azure.Executor
+	limiter  *azure.ARMRateLimiter
+}
+
+func newARMTuningReloader(
+	log logr.Logger,
+	interval time.Duration,
+	initial config.ARMTuningConfig,
+	executor *azure.Executor,
+	limiter *azure.ARMRateLimiter,
+) *armTuningReloader {
+	return &armTuningReloader{
+		log:      log,
+		interval: interval,
+		current:  initial,
+		executor: executor,
+		limiter:  limiter,
+	}
+}
+
+func (r *armTuningReloader) Start(ctx context.Context) error {
+	ticker := time.NewTicker(r.interval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return nil
+		case <-ticker.C:
+			r.reload()
+		}
+	}
+}
+
+func (r *armTuningReloader) reload() {
+	tuning, err := config.LoadARMTuningConfig()
+	if err != nil {
+		r.log.Error(err, "failed to load ARM tuning config, keeping current values")
+		return
+	}
+	if tuning.ARMRateLimitRPS == r.current.ARMRateLimitRPS && tuning.MaxConcurrentActions == r.current.MaxConcurrentActions {
+		return
+	}
+	if tuning.ARMRateLimitRPS != r.current.ARMRateLimitRPS {
+		if err := r.limiter.SetRPS(tuning.ARMRateLimitRPS); err != nil {
+			r.log.Error(err, "failed to update ARM rate limit RPS")
+			return
+		}
+		r.log.Info("updated ARM rate limit RPS",
+			"old", r.current.ARMRateLimitRPS,
+			"new", tuning.ARMRateLimitRPS,
+		)
+	}
+	if tuning.MaxConcurrentActions != r.current.MaxConcurrentActions {
+		if err := r.executor.SetMaxParallel(tuning.MaxConcurrentActions); err != nil {
+			r.log.Error(err, "failed to update max concurrent actions")
+			return
+		}
+		r.log.Info("updated max concurrent actions",
+			"old", r.current.MaxConcurrentActions,
+			"new", tuning.MaxConcurrentActions,
+		)
+	}
+	r.current = tuning
 }
