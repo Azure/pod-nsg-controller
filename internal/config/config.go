@@ -80,33 +80,41 @@ func Load() (*Config, error) {
 	}
 
 	// Parse ARM rate limit RPS.
-	rpsStr := os.Getenv("ARM_RATE_LIMIT_RPS")
-	if rpsStr == "" {
+	// When ARM_TUNING_DIR is set, file-backed tuning takes precedence via
+	// LoadARMTuningConfig(); skip env-based validation here to avoid startup
+	// failures from stale env vars that would never be used.
+	if os.Getenv("ARM_TUNING_DIR") != "" {
 		cfg.ARMRateLimitRPS = 20.0
-	} else {
-		val, err := strconv.ParseFloat(rpsStr, 64)
-		if err != nil {
-			return nil, errors.Wrap(err, "ARM_RATE_LIMIT_RPS must be a valid number")
-		}
-		if val <= 0 {
-			return nil, fmt.Errorf("ARM_RATE_LIMIT_RPS must be > 0, got %v", val)
-		}
-		cfg.ARMRateLimitRPS = val
-	}
-
-	// Parse max concurrent actions.
-	concStr := os.Getenv("MAX_CONCURRENT_ACTIONS")
-	if concStr == "" {
 		cfg.MaxConcurrentActions = 10
 	} else {
-		val, err := strconv.Atoi(concStr)
-		if err != nil {
-			return nil, errors.Wrap(err, "MAX_CONCURRENT_ACTIONS must be a valid integer")
+		rpsStr := os.Getenv("ARM_RATE_LIMIT_RPS")
+		if rpsStr == "" {
+			cfg.ARMRateLimitRPS = 20.0
+		} else {
+			val, err := strconv.ParseFloat(rpsStr, 64)
+			if err != nil {
+				return nil, errors.Wrap(err, "ARM_RATE_LIMIT_RPS must be a valid number")
+			}
+			if val <= 0 {
+				return nil, fmt.Errorf("ARM_RATE_LIMIT_RPS must be > 0, got %v", val)
+			}
+			cfg.ARMRateLimitRPS = val
 		}
-		if val < 1 {
-			return nil, fmt.Errorf("MAX_CONCURRENT_ACTIONS must be >= 1, got %d", val)
+
+		// Parse max concurrent actions.
+		concStr := os.Getenv("MAX_CONCURRENT_ACTIONS")
+		if concStr == "" {
+			cfg.MaxConcurrentActions = 10
+		} else {
+			val, err := strconv.Atoi(concStr)
+			if err != nil {
+				return nil, errors.Wrap(err, "MAX_CONCURRENT_ACTIONS must be a valid integer")
+			}
+			if val < 1 {
+				return nil, fmt.Errorf("MAX_CONCURRENT_ACTIONS must be >= 1, got %d", val)
+			}
+			cfg.MaxConcurrentActions = val
 		}
-		cfg.MaxConcurrentActions = val
 	}
 
 	// Parse max concurrent reconciles.
@@ -235,10 +243,8 @@ func LoadARMTuningConfig() (ARMTuningConfig, error) {
 			}
 			return ARMTuningConfig{}, errors.Wrap(concErr, "ARM_TUNING_DIR/MAX_CONCURRENT_ACTIONS")
 		}
-		// Both files absent in the directory — return error for runtime reload safety.
-		// At startup (no prior state), the caller handles this by falling back appropriately.
-		// At runtime, the reloader will keep last-good values on error.
-		return ARMTuningConfig{}, fmt.Errorf("ARM_TUNING_DIR is set but both tuning files are absent in %s", tuningDir)
+		// Both files absent — fall through to env/defaults.
+		// At runtime the reloader will keep last-good values on its own.
 	}
 
 	// Fall back to environment variables.
