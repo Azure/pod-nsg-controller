@@ -182,8 +182,8 @@ func (c *AddressPrefixSetClient) doRequest(ctx context.Context, retryCtx RetryCo
 
 		if httpErr != nil {
 			// Record transport failure as status "0"
-			if c.armObserver != nil {
-				c.armObserver.ObserveRequest(retryCtx.SubscriptionID, string(retryCtx.Operation), "0", duration)
+			if c.armObserver != nil && !retryCtx.SkipMetrics {
+				c.armObserver.ObserveRequest(retryCtx.SubscriptionID, method, "0", duration)
 			}
 
 			decision := DecideRetry(httpErr, attempt, policy)
@@ -212,9 +212,12 @@ func (c *AddressPrefixSetClient) doRequest(ctx context.Context, retryCtx RetryCo
 			continue
 		}
 
-		// Record the HTTP attempt with actual status code
-		if c.armObserver != nil {
-			c.armObserver.ObserveRequest(retryCtx.SubscriptionID, string(retryCtx.Operation), fmt.Sprintf("%d", resp.StatusCode), duration)
+		// Record the HTTP attempt with actual status code.
+		// For internal sub-requests (SkipMetrics), only skip emission on success (2xx)
+		// to allow error/retry metrics to flow through.
+		emitMetric := c.armObserver != nil && (!retryCtx.SkipMetrics || resp.StatusCode < 200 || resp.StatusCode >= 300)
+		if emitMetric {
+			c.armObserver.ObserveRequest(retryCtx.SubscriptionID, method, fmt.Sprintf("%d", resp.StatusCode), duration)
 		}
 
 		// 2xx success.
@@ -282,6 +285,16 @@ func parseARMError(statusCode int, body []byte) *ARMStatusError {
 
 // Get returns the specified address prefix set.
 func (c *AddressPrefixSetClient) Get(ctx context.Context, subscriptionID, resourceGroup, asgName, prefixSetName string) (*AddressPrefixSet, error) {
+	return c.getWithOptions(ctx, subscriptionID, resourceGroup, asgName, prefixSetName, false)
+}
+
+// getInternal performs a GET without emitting metrics (used by Put's internal ETag fetch).
+func (c *AddressPrefixSetClient) getInternal(ctx context.Context, subscriptionID, resourceGroup, asgName, prefixSetName string) (*AddressPrefixSet, error) {
+	return c.getWithOptions(ctx, subscriptionID, resourceGroup, asgName, prefixSetName, true)
+}
+
+// getWithOptions is the shared GET implementation.
+func (c *AddressPrefixSetClient) getWithOptions(ctx context.Context, subscriptionID, resourceGroup, asgName, prefixSetName string, skipMetrics bool) (*AddressPrefixSet, error) {
 	reqURL := c.resourceURL(subscriptionID, resourceGroup, asgName, prefixSetName)
 
 	c.log.Debug("GET AddressPrefixSet",
@@ -299,6 +312,7 @@ func (c *AddressPrefixSetClient) Get(ctx context.Context, subscriptionID, resour
 		ResourceGroup:  resourceGroup,
 		ASGName:        asgName,
 		PrefixSetName:  prefixSetName,
+		SkipMetrics:    skipMetrics,
 	}
 
 	resp, err := c.doRequest(ctx, retryCtx, http.MethodGet, reqURL, nil, nil)
@@ -462,9 +476,9 @@ func (c *AddressPrefixSetClient) Put(ctx context.Context, subscriptionID, resour
 		zap.Int("ipCount", len(ips)),
 	)
 
-	// GET current state to determine ETag / existence
+	// Internal GET to determine ETag / existence (not reported as a separate metric).
 	headers := make(map[string]string)
-	existing, getErr := c.Get(ctx, subscriptionID, resourceGroup, asgName, prefixSetName)
+	existing, getErr := c.getInternal(ctx, subscriptionID, resourceGroup, asgName, prefixSetName)
 	if getErr != nil {
 		if IsNotFound(getErr) {
 			headers["If-None-Match"] = "*"

@@ -343,3 +343,58 @@ func sumAllHistogramCounts(mf *dto.MetricFamily) uint64 {
 	}
 	return total
 }
+
+// ---------------------------------------------------------------------------
+// Phase 6: Integration — new executor metrics appear in prometheus registry
+// ---------------------------------------------------------------------------
+
+func TestPhase6_Integration_ExecutorMetrics_PrometheusRegistry(t *testing.T) {
+	metrics.ResetForTesting()
+	defer metrics.ResetForTesting()
+
+	reg := prometheus.NewRegistry()
+	rec, err := metrics.RegisterWith(reg)
+	if err != nil {
+		t.Fatalf("RegisterWith failed: %v", err)
+	}
+
+	// Exercise the new Phase 6 methods.
+	rec.ARM.ObserveCallDuration("sub-p6", "PUT", 200*time.Millisecond)
+	rec.ARM.IncConcurrentActions()
+	rec.ARM.DecConcurrentActions()
+	rec.ARM.ObserveETagConflict("sub-p6", "PUT")
+
+	mfs, err := reg.Gather()
+	if err != nil {
+		t.Fatalf("Gather() failed: %v", err)
+	}
+
+	// Verify arm_call_duration_seconds
+	callDuration := findMetricFamily(mfs, "pod_nsg_controller_arm_call_duration_seconds")
+	if callDuration == nil {
+		t.Fatal("pod_nsg_controller_arm_call_duration_seconds not found in registry")
+	}
+	cdCount := sumAllHistogramCounts(callDuration)
+	if cdCount < 1 {
+		t.Errorf("arm_call_duration_seconds sample_count = %d, want >= 1", cdCount)
+	}
+
+	// Verify arm_concurrent_actions gauge exists
+	concGauge := findMetricFamily(mfs, "pod_nsg_controller_arm_concurrent_actions")
+	if concGauge == nil {
+		t.Fatal("pod_nsg_controller_arm_concurrent_actions not found in registry")
+	}
+
+	// Verify arm_etag_conflicts_total
+	etagConflicts := findMetricFamily(mfs, "pod_nsg_controller_arm_etag_conflicts_total")
+	if etagConflicts == nil {
+		t.Fatal("pod_nsg_controller_arm_etag_conflicts_total not found in registry")
+	}
+	etagVal := findCounterWithLabels(etagConflicts, map[string]string{
+		"subscription_id": "sub-p6",
+		"operation":       "PUT",
+	})
+	if etagVal < 1 {
+		t.Errorf("arm_etag_conflicts_total{sub-p6, PUT} = %v, want >= 1", etagVal)
+	}
+}

@@ -319,3 +319,41 @@ func (f *fakeRateLimitObserver) ObserveRateLimitDelay(subscriptionID string, del
 	f.delayCount++
 	f.delays = append(f.delays, delay)
 }
+
+// ---------------------------------------------------------------------------
+// Phase 6: WithExecutorMetrics wiring assertion
+// ---------------------------------------------------------------------------
+
+func TestPhase6_WithExecutorMetrics_WiresObserver(t *testing.T) {
+	log := zaptest.NewLogger(t)
+	factory := newStubFactory()
+	client := newStubClient()
+	factory.Register("sub1", client)
+
+	obs := &fakeExecutorMetricsObserver{}
+	executor := NewExecutor(log, factory, 1, WithExecutorMetrics(obs))
+
+	actions := []engine.Action{
+		{
+			Kind:       engine.CreatePrefixSet,
+			Target:     engine.ASGTarget{SubscriptionID: "sub1", ResourceGroup: "rg1", ASGName: "asg1", PrefixSetName: "ps1"},
+			DesiredIPs: []string{"10.0.0.1/32"},
+		},
+	}
+
+	results := executor.Execute(context.Background(), actions)
+	if len(results) != 1 || !results[0].Success {
+		t.Fatalf("expected success, got: %+v", results)
+	}
+
+	// WithExecutorMetrics should have wired the observer so it receives calls.
+	if obs.durationCount == 0 {
+		t.Error("WithExecutorMetrics: observer did not receive duration observation")
+	}
+	if obs.incCount == 0 {
+		t.Error("WithExecutorMetrics: observer did not receive concurrency increment")
+	}
+	if obs.incCount != obs.decCount {
+		t.Errorf("WithExecutorMetrics: unbalanced inc/dec: inc=%d, dec=%d", obs.incCount, obs.decCount)
+	}
+}

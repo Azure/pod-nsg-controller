@@ -3,6 +3,7 @@ package azure
 import (
 	"context"
 	"errors"
+	"fmt"
 	"sync"
 	"time"
 
@@ -207,4 +208,30 @@ func (l *ARMRateLimiter) Wait(ctx context.Context, subscriptionID string) error 
 	}
 
 	return nil
+}
+
+// SetRPS updates the rate limit for all current and future per-subscription limiters.
+func (l *ARMRateLimiter) SetRPS(rps float64) error {
+	if rps <= 0 {
+		return fmt.Errorf("SetRPS: rps must be > 0, got %v", rps)
+	}
+	newBurst := int(max(1, int(ceil(rps))))
+
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.rps = rps
+	l.burst = newBurst
+	// Update all existing per-subscription limiters.
+	for _, lim := range l.limiters {
+		lim.SetLimit(rate.Limit(rps))
+		lim.SetBurst(newBurst)
+	}
+	return nil
+}
+
+// RPS returns the current configured rate limit in requests per second.
+func (l *ARMRateLimiter) RPS() float64 {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.rps
 }

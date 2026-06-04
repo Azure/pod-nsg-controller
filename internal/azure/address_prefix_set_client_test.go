@@ -975,3 +975,69 @@ func TestAddressPrefixSetClient_PutWithIfMatch_StaleETagReturns412(t *testing.T)
 		t.Errorf("expected IsPreconditionFailed error, got: %v", err)
 	}
 }
+
+// ---------------------------------------------------------------------------
+// Phase 6: ARM request operation labels use HTTP verbs (GET, PUT, DELETE)
+// ---------------------------------------------------------------------------
+
+func TestPhase6_OperationLabels_NormalizedToHTTPVerbs(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("ETag", `"test-etag"`)
+		w.Header().Set("Content-Type", "application/json")
+		switch r.Method {
+		case http.MethodGet:
+			json.NewEncoder(w).Encode(map[string]interface{}{
+				"name": "ps1",
+				"properties": map[string]interface{}{
+					"addressPrefixes": []string{"10.0.0.1/32"},
+				},
+			})
+		case http.MethodPut:
+			w.WriteHeader(http.StatusOK)
+			json.NewEncoder(w).Encode(map[string]interface{}{
+				"name": "ps1",
+				"properties": map[string]interface{}{
+					"addressPrefixes": []string{"10.0.0.1/32"},
+				},
+			})
+		case http.MethodDelete:
+			w.WriteHeader(http.StatusOK)
+		}
+	}))
+	defer srv.Close()
+
+	log := zaptest.NewLogger(t)
+	obs := &operationLabelTracker{}
+
+	client := NewAddressPrefixSetClient(log, nil, srv.Client(),
+		WithARMBaseURL(srv.URL),
+		WithARMMetrics(obs, nil),
+	)
+
+	// GET
+	_, _ = client.Get(context.Background(), "sub1", "rg1", "asg1", "ps1")
+	// PUT
+	_ = client.Put(context.Background(), "sub1", "rg1", "asg1", "ps1", []string{"10.0.0.1/32"})
+	// DELETE
+	_ = client.Delete(context.Background(), "sub1", "rg1", "asg1", "ps1")
+
+	// Phase 6 requires labels to be HTTP verbs.
+	expectedOps := []string{"GET", "PUT", "DELETE"}
+	if len(obs.operations) < 3 {
+		t.Fatalf("expected at least 3 operation observations, got %d: %v", len(obs.operations), obs.operations)
+	}
+	for i, expected := range expectedOps {
+		if obs.operations[i] != expected {
+			t.Errorf("operation[%d] = %q, want %q", i, obs.operations[i], expected)
+		}
+	}
+}
+
+// operationLabelTracker captures operation labels for assertion.
+type operationLabelTracker struct {
+	operations []string
+}
+
+func (o *operationLabelTracker) ObserveRequest(subscriptionID, operation, statusCode string, duration time.Duration) {
+	o.operations = append(o.operations, operation)
+}

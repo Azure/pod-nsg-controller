@@ -318,3 +318,95 @@ func TestPhase7_T76_RateLimiter_CollectBurstMetrics(t *testing.T) {
 		t.Errorf("T7.6: MaxDelayObserved = 0, want > 0 for throttled burst")
 	}
 }
+
+// ---------------------------------------------------------------------------
+// Phase 6: SetRPS — runtime RPS mutation
+// ---------------------------------------------------------------------------
+
+func TestPhase6_SetRPS_UpdatesExistingLimiters(t *testing.T) {
+	log := zaptest.NewLogger(t)
+	limiter := NewARMRateLimiter(log, 10)
+
+	ctx := context.Background()
+	// Warm up a subscription limiter.
+	if err := limiter.Wait(ctx, "sub-a"); err != nil {
+		t.Fatalf("Wait(sub-a) failed: %v", err)
+	}
+
+	// Update RPS.
+	err := limiter.SetRPS(50)
+	if err != nil {
+		t.Fatalf("SetRPS(50) error: %v", err)
+	}
+
+	// Verify current RPS reflects new value.
+	if got := limiter.RPS(); got != 50 {
+		t.Errorf("RPS() = %v, want 50", got)
+	}
+}
+
+func TestPhase6_SetRPS_NewSubscriptionsUseUpdatedValues(t *testing.T) {
+	log := zaptest.NewLogger(t)
+	startTime := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	clock := newFakeClock(startTime)
+
+	limiter := NewARMRateLimiter(log, 1, WithClock(clock)) // 1 RPS initially
+
+	// Update to 100 RPS.
+	if err := limiter.SetRPS(100); err != nil {
+		t.Fatalf("SetRPS(100) error: %v", err)
+	}
+
+	ctx := context.Background()
+	// A new subscription should use the updated rate. With 100 RPS and burst=100,
+	// 50 calls should be immediate.
+	for i := 0; i < 50; i++ {
+		if err := limiter.Wait(ctx, "sub-new"); err != nil {
+			t.Fatalf("Wait() call %d failed: %v", i, err)
+		}
+	}
+
+	// At 100 RPS with burst=100, all 50 calls should be within burst (no delay).
+	elapsed := clock.Now().Sub(startTime)
+	if elapsed > 0 {
+		t.Errorf("expected no delay for 50 calls at 100 RPS (burst=100), got %v", elapsed)
+	}
+}
+
+func TestPhase6_SetRPS_ZeroRejected(t *testing.T) {
+	log := zaptest.NewLogger(t)
+	limiter := NewARMRateLimiter(log, 10)
+
+	err := limiter.SetRPS(0)
+	if err == nil {
+		t.Error("expected error for SetRPS(0), got nil")
+	}
+
+	// Should still be at original value.
+	if got := limiter.RPS(); got != 10 {
+		t.Errorf("RPS() = %v after rejected SetRPS(0), want 10", got)
+	}
+}
+
+func TestPhase6_SetRPS_NegativeRejected(t *testing.T) {
+	log := zaptest.NewLogger(t)
+	limiter := NewARMRateLimiter(log, 10)
+
+	err := limiter.SetRPS(-5)
+	if err == nil {
+		t.Error("expected error for SetRPS(-5), got nil")
+	}
+
+	if got := limiter.RPS(); got != 10 {
+		t.Errorf("RPS() = %v after rejected SetRPS(-5), want 10", got)
+	}
+}
+
+func TestPhase6_RPS_ReturnsCurrentValue(t *testing.T) {
+	log := zaptest.NewLogger(t)
+	limiter := NewARMRateLimiter(log, 15.5)
+
+	if got := limiter.RPS(); got != 15.5 {
+		t.Errorf("RPS() = %v, want 15.5", got)
+	}
+}

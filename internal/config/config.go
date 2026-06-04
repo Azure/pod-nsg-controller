@@ -82,7 +82,7 @@ func Load() (*Config, error) {
 	// Parse ARM rate limit RPS.
 	rpsStr := os.Getenv("ARM_RATE_LIMIT_RPS")
 	if rpsStr == "" {
-		cfg.ARMRateLimitRPS = 10.0
+		cfg.ARMRateLimitRPS = 20.0
 	} else {
 		val, err := strconv.ParseFloat(rpsStr, 64)
 		if err != nil {
@@ -97,7 +97,7 @@ func Load() (*Config, error) {
 	// Parse max concurrent actions.
 	concStr := os.Getenv("MAX_CONCURRENT_ACTIONS")
 	if concStr == "" {
-		cfg.MaxConcurrentActions = 5
+		cfg.MaxConcurrentActions = 10
 	} else {
 		val, err := strconv.Atoi(concStr)
 		if err != nil {
@@ -185,4 +185,80 @@ func (c *Config) Validate() error {
 		return fmt.Errorf("CLUSTER_NAME must be lowercase to avoid Azure ownership collisions")
 	}
 	return nil
+}
+
+// ARMTuningConfig holds runtime-tunable ARM concurrency settings.
+type ARMTuningConfig struct {
+	ARMRateLimitRPS      float64
+	MaxConcurrentActions int
+}
+
+// LoadARMTuningConfig loads ARM tuning from mounted files (if ARM_TUNING_DIR is set)
+// or falls back to environment variables / defaults.
+func LoadARMTuningConfig() (ARMTuningConfig, error) {
+	tuning := ARMTuningConfig{
+		ARMRateLimitRPS:      20.0,
+		MaxConcurrentActions: 10,
+	}
+
+	// Try file-based tuning source first (runtime-mutable via ConfigMap mount).
+	tuningDir := os.Getenv("ARM_TUNING_DIR")
+	if tuningDir != "" {
+		rpsBytes, rpsErr := os.ReadFile(tuningDir + "/ARM_RATE_LIMIT_RPS")
+		concBytes, concErr := os.ReadFile(tuningDir + "/MAX_CONCURRENT_ACTIONS")
+
+		// If files exist, they must be valid — no silent fallback.
+		if rpsErr == nil && concErr == nil {
+			rpsVal, err := strconv.ParseFloat(strings.TrimSpace(string(rpsBytes)), 64)
+			if err != nil {
+				return ARMTuningConfig{}, errors.Wrap(err, "ARM_TUNING_DIR/ARM_RATE_LIMIT_RPS must be a valid number")
+			}
+			if rpsVal <= 0 {
+				return ARMTuningConfig{}, fmt.Errorf("ARM_TUNING_DIR/ARM_RATE_LIMIT_RPS must be > 0, got %v", rpsVal)
+			}
+			concVal, err := strconv.Atoi(strings.TrimSpace(string(concBytes)))
+			if err != nil {
+				return ARMTuningConfig{}, errors.Wrap(err, "ARM_TUNING_DIR/MAX_CONCURRENT_ACTIONS must be a valid integer")
+			}
+			if concVal < 1 {
+				return ARMTuningConfig{}, fmt.Errorf("ARM_TUNING_DIR/MAX_CONCURRENT_ACTIONS must be >= 1, got %d", concVal)
+			}
+			tuning.ARMRateLimitRPS = rpsVal
+			tuning.MaxConcurrentActions = concVal
+			return tuning, nil
+		}
+
+		// If only one file is missing, treat as partial config error.
+		if rpsErr == nil || concErr == nil {
+			if rpsErr != nil {
+				return ARMTuningConfig{}, errors.Wrap(rpsErr, "ARM_TUNING_DIR/ARM_RATE_LIMIT_RPS")
+			}
+			return ARMTuningConfig{}, errors.Wrap(concErr, "ARM_TUNING_DIR/MAX_CONCURRENT_ACTIONS")
+		}
+		// Both files absent in the directory — fall through to env/defaults.
+	}
+
+	// Fall back to environment variables.
+	if rpsStr := os.Getenv("ARM_RATE_LIMIT_RPS"); rpsStr != "" {
+		val, err := strconv.ParseFloat(rpsStr, 64)
+		if err != nil {
+			return ARMTuningConfig{}, errors.Wrap(err, "ARM_RATE_LIMIT_RPS must be a valid number")
+		}
+		if val <= 0 {
+			return ARMTuningConfig{}, fmt.Errorf("ARM_RATE_LIMIT_RPS must be > 0, got %v", val)
+		}
+		tuning.ARMRateLimitRPS = val
+	}
+	if concStr := os.Getenv("MAX_CONCURRENT_ACTIONS"); concStr != "" {
+		val, err := strconv.Atoi(concStr)
+		if err != nil {
+			return ARMTuningConfig{}, errors.Wrap(err, "MAX_CONCURRENT_ACTIONS must be a valid integer")
+		}
+		if val < 1 {
+			return ARMTuningConfig{}, fmt.Errorf("MAX_CONCURRENT_ACTIONS must be >= 1, got %d", val)
+		}
+		tuning.MaxConcurrentActions = val
+	}
+
+	return tuning, nil
 }
