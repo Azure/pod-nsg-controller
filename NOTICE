@@ -1,0 +1,289 @@
+NOTICES
+
+This project incorporates material from the projects listed below
+(Third Party IP). The original copyright notice and the license under
+which Microsoft received such Third Party IP are set forth below. Such
+licenses and notices are provided for informational purposes only.
+Microsoft licenses the Third Party IP to you under the licensing terms
+for the Microsoft product or service. Microsoft reserves all other rights
+not expressly granted under this agreement, whether by implication,
+estoppel or otherwise.
+
+---
+
+## Third Party Notices
+
+This software uses the following third-party open source components.
+Their license notices and links are provided below; full license texts are available in ThirdPartyNotices.txt.
+
+---
+
+### Azure SDK for Go
+
+- github.com/Azure/azure-sdk-for-go/sdk/azcore
+- github.com/Azure/azure-sdk-for-go/sdk/azidentity
+- github.com/Azure/azure-sdk-for-go/sdk/resourcemanager/network/armnetwork/v6
+- github.com/Azure/azure-sdk-for-go/sdk/internal
+
+Copyright (c) Microsoft Corporation.
+Licensed under the MIT License.
+https://github.com/Azure/azure-sdk-for-go/blob/main/LICENSE.txt
+
+---
+
+### Microsoft Authentication Library for Go (MSAL)
+
+- github.com/AzureAD/microsoft-authentication-library-for-go
+
+Copyright (c) Microsoft Corporation.
+Licensed under the MIT License.
+https://github.com/AzureAD/microsoft-authentication-library-for-go/blob/main/LICENSE
+
+---
+
+### go-logr/logr
+
+- github.com/go-logr/logr
+
+Copyright 2019 The logr Authors.
+Licensed under the Apache License, Version 2.0.
+https://github.com/go-logr/logr/blob/master/LICENSE
+
+---
+
+### go-logr/zapr
+
+- github.com/go-logr/zapr
+
+Copyright 2019 The logr Authors.
+Licensed under the Apache License, Version 2.0.
+https://github.com/go-logr/zapr/blob/master/LICENSE
+
+---
+
+### pkg/errors
+
+- github.com/pkg/errors
+
+Copyright (c) 2015, Dave Cheney.
+Licensed under the BSD 2-Clause "Simplified" License.
+https://github.com/pkg/errors/blob/master/LICENSE
+
+---
+
+### uber-go/zap
+
+- go.uber.org/zap
+- go.uber.org/multierr
+
+Copyright (c) 2016-2024 Uber Technologies, Inc.
+Licensed under the MIT License.
+https://github.com/uber-go/zap/blob/master/LICENSE
+
+---
+
+### Kubernetes Libraries
+
+- k8s.io/api
+- k8s.io/apimachinery
+- k8s.io/apiextensions-apiserver
+- k8s.io/client-go
+- k8s.io/klog/v2
+- k8s.io/kube-openapi
+- k8s.io/utils
+
+Copyright The Kubernetes Authors.
+Licensed under the Apache License, Version 2.0.
+https://github.com/kubernetes/kubernetes/blob/master/LICENSE
+
+---
+
+### controller-runtime
+
+- sigs.k8s.io/controller-runtime
+
+Copyright The Kubernetes Authors.
+Licensed under the Apache License, Version 2.0.
+https://github.com/kubernetes-sigs/controller-runtime/blob/main/LICENSE
+
+---
+
+### golang-jwt/jwt
+
+- github.com/golang-jwt/jwt/v5
+
+Copyright (c) 2012 Dave Grijalva; 2021 golang-jwt maintainers.
+Licensed under the MIT License.
+https://github.com/golang-jwt/jwt/blob/main/LICENSE
+
+---
+
+### google/uuid
+
+- github.com/google/uuid
+
+Copyright (c) 2009, 2014 Google Inc.
+Licensed under the BSD 3-Clause License.
+https://github.com/google/uuid/blob/master/LICENSE
+
+---
+
+### google/go-cmp
+
+- github.com/google/go-cmp
+
+Copyright (c) 2017 The Go Authors.
+Licensed under the BSD 3-Clause License.
+https://github.com/google/go-cmp/blob/master/LICENSE
+
+---
+
+### fsnotify/fsnotify
+
+- github.com/fsnotify/fsnotify
+
+Copyright (c) 2012-2019 fsnotify Authors.
+Licensed under the BSD 3-Clause License.
+https://github.com/fsnotify/fsnotify/blob/main/LICENSE
+
+---
+
+### prometheus/client_golang
+
+- github.com/prometheus/client_golang
+- github.com/prometheus/client_model
+- github.com/prometheus/common
+- github.com/prometheus/procfs
+
+Copyright 2012-2015 The Prometheus Authors.
+Licensed under the Apache License, Version 2.0.
+https://github.com/prometheus/client_golang/blob/main/LICENSE
+
+---
+
+### spf13/pflag
+
+- github.com/spf13/pflag
+
+Copyright (c) 2012 Alex Ogier; Copyright (c) 2012 The Go Authors.
+Licensed under the BSD 3-Clause License.
+https://github.com/spf13/pflag/blob/master/LICENSE
+
+---
+
+### golang.org/x libraries
+
+- golang.org/x/crypto
+- golang.org/x/exp
+- golang.org/x/net
+- golang.org/x/oauth2
+- golang.org/x/sys
+- golang.org/x/term
+- golang.org/x/text
+- golang.org/x/time
+
+Copyright The Go Authors.
+Licensed under the BSD 3-Clause License.
+https://cs.opensource.google/go/x/crypto/+/master:LICENSE
+
+---
+
+### google.golang.org/protobuf
+
+- google.golang.org/protobuf
+
+Copyright (c) 2018 The Go Authors.
+Licensed under the BSD 3-Clause License.
+https://github.com/protocolbuffers/protobuf-go/blob/master/LICENSE
+
+---
+
+### gogo/protobuf
+
+- github.com/gogo/protobuf
+
+Copyright (c) 2013, The GoGo Authors.
+Licensed under the BSD 3-Clause License.
+https://github.com/gogo/protobuf/blob/master/LICENSE
+
+---
+
+### json-iterator/go
+
+- github.com/json-iterator/go
+
+Copyright (c) 2016 json-iterator.
+Licensed under the MIT License.
+https://github.com/json-iterator/go/blob/master/LICENSE
+
+---
+
+### imdario/mergo
+
+- github.com/imdario/mergo
+
+Copyright (c) 2013 Dario Castañé.
+Licensed under the BSD 3-Clause License.
+https://github.com/imdario/mergo/blob/master/LICENSE
+
+---
+
+### gopkg.in/yaml.v2 / gopkg.in/yaml.v3
+
+- gopkg.in/yaml.v2
+- gopkg.in/yaml.v3
+
+Copyright (c) 2006-2011 Kirill Simonov; Copyright (c) 2011-2019 Canonical Ltd.
+Licensed under the MIT License and Apache License, Version 2.0.
+https://github.com/go-yaml/yaml/blob/v3/LICENSE
+
+---
+
+### evanphx/json-patch
+
+- github.com/evanphx/json-patch/v5
+- gopkg.in/evanphx/json-patch.v4
+
+Copyright (c) 2014, Evan Phoenix.
+Licensed under the BSD 3-Clause License.
+https://github.com/evanphx/json-patch/blob/master/LICENSE
+
+---
+
+### fxamacker/cbor
+
+- github.com/fxamacker/cbor/v2
+
+Copyright (c) 2019-2024 Faye Amacker.
+Licensed under the MIT License.
+https://github.com/fxamacker/cbor/blob/master/LICENSE
+
+---
+
+### sigs.k8s.io/json
+
+- sigs.k8s.io/json
+
+Copyright The Kubernetes Authors.
+Licensed under the Apache License, Version 2.0 and BSD 3-Clause License.
+https://github.com/kubernetes-sigs/json/blob/main/LICENSE
+
+---
+
+### sigs.k8s.io/yaml
+
+- sigs.k8s.io/yaml
+
+Copyright The Kubernetes Authors.
+Licensed under the MIT License and Apache License, Version 2.0.
+https://github.com/kubernetes-sigs/yaml/blob/master/LICENSE
+
+---
+
+### sigs.k8s.io/structured-merge-diff
+
+- sigs.k8s.io/structured-merge-diff/v4
+
+Copyright The Kubernetes Authors.
+Licensed under the Apache License, Version 2.0.
+https://github.com/kubernetes-sigs/structured-merge-diff/blob/master/LICENSE
