@@ -16,7 +16,7 @@
 
 ## Checklist
 
-- [ ] I have read the [CONTRIBUTING](../CONTRIBUTING.md) guide
+- [ ] I have read the [CONTRIBUTING](/CONTRIBUTING.md) guide
 - [ ] My code follows the project's coding conventions
 - [ ] I have added/updated tests that prove my fix is effective or my feature works
 - [ ] All new and existing tests pass (`make test`)
