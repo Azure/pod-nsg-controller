@@ -63,7 +63,7 @@ expressly granted herein, whether by implication, estoppel or otherwise.
 54. gopkg.in/evanphx/json-patch.v4 (BSD-3-Clause)
 55. gopkg.in/inf.v0 (BSD-3-Clause)
 56. gopkg.in/yaml.v2 (Apache-2.0)
-57. gopkg.in/yaml.v3 (MIT)
+57. gopkg.in/yaml.v3 (MIT AND Apache-2.0)
 58. k8s.io/api (Apache-2.0)
 59. k8s.io/apiextensions-apiserver (Apache-2.0)
 60. k8s.io/apimachinery (Apache-2.0)
