@@ -141,8 +141,8 @@ type DesiredStateRecomputeArtifacts struct {
 
 // ComputeDesiredStateRecomputeArtifacts computes all recompute-derived data in
 // a single pass over namespace pods. This replaces the multi-pass approach of
-// calling ComputeMatchedPodsByMapping + ComputeDesiredStateWithSnapshot +
-// hasPendingIPPodsFromList separately.
+// calling ComputeMatchedPodsByMapping + ComputeDesiredStateWithSnapshot
+// separately.
 //
 // PARITY CONTRACT: The artifacts produced here must remain semantically
 // equivalent to the incremental cache mutation paths (OnPodAdd, OnPodUpdate,

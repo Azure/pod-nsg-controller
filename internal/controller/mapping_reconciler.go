@@ -1167,11 +1167,6 @@ func hasPendingIPPods(rules []v1alpha1.Mapping, pods []corev1.Pod) bool {
 	return false
 }
 
-// hasPendingIPPodsFromList checks if any matched pod has no IP (spec variant).
-func hasPendingIPPodsFromList(spec v1alpha1.PodASGMappingSpec, pods []corev1.Pod) bool {
-	return hasPendingIPPods(spec.Mappings, pods)
-}
-
 func promptRequeueAfter(resyncInterval time.Duration) time.Duration {
 	const defaultDelay = time.Second
 
