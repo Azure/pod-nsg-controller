@@ -290,7 +290,9 @@ func (c *AddressPrefixSetClient) Get(ctx context.Context, subscriptionID, resour
 	return c.getWithOptions(ctx, subscriptionID, resourceGroup, asgName, prefixSetName, false)
 }
 
-// getInternal performs a GET without emitting metrics (used by Put's internal ETag fetch).
+// getInternal performs a GET that suppresses metrics for successful responses
+// (used by Put's internal ETag fetch). Transport errors and non-2xx responses
+// are still emitted to keep failures observable.
 func (c *AddressPrefixSetClient) getInternal(ctx context.Context, subscriptionID, resourceGroup, asgName, prefixSetName string) (*AddressPrefixSet, error) {
 	return c.getWithOptions(ctx, subscriptionID, resourceGroup, asgName, prefixSetName, true)
 }
