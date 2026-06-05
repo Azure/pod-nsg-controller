@@ -5,6 +5,17 @@ metadata:
   labels:
     app.kubernetes.io/name: pod-nsg-controller
 ---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: pod-nsg-controller-arm-tuning
+  namespace: pod-nsg-controller-system
+  labels:
+    app.kubernetes.io/name: pod-nsg-controller
+data:
+  ARM_RATE_LIMIT_RPS: "20"
+  MAX_CONCURRENT_ACTIONS: "10"
+---
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -66,10 +77,12 @@ spec:
                 secretKeyRef:
                   name: pod-nsg-controller-azure
                   key: nsg-name
-            - name: ARM_RATE_LIMIT_RPS
-              value: "10"
-            - name: MAX_CONCURRENT_ACTIONS
-              value: "5"
+            - name: ARM_TUNING_DIR
+              value: "/etc/pod-nsg-controller/arm-tuning"
+          volumeMounts:
+            - name: arm-tuning
+              mountPath: /etc/pod-nsg-controller/arm-tuning
+              readOnly: true
           livenessProbe:
             httpGet:
               path: /healthz
@@ -95,3 +108,7 @@ spec:
             capabilities:
               drop:
                 - ALL
+      volumes:
+        - name: arm-tuning
+          configMap:
+            name: pod-nsg-controller-arm-tuning

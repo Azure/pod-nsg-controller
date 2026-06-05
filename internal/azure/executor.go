@@ -43,6 +43,18 @@ func armOperation(kind engine.ActionKind) ARMOperation {
 	}
 }
 
+// metricOperationLabel returns the HTTP verb for executor metrics labels.
+func metricOperationLabel(kind engine.ActionKind) string {
+	switch kind {
+	case engine.CreatePrefixSet, engine.UpdatePrefixSet, engine.PatchPrefixSet:
+		return "PUT"
+	case engine.DeletePrefixSet:
+		return "DELETE"
+	default:
+		return "UNKNOWN"
+	}
+}
+
 // Executor runs engine actions against Azure with bounded concurrency and ETag retry.
 type Executor struct {
 	log                   *zap.Logger
@@ -50,7 +62,9 @@ type Executor struct {
 	maxParallel           int
 	maxRetries            int
 	retryObserver         armRetryObserver
+	metricsObserver       ARMExecutorObserver
 	patchThresholdPercent int
+	mu                    sync.RWMutex
 }
 
 // NewExecutor creates an Executor with the given concurrency bound.
@@ -75,7 +89,11 @@ func NewExecutor(log *zap.Logger, factory AddressPrefixSetClientFactory, maxPara
 func (e *Executor) Execute(ctx context.Context, actions []engine.Action) []ActionResult {
 	results := make([]ActionResult, len(actions))
 
-	sem := make(chan struct{}, e.maxParallel)
+	e.mu.RLock()
+	maxParallel := e.maxParallel
+	e.mu.RUnlock()
+
+	sem := make(chan struct{}, maxParallel)
 	var wg sync.WaitGroup
 
 	for i, action := range actions {
@@ -92,13 +110,24 @@ func (e *Executor) Execute(ctx context.Context, actions []engine.Action) []Actio
 				return
 			}
 
+			if e.metricsObserver != nil {
+				e.metricsObserver.IncConcurrentActions()
+				defer e.metricsObserver.DecConcurrentActions()
+			}
+
 			client, err := e.factory.ForSubscription(act.Target.SubscriptionID)
 			if err != nil {
 				results[idx] = ActionResult{Action: act, Success: false, Err: pkgerrors.Wrap(err, "getting client")}
 				return
 			}
 
+			start := time.Now()
 			outcome := e.executeWithETagRetry(ctx, client, act)
+			if e.metricsObserver != nil {
+				op := metricOperationLabel(outcome.finalActionKind)
+				e.metricsObserver.ObserveCallDuration(act.Target.SubscriptionID, op, time.Since(start))
+			}
+
 			results[idx] = ActionResult{
 				Action:          act,
 				Success:         outcome.err == nil,
@@ -208,6 +237,9 @@ func (e *Executor) executeWithETagRetry(ctx context.Context, client AddressPrefi
 		// Emit etag-conflict retry metric
 		if e.retryObserver != nil {
 			e.retryObserver.ObserveRetry(action.Target.SubscriptionID, string(armOperation(action.Kind)), "etag-conflict")
+		}
+		if e.metricsObserver != nil {
+			e.metricsObserver.ObserveETagConflict(action.Target.SubscriptionID, metricOperationLabel(action.Kind))
 		}
 
 		if attempt == e.maxRetries {
@@ -324,4 +356,22 @@ func buildSingleTargetActual(action engine.Action, current *AddressPrefixSet, ge
 	return map[engine.ASGTarget]engine.ActualPrefixSet{
 		action.Target: {IPs: ips},
 	}, nil
+}
+
+// SetMaxParallel updates the maximum concurrency for subsequent Execute calls.
+func (e *Executor) SetMaxParallel(v int) error {
+	if v < 1 {
+		return fmt.Errorf("SetMaxParallel: value must be >= 1, got %d", v)
+	}
+	e.mu.Lock()
+	e.maxParallel = v
+	e.mu.Unlock()
+	return nil
+}
+
+// MaxParallel returns the current max parallel setting.
+func (e *Executor) MaxParallel() int {
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+	return e.maxParallel
 }

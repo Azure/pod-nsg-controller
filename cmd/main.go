@@ -1,6 +1,8 @@
 package main
 
 import (
+	"context"
+	"errors"
 	"flag"
 	"os"
 	"time"
@@ -64,6 +66,24 @@ func main() {
 		os.Exit(1)
 	}
 
+	// Load ARM tuning from file-backed source (ConfigMap mount) at startup,
+	// so the controller respects mounted tuning values from the first request.
+	armTuning, err := config.LoadARMTuningConfig()
+	if err != nil {
+		if errors.Is(err, config.ErrTuningFilesAbsent) {
+			// At startup, absent files are non-fatal — fall back to env/defaults.
+			setupLog.Info("ARM tuning files not found, falling back to env/defaults")
+			armTuning, err = config.LoadARMTuningFromEnv()
+			if err != nil {
+				setupLog.Error(err, "unable to load ARM tuning from environment")
+				os.Exit(1)
+			}
+		} else {
+			setupLog.Error(err, "unable to load ARM tuning configuration")
+			os.Exit(1)
+		}
+	}
+
 	// Register metrics with the controller-runtime Prometheus registry.
 	rec, err := metrics.RegisterWith(ctrlmetrics.Registry)
 	if err != nil {
@@ -85,7 +105,7 @@ func main() {
 
 	rateLimiter := azure.NewARMRateLimiter(
 		zapLog.With(zap.String("component", "azure-rate-limiter")),
-		cfg.ARMRateLimitRPS,
+		armTuning.ARMRateLimitRPS,
 		azure.WithRateLimitMetrics(rec.ARM),
 	)
 
@@ -99,8 +119,9 @@ func main() {
 	executor := azure.NewExecutor(
 		zapLog.With(zap.String("component", "azure-executor")),
 		prefixSetFactory,
-		cfg.MaxConcurrentActions,
+		armTuning.MaxConcurrentActions,
 		azure.WithExecutorRetryMetrics(rec.ARM),
+		azure.WithExecutorMetrics(rec.ARM),
 		azure.WithPatchThresholdPercent(cfg.PatchThresholdPercent),
 	)
 
@@ -178,6 +199,19 @@ func main() {
 		os.Exit(1)
 	}
 
+	// Register the ARM tuning reloader as a manager Runnable for runtime updates.
+	tuningReloader := newARMTuningReloader(
+		zapLog.Named("arm-tuning-reloader"),
+		30*time.Second,
+		armTuning,
+		executor,
+		rateLimiter,
+	)
+	if err := mgr.Add(tuningReloader); err != nil {
+		setupLog.Error(err, "unable to add ARM tuning reloader")
+		os.Exit(1)
+	}
+
 	if err := mgr.AddHealthzCheck("healthz", healthz.Ping); err != nil {
 		setupLog.Error(err, "unable to set up health check")
 		os.Exit(1)
@@ -203,5 +237,85 @@ func main() {
 	if err := mgr.Start(ctrl.SetupSignalHandler()); err != nil {
 		setupLog.Error(err, "problem running manager")
 		os.Exit(1)
+	}
+}
+
+// armTuningReloader polls the ARM tuning source and applies runtime updates
+// to the executor and rate limiter without requiring a controller restart.
+type armTuningReloader struct {
+	log      *zap.Logger
+	interval time.Duration
+	current  config.ARMTuningConfig
+	executor *azure.Executor
+	limiter  *azure.ARMRateLimiter
+}
+
+func newARMTuningReloader(
+	log *zap.Logger,
+	interval time.Duration,
+	initial config.ARMTuningConfig,
+	executor *azure.Executor,
+	limiter *azure.ARMRateLimiter,
+) *armTuningReloader {
+	return &armTuningReloader{
+		log:      log,
+		interval: interval,
+		current:  initial,
+		executor: executor,
+		limiter:  limiter,
+	}
+}
+
+func (r *armTuningReloader) Start(ctx context.Context) error {
+	ticker := time.NewTicker(r.interval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return nil
+		case <-ticker.C:
+			r.reload()
+		}
+	}
+}
+
+func (r *armTuningReloader) reload() {
+	result := config.LoadARMTuningForReload()
+	if result.NotConfigured {
+		return
+	}
+	if result.FilesAbsent {
+		r.log.Info("ARM tuning files absent at runtime, keeping current values")
+		return
+	}
+
+	// Apply valid RPS independently.
+	if result.ARMRateLimitRPS != nil && *result.ARMRateLimitRPS != r.current.ARMRateLimitRPS {
+		if err := r.limiter.SetRPS(*result.ARMRateLimitRPS); err != nil {
+			r.log.Error("failed to update ARM rate limit RPS", zap.Error(err))
+		} else {
+			r.log.Info("updated ARM rate limit RPS",
+				zap.Float64("old", r.current.ARMRateLimitRPS),
+				zap.Float64("new", *result.ARMRateLimitRPS),
+			)
+			r.current.ARMRateLimitRPS = *result.ARMRateLimitRPS
+		}
+	} else if result.ARMRateLimitRPSError != nil {
+		r.log.Error("failed to load ARM rate limit RPS, keeping current value", zap.Error(result.ARMRateLimitRPSError))
+	}
+
+	// Apply valid concurrency independently.
+	if result.MaxConcurrentActions != nil && *result.MaxConcurrentActions != r.current.MaxConcurrentActions {
+		if err := r.executor.SetMaxParallel(*result.MaxConcurrentActions); err != nil {
+			r.log.Error("failed to update max concurrent actions", zap.Error(err))
+		} else {
+			r.log.Info("updated max concurrent actions",
+				zap.Int("old", r.current.MaxConcurrentActions),
+				zap.Int("new", *result.MaxConcurrentActions),
+			)
+			r.current.MaxConcurrentActions = *result.MaxConcurrentActions
+		}
+	} else if result.MaxConcurrentActionsErr != nil {
+		r.log.Error("failed to load max concurrent actions, keeping current value", zap.Error(result.MaxConcurrentActionsErr))
 	}
 }

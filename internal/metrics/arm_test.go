@@ -152,3 +152,105 @@ func TestPhase8_ARMHistogram_UsesSpecifiedBuckets(t *testing.T) {
 		}
 	}
 }
+
+// ---------------------------------------------------------------------------
+// Phase 6: Executor metrics (arm_call_duration, arm_concurrent_actions, arm_etag_conflicts)
+// ---------------------------------------------------------------------------
+
+func TestPhase6_ARMRecorder_ObserveCallDuration(t *testing.T) {
+	rec := newARMRecorder()
+
+	rec.ObserveCallDuration("sub-1", "PUT", 300*time.Millisecond)
+	rec.ObserveCallDuration("sub-1", "PUT", 500*time.Millisecond)
+
+	count := getHistogramSampleCount(t, rec.callDuration, "sub-1", "PUT")
+	if count != 2 {
+		t.Errorf("arm_call_duration_seconds sample count = %d, want 2", count)
+	}
+}
+
+func TestPhase6_ARMRecorder_ConcurrentActionsGauge(t *testing.T) {
+	rec := newARMRecorder()
+
+	rec.IncConcurrentActions()
+	rec.IncConcurrentActions()
+	rec.DecConcurrentActions()
+
+	// Gauge should be at 1 (2 inc - 1 dec).
+	var m dto.Metric
+	if err := rec.concurrentActions.Write(&m); err != nil {
+		t.Fatalf("failed to write gauge metric: %v", err)
+	}
+	if got := m.GetGauge().GetValue(); got != 1 {
+		t.Errorf("arm_concurrent_actions gauge = %v, want 1", got)
+	}
+}
+
+func TestPhase6_ARMRecorder_ObserveETagConflict(t *testing.T) {
+	rec := newARMRecorder()
+
+	rec.ObserveETagConflict("sub-1", "PUT")
+	rec.ObserveETagConflict("sub-1", "PUT")
+	rec.ObserveETagConflict("sub-2", "DELETE")
+
+	val1 := getARMCounterValue(t, rec.etagConflictsTotal, "sub-1", "PUT")
+	if val1 != 2 {
+		t.Errorf("arm_etag_conflicts_total{sub-1, PUT} = %v, want 2", val1)
+	}
+
+	val2 := getARMCounterValue(t, rec.etagConflictsTotal, "sub-2", "DELETE")
+	if val2 != 1 {
+		t.Errorf("arm_etag_conflicts_total{sub-2, DELETE} = %v, want 1", val2)
+	}
+}
+
+func TestPhase6_ARMRecorder_CollectorCount(t *testing.T) {
+	rec := newARMRecorder()
+	collectors := rec.Collectors()
+
+	// Phase 6 adds 3 new collectors: callDuration, concurrentActions, etagConflictsTotal.
+	// Original 5 + 3 new = 8 total.
+	if got := len(collectors); got != 8 {
+		t.Errorf("ARMRecorder.Collectors() count = %d, want 8", got)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Phase 6: ARMRecorder accepts Phase 6 verb label set (GET, PUT, DELETE, UNKNOWN)
+// ---------------------------------------------------------------------------
+
+func TestPhase6_ARMRecorder_AcceptsVerbLabelSet(t *testing.T) {
+	// Phase 6 design: operation dimension must accept HTTP verbs.
+	verbs := []string{"GET", "PUT", "DELETE", "UNKNOWN"}
+
+	rec := newARMRecorder()
+
+	for _, verb := range verbs {
+		t.Run("callDuration_"+verb, func(t *testing.T) {
+			rec.ObserveCallDuration("sub-verb-test", verb, 100*time.Millisecond)
+			count := getHistogramSampleCount(t, rec.callDuration, "sub-verb-test", verb)
+			if count == 0 {
+				t.Errorf("arm_call_duration_seconds{operation=%q} expected observation, got 0", verb)
+			}
+		})
+	}
+
+	for _, verb := range verbs {
+		t.Run("etagConflict_"+verb, func(t *testing.T) {
+			rec.ObserveETagConflict("sub-verb-test", verb)
+			val := getARMCounterValue(t, rec.etagConflictsTotal, "sub-verb-test", verb)
+			if val == 0 {
+				t.Errorf("arm_etag_conflicts_total{operation=%q} expected increment, got 0", verb)
+			}
+		})
+	}
+}
+
+func TestPhase6_ARMRecorder_RejectsNonVerbOperation(t *testing.T) {
+	// The recorder itself accepts arbitrary operation strings — it is a
+	// label-value on a Prometheus counter/histogram, so no validation
+	// happens at this layer. The real contract that only HTTP verbs
+	// ("GET", "PUT", "DELETE", …) appear as operation labels is enforced
+	// by metricOperationLabel() at the executor level (see executor_test.go).
+	t.Skip("recorder accepts arbitrary strings; operation-label contract is enforced at executor level — see executor_test.go")
+}

@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -318,4 +319,117 @@ type fakeRateLimitObserver struct {
 func (f *fakeRateLimitObserver) ObserveRateLimitDelay(subscriptionID string, delay time.Duration) {
 	f.delayCount++
 	f.delays = append(f.delays, delay)
+}
+
+// ---------------------------------------------------------------------------
+// Phase 6: WithExecutorMetrics wiring assertion
+// ---------------------------------------------------------------------------
+
+func TestPhase6_WithExecutorMetrics_WiresObserver(t *testing.T) {
+	log := zaptest.NewLogger(t)
+	factory := newStubFactory()
+	client := newStubClient()
+	factory.Register("sub1", client)
+
+	obs := &fakeExecutorMetricsObserver{}
+	executor := NewExecutor(log, factory, 1, WithExecutorMetrics(obs))
+
+	actions := []engine.Action{
+		{
+			Kind:       engine.CreatePrefixSet,
+			Target:     engine.ASGTarget{SubscriptionID: "sub1", ResourceGroup: "rg1", ASGName: "asg1", PrefixSetName: "ps1"},
+			DesiredIPs: []string{"10.0.0.1/32"},
+		},
+	}
+
+	results := executor.Execute(context.Background(), actions)
+	if len(results) != 1 || !results[0].Success {
+		t.Fatalf("expected success, got: %+v", results)
+	}
+
+	// WithExecutorMetrics should have wired the observer so it receives calls.
+	if obs.durationCount == 0 {
+		t.Error("WithExecutorMetrics: observer did not receive duration observation")
+	}
+	if obs.incCount == 0 {
+		t.Error("WithExecutorMetrics: observer did not receive concurrency increment")
+	}
+	if obs.incCount != obs.decCount {
+		t.Errorf("WithExecutorMetrics: unbalanced inc/dec: inc=%d, dec=%d", obs.incCount, obs.decCount)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Phase 6: WithExecutorMetrics — captured operation labels are HTTP verbs
+// ---------------------------------------------------------------------------
+
+func TestPhase6_WithExecutorMetrics_OperationLabelsAreHTTPVerbs(t *testing.T) {
+	log := zaptest.NewLogger(t)
+	factory := newStubFactory()
+	client := newStubClient()
+	factory.Register("sub1", client)
+
+	obs := &labelTrackingObserver{}
+	executor := NewExecutor(log, factory, 1, WithExecutorMetrics(obs))
+
+	actions := []engine.Action{
+		{
+			Kind:       engine.CreatePrefixSet,
+			Target:     engine.ASGTarget{SubscriptionID: "sub1", ResourceGroup: "rg1", ASGName: "asg1", PrefixSetName: "ps1"},
+			DesiredIPs: []string{"10.0.0.1/32"},
+		},
+	}
+
+	results := executor.Execute(context.Background(), actions)
+	if len(results) != 1 || !results[0].Success {
+		t.Fatalf("expected success, got: %+v", results)
+	}
+
+	obs.mu.Lock()
+	defer obs.mu.Unlock()
+	// Phase 6: operation labels emitted to observer must be HTTP verbs.
+	if len(obs.operations) == 0 {
+		t.Fatal("no operation labels captured by observer")
+	}
+	validVerbs := map[string]bool{"PUT": true, "DELETE": true, "UNKNOWN": true, "GET": true}
+	for i, op := range obs.operations {
+		if !validVerbs[op] {
+			t.Errorf("obs.operations[%d] = %q, want HTTP verb (PUT/DELETE/UNKNOWN)", i, op)
+		}
+	}
+}
+
+// labelTrackingObserver captures operation labels for wiring assertions.
+type labelTrackingObserver struct {
+	mu            sync.Mutex
+	operations    []string
+	durationCount int
+	incCount      int
+	decCount      int
+	etagOps       []string
+}
+
+func (o *labelTrackingObserver) ObserveCallDuration(subscriptionID, operation string, d time.Duration) {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	o.operations = append(o.operations, operation)
+	o.durationCount++
+}
+
+func (o *labelTrackingObserver) IncConcurrentActions() {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	o.incCount++
+}
+
+func (o *labelTrackingObserver) DecConcurrentActions() {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	o.decCount++
+}
+
+func (o *labelTrackingObserver) ObserveETagConflict(subscriptionID, operation string) {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	o.etagOps = append(o.etagOps, operation)
 }

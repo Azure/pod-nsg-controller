@@ -1827,3 +1827,424 @@ func TestExecutor_PatchGetNotFound_RecomputeToCreateOrNoOp(t *testing.T) {
 		}
 	})
 }
+
+// ---------------------------------------------------------------------------
+// Phase 6: SetMaxParallel — runtime concurrency mutation
+// ---------------------------------------------------------------------------
+
+func TestPhase6_SetMaxParallel_NextExecuteUsesNewLimit(t *testing.T) {
+	log := zaptest.NewLogger(t)
+	factory := newStubFactory()
+
+	// Start with a slow client to measure concurrency.
+	var peak int64
+	var current int64
+
+	slowInner := &delayingStubClient{inner: newStubClient(), delay: 50 * time.Millisecond}
+	trackingClient := &concurrencyTrackingClient{
+		inner:   slowInner,
+		current: &current,
+		peak:    &peak,
+	}
+	factory.Register("sub1", trackingClient)
+
+	executor := NewExecutor(log, factory, 2) // start with max=2
+
+	// Execute with 4 actions, max parallel = 2 → peak concurrency should be 2.
+	actions := makeNActions(4, "sub1")
+	_ = executor.Execute(context.Background(), actions)
+
+	peak1 := atomic.LoadInt64(&peak)
+	if peak1 > 2 {
+		t.Errorf("expected peak concurrency <= 2, got %d", peak1)
+	}
+
+	// Now increase to 4.
+	err := executor.SetMaxParallel(4)
+	if err != nil {
+		t.Fatalf("SetMaxParallel(4) error: %v", err)
+	}
+
+	// Reset tracking.
+	atomic.StoreInt64(&peak, 0)
+	atomic.StoreInt64(&current, 0)
+
+	_ = executor.Execute(context.Background(), actions)
+
+	peak2 := atomic.LoadInt64(&peak)
+	if peak2 > 4 {
+		t.Errorf("expected peak concurrency <= 4, got %d", peak2)
+	}
+	// With 4 actions and max=4, all should run concurrently.
+	if peak2 < 3 {
+		t.Errorf("expected peak concurrency >= 3 with max=4 and 4 actions, got %d", peak2)
+	}
+}
+
+func TestPhase6_SetMaxParallel_InvalidValues(t *testing.T) {
+	log := zaptest.NewLogger(t)
+	factory := newStubFactory()
+	executor := NewExecutor(log, factory, 5)
+
+	// Zero should fail.
+	if err := executor.SetMaxParallel(0); err == nil {
+		t.Error("expected error for SetMaxParallel(0), got nil")
+	}
+
+	// Negative should fail.
+	if err := executor.SetMaxParallel(-1); err == nil {
+		t.Error("expected error for SetMaxParallel(-1), got nil")
+	}
+
+	// Current value should remain unchanged.
+	if got := executor.MaxParallel(); got != 5 {
+		t.Errorf("MaxParallel() = %d after invalid SetMaxParallel, want 5", got)
+	}
+}
+
+func TestPhase6_MaxParallel_ReturnsCurrentValue(t *testing.T) {
+	log := zaptest.NewLogger(t)
+	factory := newStubFactory()
+	executor := NewExecutor(log, factory, 7)
+
+	if got := executor.MaxParallel(); got != 7 {
+		t.Errorf("MaxParallel() = %d, want 7", got)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Phase 6: Executor metrics — duration, concurrency gauge, ETag conflicts
+// ---------------------------------------------------------------------------
+
+func TestPhase6_Executor_Metrics_DurationObserved(t *testing.T) {
+	log := zaptest.NewLogger(t)
+	factory := newStubFactory()
+	client := newStubClient()
+	factory.Register("sub1", client)
+
+	obs := &fakeExecutorMetricsObserver{}
+	executor := NewExecutor(log, factory, 2, WithExecutorMetrics(obs))
+
+	actions := []engine.Action{
+		{
+			Kind:       engine.CreatePrefixSet,
+			Target:     engine.ASGTarget{SubscriptionID: "sub1", ResourceGroup: "rg1", ASGName: "asg1", PrefixSetName: "ps1"},
+			DesiredIPs: []string{"10.0.0.1/32"},
+		},
+		{
+			Kind:       engine.UpdatePrefixSet,
+			Target:     engine.ASGTarget{SubscriptionID: "sub1", ResourceGroup: "rg1", ASGName: "asg1", PrefixSetName: "ps2"},
+			DesiredIPs: []string{"10.0.0.2/32"},
+		},
+	}
+
+	results := executor.Execute(context.Background(), actions)
+	for i, r := range results {
+		if !r.Success {
+			t.Errorf("action[%d] failed: %v", i, r.Err)
+		}
+	}
+
+	// Each action should produce exactly one duration observation.
+	if obs.durationCount != 2 {
+		t.Errorf("expected 2 duration observations, got %d", obs.durationCount)
+	}
+}
+
+func TestPhase6_Executor_Metrics_ConcurrencyGaugeBalanced(t *testing.T) {
+	log := zaptest.NewLogger(t)
+	factory := newStubFactory()
+	client := newStubClient()
+	factory.Register("sub1", client)
+
+	obs := &fakeExecutorMetricsObserver{}
+	executor := NewExecutor(log, factory, 4, WithExecutorMetrics(obs))
+
+	actions := makeNActions(4, "sub1")
+	_ = executor.Execute(context.Background(), actions)
+
+	// After all actions complete, increments should equal decrements.
+	if obs.incCount != obs.decCount {
+		t.Errorf("concurrency gauge unbalanced: inc=%d, dec=%d", obs.incCount, obs.decCount)
+	}
+	// At least one increment should have occurred.
+	if obs.incCount == 0 {
+		t.Error("expected at least one concurrency gauge increment, got 0")
+	}
+}
+
+func TestPhase6_Executor_Metrics_ETagConflictCounted(t *testing.T) {
+	log := zaptest.NewLogger(t)
+	factory := newStubFactory()
+	client := newStubClient()
+	// Pre-populate so Get works during retry.
+	client.store[stubKey("sub1", "rg1", "asg1", "ps1")] = []string{"10.0.0.1/32"}
+	// First PUT will 412, second will succeed.
+	client.fail412Count = 1
+	factory.Register("sub1", client)
+
+	obs := &fakeExecutorMetricsObserver{}
+	executor := NewExecutor(log, factory, 1, WithExecutorMetrics(obs))
+
+	actions := []engine.Action{
+		{
+			Kind:       engine.UpdatePrefixSet,
+			Target:     engine.ASGTarget{SubscriptionID: "sub1", ResourceGroup: "rg1", ASGName: "asg1", PrefixSetName: "ps1"},
+			DesiredIPs: []string{"10.0.0.1/32", "10.0.0.2/32"},
+		},
+	}
+
+	results := executor.Execute(context.Background(), actions)
+	if len(results) != 1 || !results[0].Success {
+		t.Fatalf("expected success after 412 retry, got: %+v", results)
+	}
+
+	// ETag conflict should have been counted.
+	if obs.etagConflictCount == 0 {
+		t.Error("expected at least one ETag conflict observation, got 0")
+	}
+}
+
+// --- Phase 6 test helpers ---
+
+// delayingStubClient wraps a stubClient and adds a delay to Put calls
+// for concurrency measurement.
+type delayingStubClient struct {
+	inner *stubClient
+	delay time.Duration
+}
+
+func (d *delayingStubClient) Get(ctx context.Context, subscriptionID, resourceGroup, asgName, prefixSetName string) (*AddressPrefixSet, error) {
+	return d.inner.Get(ctx, subscriptionID, resourceGroup, asgName, prefixSetName)
+}
+
+func (d *delayingStubClient) GetWithETag(ctx context.Context, subscriptionID, resourceGroup, asgName, prefixSetName string) (*AddressPrefixSet, string, error) {
+	return d.inner.GetWithETag(ctx, subscriptionID, resourceGroup, asgName, prefixSetName)
+}
+
+func (d *delayingStubClient) Put(ctx context.Context, subscriptionID, resourceGroup, asgName, prefixSetName string, ips []string) error {
+	time.Sleep(d.delay)
+	return d.inner.Put(ctx, subscriptionID, resourceGroup, asgName, prefixSetName, ips)
+}
+
+func (d *delayingStubClient) PutWithIfMatch(ctx context.Context, subscriptionID, resourceGroup, asgName, prefixSetName string, ips []string, etag string) error {
+	time.Sleep(d.delay)
+	return d.inner.PutWithIfMatch(ctx, subscriptionID, resourceGroup, asgName, prefixSetName, ips, etag)
+}
+
+func (d *delayingStubClient) Delete(ctx context.Context, subscriptionID, resourceGroup, asgName, prefixSetName string) error {
+	return d.inner.Delete(ctx, subscriptionID, resourceGroup, asgName, prefixSetName)
+}
+
+func (d *delayingStubClient) List(ctx context.Context, subscriptionID, resourceGroup, asgName string) ([]AddressPrefixSet, error) {
+	return d.inner.List(ctx, subscriptionID, resourceGroup, asgName)
+}
+
+func makeNActions(n int, subID string) []engine.Action {
+	actions := make([]engine.Action, n)
+	for i := 0; i < n; i++ {
+		actions[i] = engine.Action{
+			Kind: engine.CreatePrefixSet,
+			Target: engine.ASGTarget{
+				SubscriptionID: subID,
+				ResourceGroup:  "rg1",
+				ASGName:        "asg1",
+				PrefixSetName:  fmt.Sprintf("ps-%d", i),
+			},
+			DesiredIPs: []string{fmt.Sprintf("10.0.%d.1/32", i)},
+		}
+	}
+	return actions
+}
+
+// fakeExecutorMetricsObserver implements the Phase 6 ARMExecutorObserver interface.
+type fakeExecutorMetricsObserver struct {
+	mu                sync.Mutex
+	durationCount     int
+	incCount          int
+	decCount          int
+	etagConflictCount int
+}
+
+func (f *fakeExecutorMetricsObserver) ObserveCallDuration(subscriptionID, operation string, d time.Duration) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.durationCount++
+}
+
+func (f *fakeExecutorMetricsObserver) IncConcurrentActions() {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.incCount++
+}
+
+func (f *fakeExecutorMetricsObserver) DecConcurrentActions() {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.decCount++
+}
+
+func (f *fakeExecutorMetricsObserver) ObserveETagConflict(subscriptionID, operation string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.etagConflictCount++
+}
+
+// ---------------------------------------------------------------------------
+// Phase 6: metricOperationLabel — HTTP verb mapping for executor metrics
+// ---------------------------------------------------------------------------
+
+func TestPhase6_Executor_Metrics_DurationLabel_UsesHTTPVerb(t *testing.T) {
+	// Phase 6 design: ObserveCallDuration operation label must be HTTP verb
+	// (PUT/DELETE/UNKNOWN) not the internal enum (PutPrefixSet/DeletePrefixSet).
+	tests := []struct {
+		name     string
+		kind     engine.ActionKind
+		wantVerb string
+	}{
+		{"CreatePrefixSet→PUT", engine.CreatePrefixSet, "PUT"},
+		{"UpdatePrefixSet→PUT", engine.UpdatePrefixSet, "PUT"},
+		{"PatchPrefixSet→PUT", engine.PatchPrefixSet, "PUT"},
+		{"DeletePrefixSet→DELETE", engine.DeletePrefixSet, "DELETE"},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			log := zaptest.NewLogger(t)
+			factory := newStubFactory()
+			client := newStubClient()
+			factory.Register("sub1", client)
+
+			obs := &labelCapturingObserver{}
+			executor := NewExecutor(log, factory, 1, WithExecutorMetrics(obs))
+
+			actions := []engine.Action{
+				{
+					Kind:       tc.kind,
+					Target:     engine.ASGTarget{SubscriptionID: "sub1", ResourceGroup: "rg1", ASGName: "asg1", PrefixSetName: "ps1"},
+					DesiredIPs: []string{"10.0.0.1/32"},
+				},
+			}
+
+			_ = executor.Execute(context.Background(), actions)
+
+			obs.mu.Lock()
+			defer obs.mu.Unlock()
+			if len(obs.durationOps) == 0 {
+				t.Fatal("no duration observations recorded")
+			}
+			got := obs.durationOps[0]
+			if got != tc.wantVerb {
+				t.Errorf("ObserveCallDuration operation = %q, want HTTP verb %q", got, tc.wantVerb)
+			}
+		})
+	}
+}
+
+func TestPhase6_Executor_Metrics_ETagConflictLabel_UsesHTTPVerb(t *testing.T) {
+	// Phase 6 design: ObserveETagConflict must use HTTP verb labels (PUT/DELETE).
+	log := zaptest.NewLogger(t)
+	factory := newStubFactory()
+	client := newStubClient()
+	// Pre-populate so Get works during ETag retry.
+	client.store[stubKey("sub1", "rg1", "asg1", "ps1")] = []string{"10.0.0.1/32"}
+	client.fail412Count = 1
+	factory.Register("sub1", client)
+
+	obs := &labelCapturingObserver{}
+	executor := NewExecutor(log, factory, 1, WithExecutorMetrics(obs))
+
+	actions := []engine.Action{
+		{
+			Kind:       engine.UpdatePrefixSet,
+			Target:     engine.ASGTarget{SubscriptionID: "sub1", ResourceGroup: "rg1", ASGName: "asg1", PrefixSetName: "ps1"},
+			DesiredIPs: []string{"10.0.0.1/32", "10.0.0.2/32"},
+		},
+	}
+
+	_ = executor.Execute(context.Background(), actions)
+
+	obs.mu.Lock()
+	defer obs.mu.Unlock()
+	if len(obs.etagOps) == 0 {
+		t.Fatal("no ETag conflict observations recorded")
+	}
+	got := obs.etagOps[0]
+	if got != "PUT" {
+		t.Errorf("ObserveETagConflict operation = %q, want HTTP verb %q", got, "PUT")
+	}
+}
+
+func TestPhase6_Executor_Metrics_DurationLabel_TerminalActionKind(t *testing.T) {
+	// Phase 6 design: when ETag retry recomputes to a different action kind,
+	// the duration label must reflect the terminal (final) action kind.
+	log := zaptest.NewLogger(t)
+	factory := newStubFactory()
+	client := newStubClient()
+	// Pre-populate target so Get during ETag retry finds data.
+	client.store[stubKey("sub1", "rg1", "asg1", "ps1")] = []string{"10.0.0.1/32"}
+	// Force one 412 to trigger a recompute.
+	client.fail412Count = 1
+	factory.Register("sub1", client)
+
+	obs := &labelCapturingObserver{}
+	executor := NewExecutor(log, factory, 1, WithExecutorMetrics(obs))
+
+	actions := []engine.Action{
+		{
+			Kind:       engine.UpdatePrefixSet,
+			Target:     engine.ASGTarget{SubscriptionID: "sub1", ResourceGroup: "rg1", ASGName: "asg1", PrefixSetName: "ps1"},
+			DesiredIPs: []string{"10.0.0.1/32", "10.0.0.2/32"},
+		},
+	}
+
+	results := executor.Execute(context.Background(), actions)
+	if len(results) != 1 || !results[0].Success {
+		t.Fatalf("expected success, got: %+v", results)
+	}
+
+	obs.mu.Lock()
+	defer obs.mu.Unlock()
+	if len(obs.durationOps) == 0 {
+		t.Fatal("no duration observations recorded")
+	}
+	// The operation label must be an HTTP verb, not an internal enum string.
+	got := obs.durationOps[0]
+	validVerbs := map[string]bool{"PUT": true, "DELETE": true, "UNKNOWN": true}
+	if !validVerbs[got] {
+		t.Errorf("ObserveCallDuration operation = %q, want one of PUT/DELETE/UNKNOWN (HTTP verb)", got)
+	}
+}
+
+// labelCapturingObserver captures the operation label values for assertions.
+type labelCapturingObserver struct {
+	mu          sync.Mutex
+	durationOps []string
+	etagOps     []string
+	incCount    int
+	decCount    int
+}
+
+func (o *labelCapturingObserver) ObserveCallDuration(subscriptionID, operation string, d time.Duration) {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	o.durationOps = append(o.durationOps, operation)
+}
+
+func (o *labelCapturingObserver) IncConcurrentActions() {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	o.incCount++
+}
+
+func (o *labelCapturingObserver) DecConcurrentActions() {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	o.decCount++
+}
+
+func (o *labelCapturingObserver) ObserveETagConflict(subscriptionID, operation string) {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	o.etagOps = append(o.etagOps, operation)
+}

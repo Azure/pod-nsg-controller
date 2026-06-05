@@ -152,6 +152,21 @@ func rebindARMCollector(r *ARMRecorder, i int, c prometheus.Collector) error {
 			r.rateLimitDuration = hv
 			return nil
 		}
+	case 5:
+		if hv, ok := c.(*prometheus.HistogramVec); ok {
+			r.callDuration = hv
+			return nil
+		}
+	case 6:
+		if g, ok := c.(prometheus.Gauge); ok {
+			r.concurrentActions = g
+			return nil
+		}
+	case 7:
+		if cv, ok := c.(*prometheus.CounterVec); ok {
+			r.etagConflictsTotal = cv
+			return nil
+		}
 	}
 	return pkgerrors.Errorf("rebind ARM collector %d: type mismatch (got %T)", i, c)
 }

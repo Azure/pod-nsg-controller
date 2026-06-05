@@ -69,6 +69,22 @@ func WithPatchThresholdPercent(pct int) ExecutorOption {
 	}
 }
 
+// WithExecutorMetrics adds executor-side metrics observation (Phase 6).
+// The observer receives call duration, concurrency gauge, and ETag conflict events.
+func WithExecutorMetrics(obs ARMExecutorObserver) ExecutorOption {
+	return func(e *Executor) {
+		e.metricsObserver = obs
+	}
+}
+
+// ARMExecutorObserver is the interface for executor-side ARM metrics (Phase 6).
+type ARMExecutorObserver interface {
+	ObserveCallDuration(subscriptionID, operation string, d time.Duration)
+	IncConcurrentActions()
+	DecConcurrentActions()
+	ObserveETagConflict(subscriptionID, operation string)
+}
+
 // WithRateLimitMetrics adds rate-limit delay metrics to the ARMRateLimiter.
 // Emits only when delay > 0.
 func WithRateLimitMetrics(obs metrics.ARMRateLimitObserver) ARMRateLimiterOption {
