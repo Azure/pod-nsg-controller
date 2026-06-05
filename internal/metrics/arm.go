@@ -21,14 +21,6 @@ type ARMRateLimitObserver interface {
 	ObserveRateLimitDelay(subscriptionID string, delay time.Duration)
 }
 
-// ARMExecutorObserver is the interface for executor-side ARM metrics (Phase 6).
-type ARMExecutorObserver interface {
-	ObserveCallDuration(subscriptionID, operation string, d time.Duration)
-	IncConcurrentActions()
-	DecConcurrentActions()
-	ObserveETagConflict(subscriptionID, operation string)
-}
-
 // ARMRecorder records ARM call Prometheus metrics.
 type ARMRecorder struct {
 	requestsTotal      *prometheus.CounterVec
