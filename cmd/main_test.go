@@ -3,6 +3,7 @@ package main
 import (
 	"os"
 	"testing"
+	"time"
 
 	"go.uber.org/zap/zaptest"
 
@@ -30,7 +31,7 @@ func TestReloader_Reload_ValidRPS_InvalidConcurrency_AppliesRPSOnly(t *testing.T
 	limiter := azure.NewARMRateLimiter(log, initial.ARMRateLimitRPS)
 	executor := azure.NewExecutor(log, nil, initial.MaxConcurrentActions)
 
-	reloader := newARMTuningReloader(log, 30_000_000_000, initial, executor, limiter)
+	reloader := newARMTuningReloader(log, 30*time.Second, initial, executor, limiter)
 
 	// Write valid RPS, invalid concurrency.
 	if err := os.WriteFile(dir+"/ARM_RATE_LIMIT_RPS", []byte("50\n"), 0644); err != nil {
@@ -67,7 +68,7 @@ func TestReloader_Reload_InvalidRPS_ValidConcurrency_AppliesConcurrencyOnly(t *t
 	limiter := azure.NewARMRateLimiter(log, initial.ARMRateLimitRPS)
 	executor := azure.NewExecutor(log, nil, initial.MaxConcurrentActions)
 
-	reloader := newARMTuningReloader(log, 30_000_000_000, initial, executor, limiter)
+	reloader := newARMTuningReloader(log, 30*time.Second, initial, executor, limiter)
 
 	// Write invalid RPS, valid concurrency.
 	if err := os.WriteFile(dir+"/ARM_RATE_LIMIT_RPS", []byte("not-a-number\n"), 0644); err != nil {
@@ -104,7 +105,7 @@ func TestReloader_Reload_BothFilesAbsent_KeepsCurrentValues(t *testing.T) {
 	limiter := azure.NewARMRateLimiter(log, initial.ARMRateLimitRPS)
 	executor := azure.NewExecutor(log, nil, initial.MaxConcurrentActions)
 
-	reloader := newARMTuningReloader(log, 30_000_000_000, initial, executor, limiter)
+	reloader := newARMTuningReloader(log, 30*time.Second, initial, executor, limiter)
 
 	// No files written — both absent.
 	reloader.reload()
@@ -133,7 +134,7 @@ func TestReloader_Reload_OneFileMissing_OneValid_AppliesValidField(t *testing.T)
 	limiter := azure.NewARMRateLimiter(log, initial.ARMRateLimitRPS)
 	executor := azure.NewExecutor(log, nil, initial.MaxConcurrentActions)
 
-	reloader := newARMTuningReloader(log, 30_000_000_000, initial, executor, limiter)
+	reloader := newARMTuningReloader(log, 30*time.Second, initial, executor, limiter)
 
 	// Only write MAX_CONCURRENT_ACTIONS (RPS file missing).
 	if err := os.WriteFile(dir+"/MAX_CONCURRENT_ACTIONS", []byte("15\n"), 0644); err != nil {
