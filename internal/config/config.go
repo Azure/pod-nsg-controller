@@ -92,12 +92,14 @@ func Load() (*Config, error) {
 	// LoadARMTuningConfig(); skip env-based validation here to avoid startup
 	// failures from stale env vars that would never be used.
 	if os.Getenv("ARM_TUNING_DIR") != "" {
-		cfg.ARMRateLimitRPS = 20.0
-		cfg.MaxConcurrentActions = 10
+		defaults := ARMTuningDefaults()
+		cfg.ARMRateLimitRPS = defaults.ARMRateLimitRPS
+		cfg.MaxConcurrentActions = defaults.MaxConcurrentActions
 	} else {
+		defaults := ARMTuningDefaults()
 		rpsStr := os.Getenv("ARM_RATE_LIMIT_RPS")
 		if rpsStr == "" {
-			cfg.ARMRateLimitRPS = 20.0
+			cfg.ARMRateLimitRPS = defaults.ARMRateLimitRPS
 		} else {
 			val, err := strconv.ParseFloat(rpsStr, 64)
 			if err != nil {
@@ -112,7 +114,7 @@ func Load() (*Config, error) {
 		// Parse max concurrent actions.
 		concStr := os.Getenv("MAX_CONCURRENT_ACTIONS")
 		if concStr == "" {
-			cfg.MaxConcurrentActions = 10
+			cfg.MaxConcurrentActions = defaults.MaxConcurrentActions
 		} else {
 			val, err := strconv.Atoi(concStr)
 			if err != nil {
