@@ -8,7 +8,7 @@ import (
 
 // ---------- ARMRateLimitRPS ----------
 
-func TestLoad_ARMRateLimitRPS_Default10(t *testing.T) {
+func TestLoad_ARMRateLimitRPS_Default20(t *testing.T) {
 	t.Setenv("CLUSTER_NAME", "test-cluster")
 	// Unset to get default.
 	os.Unsetenv("ARM_RATE_LIMIT_RPS")
@@ -70,7 +70,7 @@ func TestLoad_ARMRateLimitRPS_NegativeFails(t *testing.T) {
 
 // ---------- MaxConcurrentActions ----------
 
-func TestLoad_MaxConcurrentActions_Default5(t *testing.T) {
+func TestLoad_MaxConcurrentActions_Default10(t *testing.T) {
 	t.Setenv("CLUSTER_NAME", "test-cluster")
 	os.Unsetenv("MAX_CONCURRENT_ACTIONS")
 
