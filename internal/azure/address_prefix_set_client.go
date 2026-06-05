@@ -181,8 +181,10 @@ func (c *AddressPrefixSetClient) doRequest(ctx context.Context, retryCtx RetryCo
 		duration := time.Since(start)
 
 		if httpErr != nil {
-			// Record transport failure as status "0"
-			if c.armObserver != nil && !retryCtx.SkipMetrics {
+			// Record transport failure as status "0".
+			// Even for internal sub-requests (SkipMetrics), emit error metrics
+			// so transport failures remain observable in arm_requests_total.
+			if c.armObserver != nil {
 				c.armObserver.ObserveRequest(retryCtx.SubscriptionID, method, "0", duration)
 			}
 
