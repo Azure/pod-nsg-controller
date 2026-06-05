@@ -4,7 +4,6 @@ import (
 	"os"
 	"testing"
 
-	"github.com/go-logr/zapr"
 	"go.uber.org/zap/zaptest"
 
 	"github.com/Azure/pod-nsg-controller/internal/azure"
@@ -27,9 +26,9 @@ func TestReloader_Reload_ValidRPS_InvalidConcurrency_AppliesRPSOnly(t *testing.T
 		MaxConcurrentActions: 5,
 	}
 
-	log := zapr.NewLogger(zaptest.NewLogger(t))
-	limiter := azure.NewARMRateLimiter(zaptest.NewLogger(t), initial.ARMRateLimitRPS)
-	executor := azure.NewExecutor(zaptest.NewLogger(t), nil, initial.MaxConcurrentActions)
+	log := zaptest.NewLogger(t)
+	limiter := azure.NewARMRateLimiter(log, initial.ARMRateLimitRPS)
+	executor := azure.NewExecutor(log, nil, initial.MaxConcurrentActions)
 
 	reloader := newARMTuningReloader(log, 30_000_000_000, initial, executor, limiter)
 
@@ -64,9 +63,9 @@ func TestReloader_Reload_InvalidRPS_ValidConcurrency_AppliesConcurrencyOnly(t *t
 		MaxConcurrentActions: 5,
 	}
 
-	log := zapr.NewLogger(zaptest.NewLogger(t))
-	limiter := azure.NewARMRateLimiter(zaptest.NewLogger(t), initial.ARMRateLimitRPS)
-	executor := azure.NewExecutor(zaptest.NewLogger(t), nil, initial.MaxConcurrentActions)
+	log := zaptest.NewLogger(t)
+	limiter := azure.NewARMRateLimiter(log, initial.ARMRateLimitRPS)
+	executor := azure.NewExecutor(log, nil, initial.MaxConcurrentActions)
 
 	reloader := newARMTuningReloader(log, 30_000_000_000, initial, executor, limiter)
 
@@ -101,9 +100,9 @@ func TestReloader_Reload_BothFilesAbsent_KeepsCurrentValues(t *testing.T) {
 		MaxConcurrentActions: 8,
 	}
 
-	log := zapr.NewLogger(zaptest.NewLogger(t))
-	limiter := azure.NewARMRateLimiter(zaptest.NewLogger(t), initial.ARMRateLimitRPS)
-	executor := azure.NewExecutor(zaptest.NewLogger(t), nil, initial.MaxConcurrentActions)
+	log := zaptest.NewLogger(t)
+	limiter := azure.NewARMRateLimiter(log, initial.ARMRateLimitRPS)
+	executor := azure.NewExecutor(log, nil, initial.MaxConcurrentActions)
 
 	reloader := newARMTuningReloader(log, 30_000_000_000, initial, executor, limiter)
 
@@ -130,9 +129,9 @@ func TestReloader_Reload_OneFileMissing_OneValid_AppliesValidField(t *testing.T)
 		MaxConcurrentActions: 5,
 	}
 
-	log := zapr.NewLogger(zaptest.NewLogger(t))
-	limiter := azure.NewARMRateLimiter(zaptest.NewLogger(t), initial.ARMRateLimitRPS)
-	executor := azure.NewExecutor(zaptest.NewLogger(t), nil, initial.MaxConcurrentActions)
+	log := zaptest.NewLogger(t)
+	limiter := azure.NewARMRateLimiter(log, initial.ARMRateLimitRPS)
+	executor := azure.NewExecutor(log, nil, initial.MaxConcurrentActions)
 
 	reloader := newARMTuningReloader(log, 30_000_000_000, initial, executor, limiter)
 

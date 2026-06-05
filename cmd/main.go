@@ -7,7 +7,6 @@ import (
 	"os"
 	"time"
 
-	"github.com/go-logr/logr"
 	"github.com/go-logr/zapr"
 	"go.uber.org/zap"
 	"go.uber.org/zap/zapcore"
@@ -202,7 +201,7 @@ func main() {
 
 	// Register the ARM tuning reloader as a manager Runnable for runtime updates.
 	tuningReloader := newARMTuningReloader(
-		ctrl.Log.WithName("arm-tuning-reloader"),
+		zapLog.Named("arm-tuning-reloader"),
 		30*time.Second,
 		armTuning,
 		executor,
@@ -244,7 +243,7 @@ func main() {
 // armTuningReloader polls the ARM tuning source and applies runtime updates
 // to the executor and rate limiter without requiring a controller restart.
 type armTuningReloader struct {
-	log      logr.Logger
+	log      *zap.Logger
 	interval time.Duration
 	current  config.ARMTuningConfig
 	executor *azure.Executor
@@ -252,7 +251,7 @@ type armTuningReloader struct {
 }
 
 func newARMTuningReloader(
-	log logr.Logger,
+	log *zap.Logger,
 	interval time.Duration,
 	initial config.ARMTuningConfig,
 	executor *azure.Executor,
@@ -293,30 +292,30 @@ func (r *armTuningReloader) reload() {
 	// Apply valid RPS independently.
 	if result.ARMRateLimitRPS != nil && *result.ARMRateLimitRPS != r.current.ARMRateLimitRPS {
 		if err := r.limiter.SetRPS(*result.ARMRateLimitRPS); err != nil {
-			r.log.Error(err, "failed to update ARM rate limit RPS")
+			r.log.Error("failed to update ARM rate limit RPS", zap.Error(err))
 		} else {
 			r.log.Info("updated ARM rate limit RPS",
-				"old", r.current.ARMRateLimitRPS,
-				"new", *result.ARMRateLimitRPS,
+				zap.Float64("old", r.current.ARMRateLimitRPS),
+				zap.Float64("new", *result.ARMRateLimitRPS),
 			)
 			r.current.ARMRateLimitRPS = *result.ARMRateLimitRPS
 		}
 	} else if result.ARMRateLimitRPSError != nil {
-		r.log.Error(result.ARMRateLimitRPSError, "failed to load ARM rate limit RPS, keeping current value")
+		r.log.Error("failed to load ARM rate limit RPS, keeping current value", zap.Error(result.ARMRateLimitRPSError))
 	}
 
 	// Apply valid concurrency independently.
 	if result.MaxConcurrentActions != nil && *result.MaxConcurrentActions != r.current.MaxConcurrentActions {
 		if err := r.executor.SetMaxParallel(*result.MaxConcurrentActions); err != nil {
-			r.log.Error(err, "failed to update max concurrent actions")
+			r.log.Error("failed to update max concurrent actions", zap.Error(err))
 		} else {
 			r.log.Info("updated max concurrent actions",
-				"old", r.current.MaxConcurrentActions,
-				"new", *result.MaxConcurrentActions,
+				zap.Int("old", r.current.MaxConcurrentActions),
+				zap.Int("new", *result.MaxConcurrentActions),
 			)
 			r.current.MaxConcurrentActions = *result.MaxConcurrentActions
 		}
 	} else if result.MaxConcurrentActionsErr != nil {
-		r.log.Error(result.MaxConcurrentActionsErr, "failed to load max concurrent actions, keeping current value")
+		r.log.Error("failed to load max concurrent actions, keeping current value", zap.Error(result.MaxConcurrentActionsErr))
 	}
 }
