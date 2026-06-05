@@ -1,6 +1,7 @@
 package config
 
 import (
+	stderrors "errors"
 	"fmt"
 	"os"
 	"strconv"
@@ -9,6 +10,12 @@ import (
 
 	"github.com/pkg/errors"
 )
+
+// ErrTuningFilesAbsent is returned by LoadARMTuningConfig when ARM_TUNING_DIR
+// is set but both tuning files are missing. At startup this is non-fatal
+// (caller falls back to defaults); at runtime the reloader treats it as an
+// error and preserves last-good values.
+var ErrTuningFilesAbsent = stderrors.New("ARM_TUNING_DIR set but both tuning files absent")
 
 const (
 	// LabelASG is the pod label for single-ASG assignment.
@@ -34,10 +41,10 @@ type Config struct {
 	// ResyncInterval is the periodic resync interval for drift correction.
 	ResyncInterval time.Duration
 
-	// ARMRateLimitRPS is the per-subscription ARM call rate limit (default: 10).
+	// ARMRateLimitRPS is the per-subscription ARM call rate limit (default: 20).
 	ARMRateLimitRPS float64
 
-	// MaxConcurrentActions is the max parallel ARM mutations per reconcile (default: 5).
+	// MaxConcurrentActions is the max parallel ARM mutations per reconcile (default: 10).
 	MaxConcurrentActions int
 
 	// MaxConcurrentReconciles is the number of concurrent reconcile workers (default: 5).
@@ -201,6 +208,14 @@ type ARMTuningConfig struct {
 	MaxConcurrentActions int
 }
 
+// ARMTuningDefaults returns ARMTuningConfig with Phase 6 default values.
+func ARMTuningDefaults() ARMTuningConfig {
+	return ARMTuningConfig{
+		ARMRateLimitRPS:      20.0,
+		MaxConcurrentActions: 10,
+	}
+}
+
 // LoadARMTuningConfig loads ARM tuning from mounted files (if ARM_TUNING_DIR is set)
 // or falls back to environment variables / defaults.
 func LoadARMTuningConfig() (ARMTuningConfig, error) {
@@ -243,11 +258,49 @@ func LoadARMTuningConfig() (ARMTuningConfig, error) {
 			}
 			return ARMTuningConfig{}, errors.Wrap(concErr, "ARM_TUNING_DIR/MAX_CONCURRENT_ACTIONS")
 		}
-		// Both files absent — fall through to env/defaults.
-		// At runtime the reloader will keep last-good values on its own.
+		// Both files absent — signal to caller so runtime reloader can
+		// preserve last-good values. At startup, caller treats this as
+		// non-fatal and falls back to env/defaults.
+		// Only treat as "absent" when both errors are actually file-not-found;
+		// permission errors or other I/O failures are real faults.
+		if os.IsNotExist(rpsErr) && os.IsNotExist(concErr) {
+			return ARMTuningConfig{}, ErrTuningFilesAbsent
+		}
+		// Non-ENOENT double failure — surface the real error.
+		return ARMTuningConfig{}, errors.Wrap(rpsErr, "ARM_TUNING_DIR: unable to read tuning files")
 	}
 
 	// Fall back to environment variables.
+	if rpsStr := os.Getenv("ARM_RATE_LIMIT_RPS"); rpsStr != "" {
+		val, err := strconv.ParseFloat(rpsStr, 64)
+		if err != nil {
+			return ARMTuningConfig{}, errors.Wrap(err, "ARM_RATE_LIMIT_RPS must be a valid number")
+		}
+		if val <= 0 {
+			return ARMTuningConfig{}, fmt.Errorf("ARM_RATE_LIMIT_RPS must be > 0, got %v", val)
+		}
+		tuning.ARMRateLimitRPS = val
+	}
+	if concStr := os.Getenv("MAX_CONCURRENT_ACTIONS"); concStr != "" {
+		val, err := strconv.Atoi(concStr)
+		if err != nil {
+			return ARMTuningConfig{}, errors.Wrap(err, "MAX_CONCURRENT_ACTIONS must be a valid integer")
+		}
+		if val < 1 {
+			return ARMTuningConfig{}, fmt.Errorf("MAX_CONCURRENT_ACTIONS must be >= 1, got %d", val)
+		}
+		tuning.MaxConcurrentActions = val
+	}
+
+	return tuning, nil
+}
+
+// LoadARMTuningFromEnv loads ARM tuning from environment variables only,
+// falling back to Phase 6 defaults. Used at startup when tuning files are
+// absent but env-based configuration should still be honoured.
+func LoadARMTuningFromEnv() (ARMTuningConfig, error) {
+	tuning := ARMTuningDefaults()
+
 	if rpsStr := os.Getenv("ARM_RATE_LIMIT_RPS"); rpsStr != "" {
 		val, err := strconv.ParseFloat(rpsStr, 64)
 		if err != nil {

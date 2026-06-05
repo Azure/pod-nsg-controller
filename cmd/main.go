@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"flag"
 	"os"
 	"time"
@@ -70,8 +71,18 @@ func main() {
 	// so the controller respects mounted tuning values from the first request.
 	armTuning, err := config.LoadARMTuningConfig()
 	if err != nil {
-		setupLog.Error(err, "unable to load ARM tuning configuration")
-		os.Exit(1)
+		if errors.Is(err, config.ErrTuningFilesAbsent) {
+			// At startup, absent files are non-fatal — fall back to env/defaults.
+			setupLog.Info("ARM tuning files not found, falling back to env/defaults")
+			armTuning, err = config.LoadARMTuningFromEnv()
+			if err != nil {
+				setupLog.Error(err, "unable to load ARM tuning from environment")
+				os.Exit(1)
+			}
+		} else {
+			setupLog.Error(err, "unable to load ARM tuning configuration")
+			os.Exit(1)
+		}
 	}
 
 	// Register metrics with the controller-runtime Prometheus registry.

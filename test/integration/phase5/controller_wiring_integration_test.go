@@ -17,6 +17,7 @@ import (
 	"github.com/Azure/pod-nsg-controller/internal/engine"
 	"github.com/pkg/errors"
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
@@ -1936,6 +1937,14 @@ func TestPhase5_DeleteRecreateRace_StaleInFlightCannotRepopulateCache(t *testing
 		}
 		return ps.Properties == nil || len(ps.Properties.AddressPrefixes) == 0
 	}, "expected prefix set cleaned up after mapping delete")
+
+	// Wait for the old mapping to be fully deleted (finalizer removed, gone from etcd)
+	// before recreating with the same name to avoid "object is being deleted" race.
+	eventually(t, 15*time.Second, 200*time.Millisecond, func() bool {
+		var old v1alpha1.PodASGMapping
+		err := te.k8sClient.Get(ctx, types.NamespacedName{Name: "race-mapping", Namespace: ns.Name}, &old)
+		return apierrors.IsNotFound(err)
+	}, "expected mapping to be fully deleted before recreating")
 
 	// Recreate mapping with different selector (v2)
 	newMapping := &v1alpha1.PodASGMapping{

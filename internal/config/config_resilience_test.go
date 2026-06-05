@@ -1,6 +1,7 @@
 package config
 
 import (
+	"errors"
 	"os"
 	"testing"
 )
@@ -297,5 +298,166 @@ func TestLoadARMTuningConfig_FileTakesPrecedenceOverEnv(t *testing.T) {
 	}
 	if tuning.MaxConcurrentActions != 12 {
 		t.Errorf("expected file-based MaxConcurrentActions=12 over env=99, got %d", tuning.MaxConcurrentActions)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Phase 6: ErrTuningFilesAbsent — startup fallback path
+// ---------------------------------------------------------------------------
+
+func TestLoadARMTuningConfig_FilesAbsent_ReturnsErrTuningFilesAbsent(t *testing.T) {
+	// Point ARM_TUNING_DIR at an empty directory (files not mounted yet).
+	dir := t.TempDir()
+	t.Setenv("ARM_TUNING_DIR", dir)
+	os.Unsetenv("ARM_RATE_LIMIT_RPS")
+	os.Unsetenv("MAX_CONCURRENT_ACTIONS")
+
+	_, err := LoadARMTuningConfig()
+	if err == nil {
+		t.Fatal("expected error when tuning files are absent, got nil")
+	}
+	if !errors.Is(err, ErrTuningFilesAbsent) {
+		t.Errorf("expected ErrTuningFilesAbsent, got: %v", err)
+	}
+}
+
+func TestLoadARMTuningFromEnv_FallbackDefaults(t *testing.T) {
+	// Simulate the startup fallback: no env set, should return Phase 6 defaults.
+	os.Unsetenv("ARM_RATE_LIMIT_RPS")
+	os.Unsetenv("MAX_CONCURRENT_ACTIONS")
+
+	tuning, err := LoadARMTuningFromEnv()
+	if err != nil {
+		t.Fatalf("LoadARMTuningFromEnv() error: %v", err)
+	}
+	if tuning.ARMRateLimitRPS != 20.0 {
+		t.Errorf("expected default ARMRateLimitRPS=20, got %v", tuning.ARMRateLimitRPS)
+	}
+	if tuning.MaxConcurrentActions != 10 {
+		t.Errorf("expected default MaxConcurrentActions=10, got %d", tuning.MaxConcurrentActions)
+	}
+}
+
+func TestLoadARMTuningFromEnv_RespectsEnvOverrides(t *testing.T) {
+	t.Setenv("ARM_RATE_LIMIT_RPS", "42.5")
+	t.Setenv("MAX_CONCURRENT_ACTIONS", "7")
+
+	tuning, err := LoadARMTuningFromEnv()
+	if err != nil {
+		t.Fatalf("LoadARMTuningFromEnv() error: %v", err)
+	}
+	if tuning.ARMRateLimitRPS != 42.5 {
+		t.Errorf("expected ARMRateLimitRPS=42.5, got %v", tuning.ARMRateLimitRPS)
+	}
+	if tuning.MaxConcurrentActions != 7 {
+		t.Errorf("expected MaxConcurrentActions=7, got %d", tuning.MaxConcurrentActions)
+	}
+}
+
+func TestLoadARMTuningConfig_FilesAbsent_ThenEnvFallbackWorks(t *testing.T) {
+	// End-to-end startup fallback: ARM_TUNING_DIR set but files absent →
+	// ErrTuningFilesAbsent, then LoadARMTuningFromEnv succeeds with env values.
+	dir := t.TempDir()
+	t.Setenv("ARM_TUNING_DIR", dir)
+	t.Setenv("ARM_RATE_LIMIT_RPS", "25")
+	t.Setenv("MAX_CONCURRENT_ACTIONS", "8")
+
+	_, err := LoadARMTuningConfig()
+	if !errors.Is(err, ErrTuningFilesAbsent) {
+		t.Fatalf("expected ErrTuningFilesAbsent, got: %v", err)
+	}
+
+	// Caller (cmd/main.go) falls back here:
+	tuning, err := LoadARMTuningFromEnv()
+	if err != nil {
+		t.Fatalf("LoadARMTuningFromEnv() error: %v", err)
+	}
+	if tuning.ARMRateLimitRPS != 25 {
+		t.Errorf("expected ARMRateLimitRPS=25, got %v", tuning.ARMRateLimitRPS)
+	}
+	if tuning.MaxConcurrentActions != 8 {
+		t.Errorf("expected MaxConcurrentActions=8, got %d", tuning.MaxConcurrentActions)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Phase 6: Runtime reload — last-good retention pattern
+// ---------------------------------------------------------------------------
+
+func TestLoadARMTuningConfig_RuntimeReload_LastGoodRetention(t *testing.T) {
+	// Simulates what armTuningReloader.reload() does:
+	// 1. Load good values from files
+	// 2. Files become invalid → LoadARMTuningConfig returns error
+	// 3. Caller (reloader) keeps last-good values
+	dir := t.TempDir()
+	t.Setenv("ARM_TUNING_DIR", dir)
+
+	// Step 1: Write valid tuning files.
+	if err := os.WriteFile(dir+"/ARM_RATE_LIMIT_RPS", []byte("30\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(dir+"/MAX_CONCURRENT_ACTIONS", []byte("12\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	lastGood, err := LoadARMTuningConfig()
+	if err != nil {
+		t.Fatalf("initial load should succeed: %v", err)
+	}
+	if lastGood.ARMRateLimitRPS != 30 || lastGood.MaxConcurrentActions != 12 {
+		t.Fatalf("unexpected initial values: %+v", lastGood)
+	}
+
+	// Step 2: Corrupt the files (simulate invalid runtime snapshot).
+	if err := os.WriteFile(dir+"/ARM_RATE_LIMIT_RPS", []byte("garbage\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	_, err = LoadARMTuningConfig()
+	if err == nil {
+		t.Fatal("expected error for corrupted tuning file, got nil")
+	}
+
+	// Step 3: The reloader pattern — on error, keep last-good.
+	// (This verifies the contract that LoadARMTuningConfig errors out
+	// rather than silently returning bad values, enabling the reloader
+	// to preserve r.current.)
+	if lastGood.ARMRateLimitRPS != 30 || lastGood.MaxConcurrentActions != 12 {
+		t.Errorf("last-good values should be preserved: %+v", lastGood)
+	}
+}
+
+func TestLoadARMTuningConfig_RuntimeReload_FilesRemovedReturnsAbsent(t *testing.T) {
+	// Simulates files being removed at runtime (e.g., ConfigMap unmounted).
+	dir := t.TempDir()
+	t.Setenv("ARM_TUNING_DIR", dir)
+
+	// Write files, load successfully.
+	if err := os.WriteFile(dir+"/ARM_RATE_LIMIT_RPS", []byte("25\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(dir+"/MAX_CONCURRENT_ACTIONS", []byte("8\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	tuning, err := LoadARMTuningConfig()
+	if err != nil {
+		t.Fatalf("initial load should succeed: %v", err)
+	}
+	if tuning.ARMRateLimitRPS != 25 || tuning.MaxConcurrentActions != 8 {
+		t.Fatalf("unexpected initial values: %+v", tuning)
+	}
+
+	// Remove files — simulates ConfigMap deletion at runtime.
+	os.Remove(dir + "/ARM_RATE_LIMIT_RPS")
+	os.Remove(dir + "/MAX_CONCURRENT_ACTIONS")
+
+	_, err = LoadARMTuningConfig()
+	if err == nil {
+		t.Fatal("expected error after files removed, got nil")
+	}
+	// Reloader sees this error and preserves last-good values.
+	if !errors.Is(err, ErrTuningFilesAbsent) {
+		t.Errorf("expected ErrTuningFilesAbsent for removed files, got: %v", err)
 	}
 }

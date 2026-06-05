@@ -12,6 +12,7 @@ import (
 	"github.com/Azure/pod-nsg-controller/internal/azure/fake"
 	"github.com/Azure/pod-nsg-controller/internal/controller"
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 )
@@ -1183,6 +1184,14 @@ func TestPhase5_CrossModule_PodEventMutation_TerminalCleanup_StalePublish(t *tes
 		}
 		return ps.Properties == nil || len(ps.Properties.AddressPrefixes) == 0
 	}, "expected prefix set cleaned up after terminal delete despite concurrent pod events")
+
+	// Wait for the old mapping to be fully deleted (finalizer removed, gone from etcd)
+	// before recreating with the same name to avoid "object is being deleted" race.
+	eventually(t, 15*time.Second, 200*time.Millisecond, func() bool {
+		var old v1alpha1.PodASGMapping
+		err := te.k8sClient.Get(ctx, types.NamespacedName{Name: "cross-race-mapping", Namespace: ns.Name}, &old)
+		return apierrors.IsNotFound(err)
+	}, "expected mapping to be fully deleted before recreating")
 
 	// Recreate mapping to verify clean convergence from fresh state
 	freshMapping := &v1alpha1.PodASGMapping{
