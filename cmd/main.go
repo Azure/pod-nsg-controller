@@ -281,33 +281,38 @@ func (r *armTuningReloader) Start(ctx context.Context) error {
 }
 
 func (r *armTuningReloader) reload() {
-	tuning, err := config.LoadARMTuningConfig()
-	if err != nil {
-		r.log.Error(err, "failed to load ARM tuning config, keeping current values")
+	result := config.LoadARMTuningForReload()
+	if result.NotConfigured || result.FilesAbsent {
 		return
 	}
-	if tuning.ARMRateLimitRPS == r.current.ARMRateLimitRPS && tuning.MaxConcurrentActions == r.current.MaxConcurrentActions {
-		return
-	}
-	if tuning.ARMRateLimitRPS != r.current.ARMRateLimitRPS {
-		if err := r.limiter.SetRPS(tuning.ARMRateLimitRPS); err != nil {
+
+	// Apply valid RPS independently.
+	if result.ARMRateLimitRPS != nil && *result.ARMRateLimitRPS != r.current.ARMRateLimitRPS {
+		if err := r.limiter.SetRPS(*result.ARMRateLimitRPS); err != nil {
 			r.log.Error(err, "failed to update ARM rate limit RPS")
-			return
+		} else {
+			r.log.Info("updated ARM rate limit RPS",
+				"old", r.current.ARMRateLimitRPS,
+				"new", *result.ARMRateLimitRPS,
+			)
+			r.current.ARMRateLimitRPS = *result.ARMRateLimitRPS
 		}
-		r.log.Info("updated ARM rate limit RPS",
-			"old", r.current.ARMRateLimitRPS,
-			"new", tuning.ARMRateLimitRPS,
-		)
+	} else if result.ARMRateLimitRPSError != nil {
+		r.log.Error(result.ARMRateLimitRPSError, "failed to load ARM rate limit RPS, keeping current value")
 	}
-	if tuning.MaxConcurrentActions != r.current.MaxConcurrentActions {
-		if err := r.executor.SetMaxParallel(tuning.MaxConcurrentActions); err != nil {
+
+	// Apply valid concurrency independently.
+	if result.MaxConcurrentActions != nil && *result.MaxConcurrentActions != r.current.MaxConcurrentActions {
+		if err := r.executor.SetMaxParallel(*result.MaxConcurrentActions); err != nil {
 			r.log.Error(err, "failed to update max concurrent actions")
-			return
+		} else {
+			r.log.Info("updated max concurrent actions",
+				"old", r.current.MaxConcurrentActions,
+				"new", *result.MaxConcurrentActions,
+			)
+			r.current.MaxConcurrentActions = *result.MaxConcurrentActions
 		}
-		r.log.Info("updated max concurrent actions",
-			"old", r.current.MaxConcurrentActions,
-			"new", tuning.MaxConcurrentActions,
-		)
+	} else if result.MaxConcurrentActionsErr != nil {
+		r.log.Error(result.MaxConcurrentActionsErr, "failed to load max concurrent actions, keeping current value")
 	}
-	r.current = tuning
 }

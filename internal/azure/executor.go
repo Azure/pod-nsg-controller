@@ -43,6 +43,18 @@ func armOperation(kind engine.ActionKind) ARMOperation {
 	}
 }
 
+// actionKindHTTPVerb returns the HTTP verb for metrics labels.
+func actionKindHTTPVerb(kind engine.ActionKind) string {
+	switch kind {
+	case engine.CreatePrefixSet, engine.UpdatePrefixSet, engine.PatchPrefixSet:
+		return "PUT"
+	case engine.DeletePrefixSet:
+		return "DELETE"
+	default:
+		return "UNKNOWN"
+	}
+}
+
 // Executor runs engine actions against Azure with bounded concurrency and ETag retry.
 type Executor struct {
 	log                   *zap.Logger
@@ -112,7 +124,7 @@ func (e *Executor) Execute(ctx context.Context, actions []engine.Action) []Actio
 			start := time.Now()
 			outcome := e.executeWithETagRetry(ctx, client, act)
 			if e.metricsObserver != nil {
-				op := string(armOperation(act.Kind))
+				op := actionKindHTTPVerb(outcome.finalActionKind)
 				e.metricsObserver.ObserveCallDuration(act.Target.SubscriptionID, op, time.Since(start))
 			}
 
@@ -227,7 +239,7 @@ func (e *Executor) executeWithETagRetry(ctx context.Context, client AddressPrefi
 			e.retryObserver.ObserveRetry(action.Target.SubscriptionID, string(armOperation(action.Kind)), "etag-conflict")
 		}
 		if e.metricsObserver != nil {
-			e.metricsObserver.ObserveETagConflict(action.Target.SubscriptionID, string(armOperation(action.Kind)))
+			e.metricsObserver.ObserveETagConflict(action.Target.SubscriptionID, actionKindHTTPVerb(action.Kind))
 		}
 
 		if attempt == e.maxRetries {

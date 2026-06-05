@@ -3,6 +3,7 @@ package config
 import (
 	stderrors "errors"
 	"fmt"
+	"math"
 	"os"
 	"strconv"
 	"strings"
@@ -102,8 +103,8 @@ func Load() (*Config, error) {
 			if err != nil {
 				return nil, errors.Wrap(err, "ARM_RATE_LIMIT_RPS must be a valid number")
 			}
-			if val <= 0 {
-				return nil, fmt.Errorf("ARM_RATE_LIMIT_RPS must be > 0, got %v", val)
+			if val <= 0 || math.IsNaN(val) || math.IsInf(val, 0) {
+				return nil, fmt.Errorf("ARM_RATE_LIMIT_RPS must be a finite number > 0, got %v", val)
 			}
 			cfg.ARMRateLimitRPS = val
 		}
@@ -236,8 +237,8 @@ func LoadARMTuningConfig() (ARMTuningConfig, error) {
 			if err != nil {
 				return ARMTuningConfig{}, errors.Wrap(err, "ARM_TUNING_DIR/ARM_RATE_LIMIT_RPS must be a valid number")
 			}
-			if rpsVal <= 0 {
-				return ARMTuningConfig{}, fmt.Errorf("ARM_TUNING_DIR/ARM_RATE_LIMIT_RPS must be > 0, got %v", rpsVal)
+			if rpsVal <= 0 || math.IsNaN(rpsVal) || math.IsInf(rpsVal, 0) {
+				return ARMTuningConfig{}, fmt.Errorf("ARM_TUNING_DIR/ARM_RATE_LIMIT_RPS must be a finite number > 0, got %v", rpsVal)
 			}
 			concVal, err := strconv.Atoi(strings.TrimSpace(string(concBytes)))
 			if err != nil {
@@ -276,8 +277,8 @@ func LoadARMTuningConfig() (ARMTuningConfig, error) {
 		if err != nil {
 			return ARMTuningConfig{}, errors.Wrap(err, "ARM_RATE_LIMIT_RPS must be a valid number")
 		}
-		if val <= 0 {
-			return ARMTuningConfig{}, fmt.Errorf("ARM_RATE_LIMIT_RPS must be > 0, got %v", val)
+		if val <= 0 || math.IsNaN(val) || math.IsInf(val, 0) {
+			return ARMTuningConfig{}, fmt.Errorf("ARM_RATE_LIMIT_RPS must be a finite number > 0, got %v", val)
 		}
 		tuning.ARMRateLimitRPS = val
 	}
@@ -306,8 +307,8 @@ func LoadARMTuningFromEnv() (ARMTuningConfig, error) {
 		if err != nil {
 			return ARMTuningConfig{}, errors.Wrap(err, "ARM_RATE_LIMIT_RPS must be a valid number")
 		}
-		if val <= 0 {
-			return ARMTuningConfig{}, fmt.Errorf("ARM_RATE_LIMIT_RPS must be > 0, got %v", val)
+		if val <= 0 || math.IsNaN(val) || math.IsInf(val, 0) {
+			return ARMTuningConfig{}, fmt.Errorf("ARM_RATE_LIMIT_RPS must be a finite number > 0, got %v", val)
 		}
 		tuning.ARMRateLimitRPS = val
 	}
@@ -323,4 +324,72 @@ func LoadARMTuningFromEnv() (ARMTuningConfig, error) {
 	}
 
 	return tuning, nil
+}
+
+// ARMTuningReloadResult holds per-field results for runtime reload.
+// Unlike LoadARMTuningConfig (which is atomic), this allows applying
+// valid fields independently during runtime reload.
+type ARMTuningReloadResult struct {
+ARMRateLimitRPS         *float64
+MaxConcurrentActions    *int
+ARMRateLimitRPSError    error
+MaxConcurrentActionsErr error
+FilesAbsent             bool
+NotConfigured           bool // true when ARM_TUNING_DIR env var is unset
+}
+
+// LoadARMTuningForReload loads ARM tuning with per-field granularity for runtime
+// reload. Each field is independently validated — a failure in one field does not
+// prevent the other from being applied.
+func LoadARMTuningForReload() ARMTuningReloadResult {
+	tuningDir := os.Getenv("ARM_TUNING_DIR")
+	if tuningDir == "" {
+		return ARMTuningReloadResult{NotConfigured: true}
+	}
+
+	rpsBytes, rpsReadErr := os.ReadFile(tuningDir + "/ARM_RATE_LIMIT_RPS")
+	concBytes, concReadErr := os.ReadFile(tuningDir + "/MAX_CONCURRENT_ACTIONS")
+
+	// Both files absent.
+	if rpsReadErr != nil && concReadErr != nil {
+		if os.IsNotExist(rpsReadErr) && os.IsNotExist(concReadErr) {
+			return ARMTuningReloadResult{FilesAbsent: true}
+		}
+		return ARMTuningReloadResult{
+			ARMRateLimitRPSError:    errors.Wrap(rpsReadErr, "ARM_TUNING_DIR/ARM_RATE_LIMIT_RPS"),
+			MaxConcurrentActionsErr: errors.Wrap(concReadErr, "ARM_TUNING_DIR/MAX_CONCURRENT_ACTIONS"),
+		}
+	}
+
+	var result ARMTuningReloadResult
+
+	// Parse RPS independently.
+	if rpsReadErr != nil {
+		result.ARMRateLimitRPSError = errors.Wrap(rpsReadErr, "ARM_TUNING_DIR/ARM_RATE_LIMIT_RPS")
+	} else {
+		rpsVal, err := strconv.ParseFloat(strings.TrimSpace(string(rpsBytes)), 64)
+		if err != nil {
+			result.ARMRateLimitRPSError = errors.Wrap(err, "ARM_TUNING_DIR/ARM_RATE_LIMIT_RPS must be a valid number")
+		} else if rpsVal <= 0 || math.IsNaN(rpsVal) || math.IsInf(rpsVal, 0) {
+			result.ARMRateLimitRPSError = fmt.Errorf("ARM_TUNING_DIR/ARM_RATE_LIMIT_RPS must be a finite number > 0, got %v", rpsVal)
+		} else {
+			result.ARMRateLimitRPS = &rpsVal
+		}
+	}
+
+	// Parse concurrency independently.
+	if concReadErr != nil {
+		result.MaxConcurrentActionsErr = errors.Wrap(concReadErr, "ARM_TUNING_DIR/MAX_CONCURRENT_ACTIONS")
+	} else {
+		concVal, err := strconv.Atoi(strings.TrimSpace(string(concBytes)))
+		if err != nil {
+			result.MaxConcurrentActionsErr = errors.Wrap(err, "ARM_TUNING_DIR/MAX_CONCURRENT_ACTIONS must be a valid integer")
+		} else if concVal < 1 {
+			result.MaxConcurrentActionsErr = fmt.Errorf("ARM_TUNING_DIR/MAX_CONCURRENT_ACTIONS must be >= 1, got %d", concVal)
+		} else {
+			result.MaxConcurrentActions = &concVal
+		}
+	}
+
+	return result
 }
