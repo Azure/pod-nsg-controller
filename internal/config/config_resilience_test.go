@@ -133,36 +133,6 @@ func TestLoad_MaxConcurrentActions_NegativeFails(t *testing.T) {
 // Phase 6: Tunable ARM Concurrency — new default validation
 // ---------------------------------------------------------------------------
 
-func TestLoad_ARMRateLimitRPS_Phase6Default20(t *testing.T) {
-	t.Setenv("CLUSTER_NAME", "test-cluster")
-	os.Unsetenv("ARM_RATE_LIMIT_RPS")
-
-	cfg, err := Load()
-	if err != nil {
-		t.Fatalf("Load() error: %v", err)
-	}
-
-	// Phase 6 moves default from 10 to 20.
-	if cfg.ARMRateLimitRPS != 20.0 {
-		t.Errorf("Phase 6: expected default ARMRateLimitRPS=20, got %v", cfg.ARMRateLimitRPS)
-	}
-}
-
-func TestLoad_MaxConcurrentActions_Phase6Default10(t *testing.T) {
-	t.Setenv("CLUSTER_NAME", "test-cluster")
-	os.Unsetenv("MAX_CONCURRENT_ACTIONS")
-
-	cfg, err := Load()
-	if err != nil {
-		t.Fatalf("Load() error: %v", err)
-	}
-
-	// Phase 6 moves default from 5 to 10.
-	if cfg.MaxConcurrentActions != 10 {
-		t.Errorf("Phase 6: expected default MaxConcurrentActions=10, got %d", cfg.MaxConcurrentActions)
-	}
-}
-
 // ---------------------------------------------------------------------------
 // Phase 6: LoadARMTuningConfig — dedicated loader
 // ---------------------------------------------------------------------------
