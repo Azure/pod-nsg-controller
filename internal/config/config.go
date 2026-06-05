@@ -222,10 +222,7 @@ func ARMTuningDefaults() ARMTuningConfig {
 // LoadARMTuningConfig loads ARM tuning from mounted files (if ARM_TUNING_DIR is set)
 // or falls back to environment variables / defaults.
 func LoadARMTuningConfig() (ARMTuningConfig, error) {
-	tuning := ARMTuningConfig{
-		ARMRateLimitRPS:      20.0,
-		MaxConcurrentActions: 10,
-	}
+	tuning := ARMTuningDefaults()
 
 	// Try file-based tuning source first (runtime-mutable via ConfigMap mount).
 	tuningDir := os.Getenv("ARM_TUNING_DIR")
