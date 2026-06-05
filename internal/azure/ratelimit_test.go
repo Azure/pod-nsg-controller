@@ -3,6 +3,7 @@ package azure
 import (
 	"context"
 	"fmt"
+	"math"
 	"sync"
 	"testing"
 	"time"
@@ -226,15 +227,15 @@ func TestARMRateLimiter_GetLimiter_ReusesSubscriptionEntries(t *testing.T) {
 	log := zaptest.NewLogger(t)
 	limiter := NewARMRateLimiter(log, 10)
 
-	first := limiter.getLimiter("sub-a")
-	second := limiter.getLimiter("sub-a")
-	third := limiter.getLimiter("sub-b")
+	first, _ := limiter.getLimiterAndRPS("sub-a")
+	second, _ := limiter.getLimiterAndRPS("sub-a")
+	third, _ := limiter.getLimiterAndRPS("sub-b")
 
 	if first != second {
-		t.Errorf("getLimiter(sub-a) returned different limiter instances for same subscription")
+		t.Errorf("getLimiterAndRPS(sub-a) returned different limiter instances for same subscription")
 	}
 	if first == third {
-		t.Errorf("getLimiter() returned same limiter instance for different subscriptions")
+		t.Errorf("getLimiterAndRPS() returned same limiter instance for different subscriptions")
 	}
 	if got, want := len(limiter.limiters), 2; got != want {
 		t.Errorf("len(limiters) = %d, want %d", got, want)
@@ -408,5 +409,81 @@ func TestPhase6_RPS_ReturnsCurrentValue(t *testing.T) {
 
 	if got := limiter.RPS(); got != 15.5 {
 		t.Errorf("RPS() = %v, want 15.5", got)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Phase 6: SetRPS — non-finite value rejection
+// ---------------------------------------------------------------------------
+
+func TestPhase6_SetRPS_NaN_Rejected(t *testing.T) {
+	log := zaptest.NewLogger(t)
+	limiter := NewARMRateLimiter(log, 10)
+
+	err := limiter.SetRPS(math.NaN())
+	if err == nil {
+		t.Error("expected error for SetRPS(NaN), got nil")
+	}
+
+	// RPS should remain at original value.
+	if got := limiter.RPS(); got != 10 {
+		t.Errorf("RPS() = %v after rejected SetRPS(NaN), want 10", got)
+	}
+}
+
+func TestPhase6_SetRPS_PosInf_Rejected(t *testing.T) {
+	log := zaptest.NewLogger(t)
+	limiter := NewARMRateLimiter(log, 10)
+
+	err := limiter.SetRPS(math.Inf(1))
+	if err == nil {
+		t.Error("expected error for SetRPS(+Inf), got nil")
+	}
+
+	if got := limiter.RPS(); got != 10 {
+		t.Errorf("RPS() = %v after rejected SetRPS(+Inf), want 10", got)
+	}
+}
+
+func TestPhase6_SetRPS_NegInf_Rejected(t *testing.T) {
+	log := zaptest.NewLogger(t)
+	limiter := NewARMRateLimiter(log, 10)
+
+	err := limiter.SetRPS(math.Inf(-1))
+	if err == nil {
+		t.Error("expected error for SetRPS(-Inf), got nil")
+	}
+
+	if got := limiter.RPS(); got != 10 {
+		t.Errorf("RPS() = %v after rejected SetRPS(-Inf), want 10", got)
+	}
+}
+
+func TestPhase6_SetRPS_LastGoodRetainedAfterRejection(t *testing.T) {
+	log := zaptest.NewLogger(t)
+	limiter := NewARMRateLimiter(log, 10)
+
+	// Successfully update to 50.
+	if err := limiter.SetRPS(50); err != nil {
+		t.Fatalf("SetRPS(50) error: %v", err)
+	}
+	if got := limiter.RPS(); got != 50 {
+		t.Fatalf("RPS() = %v, want 50", got)
+	}
+
+	// Attempt NaN — should fail and keep 50.
+	if err := limiter.SetRPS(math.NaN()); err == nil {
+		t.Error("expected error for SetRPS(NaN), got nil")
+	}
+	if got := limiter.RPS(); got != 50 {
+		t.Errorf("RPS() = %v after rejected NaN, want last-good 50", got)
+	}
+
+	// Attempt +Inf — should fail and keep 50.
+	if err := limiter.SetRPS(math.Inf(1)); err == nil {
+		t.Error("expected error for SetRPS(+Inf), got nil")
+	}
+	if got := limiter.RPS(); got != 50 {
+		t.Errorf("RPS() = %v after rejected +Inf, want last-good 50", got)
 	}
 }

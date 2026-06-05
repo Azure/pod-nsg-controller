@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"math"
 	"sync"
 	"time"
 
@@ -130,7 +131,7 @@ func ceil(f float64) float64 {
 	return i
 }
 
-func (l *ARMRateLimiter) getLimiter(subscriptionID string) *rate.Limiter {
+func (l *ARMRateLimiter) getLimiterAndRPS(subscriptionID string) (*rate.Limiter, float64) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	lim, ok := l.limiters[subscriptionID]
@@ -147,7 +148,7 @@ func (l *ARMRateLimiter) getLimiter(subscriptionID string) *rate.Limiter {
 		lim = rate.NewLimiter(rate.Limit(l.rps), l.burst)
 		l.limiters[subscriptionID] = lim
 	}
-	return lim
+	return lim, l.rps
 }
 
 // isInfiniteDelay returns true when the delay from a rate.Reservation is
@@ -158,7 +159,7 @@ func isInfiniteDelay(d time.Duration) bool {
 
 // Wait blocks until the rate limiter allows a call for the given subscription.
 func (l *ARMRateLimiter) Wait(ctx context.Context, subscriptionID string) error {
-	lim := l.getLimiter(subscriptionID)
+	lim, currentRPS := l.getLimiterAndRPS(subscriptionID)
 	now := l.clock.Now()
 	reserve := l.reserve
 	if reserve == nil {
@@ -169,7 +170,7 @@ func (l *ARMRateLimiter) Wait(ctx context.Context, subscriptionID string) error 
 	if !reservation.OK() {
 		l.log.Warn("rate limit reservation denied",
 			zap.String("subscriptionID", subscriptionID),
-			zap.Float64("rps", l.rps),
+			zap.Float64("rps", currentRPS),
 		)
 		return ErrRateLimitReservationDenied
 	}
@@ -212,8 +213,8 @@ func (l *ARMRateLimiter) Wait(ctx context.Context, subscriptionID string) error 
 
 // SetRPS updates the rate limit for all current and future per-subscription limiters.
 func (l *ARMRateLimiter) SetRPS(rps float64) error {
-	if rps <= 0 {
-		return fmt.Errorf("SetRPS: rps must be > 0, got %v", rps)
+	if rps <= 0 || math.IsNaN(rps) || math.IsInf(rps, 0) {
+		return fmt.Errorf("SetRPS: rps must be a finite number > 0, got %v", rps)
 	}
 	newBurst := int(max(1, int(ceil(rps))))
 
