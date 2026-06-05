@@ -16,7 +16,7 @@ import (
 
 func TestReloader_Reload_ValidRPS_InvalidConcurrency_AppliesRPSOnly(t *testing.T) {
 	// Design: valid RPS + invalid max-parallel → only RPS updated, max-parallel
-	// retains last-good value. Current implementation returns early on any error.
+	// retains last-good value. reload() applies each field independently.
 	dir := t.TempDir()
 	t.Setenv("ARM_TUNING_DIR", dir)
 
