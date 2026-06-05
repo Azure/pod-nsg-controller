@@ -61,7 +61,7 @@ type RetryContext struct {
 	ResourceGroup  string
 	ASGName        string
 	PrefixSetName  string
-	SkipMetrics    bool // If true, doRequest does not emit armObserver metrics.
+	SkipMetrics    bool // If true, doRequest suppresses armObserver metrics for successful (2xx) responses only; transport errors and non-2xx responses are still emitted.
 }
 
 // DefaultRetryPolicy returns the default retry policy.
