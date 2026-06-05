@@ -103,8 +103,8 @@ func Load() (*Config, error) {
 			if err != nil {
 				return nil, errors.Wrap(err, "ARM_RATE_LIMIT_RPS must be a valid number")
 			}
-			if val <= 0 || math.IsNaN(val) || math.IsInf(val, 0) {
-				return nil, fmt.Errorf("ARM_RATE_LIMIT_RPS must be a finite number > 0, got %v", val)
+			if err := validateARMRateLimitRPS("ARM_RATE_LIMIT_RPS", val); err != nil {
+				return nil, err
 			}
 			cfg.ARMRateLimitRPS = val
 		}
@@ -118,8 +118,8 @@ func Load() (*Config, error) {
 			if err != nil {
 				return nil, errors.Wrap(err, "MAX_CONCURRENT_ACTIONS must be a valid integer")
 			}
-			if val < 1 {
-				return nil, fmt.Errorf("MAX_CONCURRENT_ACTIONS must be >= 1, got %d", val)
+			if err := validateMaxConcurrentActions("MAX_CONCURRENT_ACTIONS", val); err != nil {
+				return nil, err
 			}
 			cfg.MaxConcurrentActions = val
 		}
@@ -237,15 +237,15 @@ func LoadARMTuningConfig() (ARMTuningConfig, error) {
 			if err != nil {
 				return ARMTuningConfig{}, errors.Wrap(err, "ARM_TUNING_DIR/ARM_RATE_LIMIT_RPS must be a valid number")
 			}
-			if rpsVal <= 0 || math.IsNaN(rpsVal) || math.IsInf(rpsVal, 0) {
-				return ARMTuningConfig{}, fmt.Errorf("ARM_TUNING_DIR/ARM_RATE_LIMIT_RPS must be a finite number > 0, got %v", rpsVal)
+			if err := validateARMRateLimitRPS("ARM_TUNING_DIR/ARM_RATE_LIMIT_RPS", rpsVal); err != nil {
+				return ARMTuningConfig{}, err
 			}
 			concVal, err := strconv.Atoi(strings.TrimSpace(string(concBytes)))
 			if err != nil {
 				return ARMTuningConfig{}, errors.Wrap(err, "ARM_TUNING_DIR/MAX_CONCURRENT_ACTIONS must be a valid integer")
 			}
-			if concVal < 1 {
-				return ARMTuningConfig{}, fmt.Errorf("ARM_TUNING_DIR/MAX_CONCURRENT_ACTIONS must be >= 1, got %d", concVal)
+			if err := validateMaxConcurrentActions("ARM_TUNING_DIR/MAX_CONCURRENT_ACTIONS", concVal); err != nil {
+				return ARMTuningConfig{}, err
 			}
 			tuning.ARMRateLimitRPS = rpsVal
 			tuning.MaxConcurrentActions = concVal
@@ -277,8 +277,8 @@ func LoadARMTuningConfig() (ARMTuningConfig, error) {
 		if err != nil {
 			return ARMTuningConfig{}, errors.Wrap(err, "ARM_RATE_LIMIT_RPS must be a valid number")
 		}
-		if val <= 0 || math.IsNaN(val) || math.IsInf(val, 0) {
-			return ARMTuningConfig{}, fmt.Errorf("ARM_RATE_LIMIT_RPS must be a finite number > 0, got %v", val)
+		if err := validateARMRateLimitRPS("ARM_RATE_LIMIT_RPS", val); err != nil {
+			return ARMTuningConfig{}, err
 		}
 		tuning.ARMRateLimitRPS = val
 	}
@@ -287,8 +287,8 @@ func LoadARMTuningConfig() (ARMTuningConfig, error) {
 		if err != nil {
 			return ARMTuningConfig{}, errors.Wrap(err, "MAX_CONCURRENT_ACTIONS must be a valid integer")
 		}
-		if val < 1 {
-			return ARMTuningConfig{}, fmt.Errorf("MAX_CONCURRENT_ACTIONS must be >= 1, got %d", val)
+		if err := validateMaxConcurrentActions("MAX_CONCURRENT_ACTIONS", val); err != nil {
+			return ARMTuningConfig{}, err
 		}
 		tuning.MaxConcurrentActions = val
 	}
@@ -307,8 +307,8 @@ func LoadARMTuningFromEnv() (ARMTuningConfig, error) {
 		if err != nil {
 			return ARMTuningConfig{}, errors.Wrap(err, "ARM_RATE_LIMIT_RPS must be a valid number")
 		}
-		if val <= 0 || math.IsNaN(val) || math.IsInf(val, 0) {
-			return ARMTuningConfig{}, fmt.Errorf("ARM_RATE_LIMIT_RPS must be a finite number > 0, got %v", val)
+		if err := validateARMRateLimitRPS("ARM_RATE_LIMIT_RPS", val); err != nil {
+			return ARMTuningConfig{}, err
 		}
 		tuning.ARMRateLimitRPS = val
 	}
@@ -317,8 +317,8 @@ func LoadARMTuningFromEnv() (ARMTuningConfig, error) {
 		if err != nil {
 			return ARMTuningConfig{}, errors.Wrap(err, "MAX_CONCURRENT_ACTIONS must be a valid integer")
 		}
-		if val < 1 {
-			return ARMTuningConfig{}, fmt.Errorf("MAX_CONCURRENT_ACTIONS must be >= 1, got %d", val)
+		if err := validateMaxConcurrentActions("MAX_CONCURRENT_ACTIONS", val); err != nil {
+			return ARMTuningConfig{}, err
 		}
 		tuning.MaxConcurrentActions = val
 	}
@@ -370,8 +370,8 @@ func LoadARMTuningForReload() ARMTuningReloadResult {
 		rpsVal, err := strconv.ParseFloat(strings.TrimSpace(string(rpsBytes)), 64)
 		if err != nil {
 			result.ARMRateLimitRPSError = errors.Wrap(err, "ARM_TUNING_DIR/ARM_RATE_LIMIT_RPS must be a valid number")
-		} else if rpsVal <= 0 || math.IsNaN(rpsVal) || math.IsInf(rpsVal, 0) {
-			result.ARMRateLimitRPSError = fmt.Errorf("ARM_TUNING_DIR/ARM_RATE_LIMIT_RPS must be a finite number > 0, got %v", rpsVal)
+		} else if err := validateARMRateLimitRPS("ARM_TUNING_DIR/ARM_RATE_LIMIT_RPS", rpsVal); err != nil {
+			result.ARMRateLimitRPSError = err
 		} else {
 			result.ARMRateLimitRPS = &rpsVal
 		}
@@ -384,12 +384,28 @@ func LoadARMTuningForReload() ARMTuningReloadResult {
 		concVal, err := strconv.Atoi(strings.TrimSpace(string(concBytes)))
 		if err != nil {
 			result.MaxConcurrentActionsErr = errors.Wrap(err, "ARM_TUNING_DIR/MAX_CONCURRENT_ACTIONS must be a valid integer")
-		} else if concVal < 1 {
-			result.MaxConcurrentActionsErr = fmt.Errorf("ARM_TUNING_DIR/MAX_CONCURRENT_ACTIONS must be >= 1, got %d", concVal)
+		} else if err := validateMaxConcurrentActions("ARM_TUNING_DIR/MAX_CONCURRENT_ACTIONS", concVal); err != nil {
+			result.MaxConcurrentActionsErr = err
 		} else {
 			result.MaxConcurrentActions = &concVal
 		}
 	}
 
 	return result
+}
+
+// validateARMRateLimitRPS checks that rps is a positive finite number.
+func validateARMRateLimitRPS(field string, v float64) error {
+	if v <= 0 || math.IsNaN(v) || math.IsInf(v, 0) {
+		return fmt.Errorf("%s must be a finite number > 0, got %v", field, v)
+	}
+	return nil
+}
+
+// validateMaxConcurrentActions checks that concurrency is >= 1.
+func validateMaxConcurrentActions(field string, v int) error {
+	if v < 1 {
+		return fmt.Errorf("%s must be >= 1, got %d", field, v)
+	}
+	return nil
 }
