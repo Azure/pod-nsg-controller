@@ -427,6 +427,233 @@ func TestLoadARMTuningConfig_RuntimeReload_LastGoodRetention(t *testing.T) {
 	}
 }
 
+// ---------------------------------------------------------------------------
+// Phase 6: NaN/Inf validation — non-finite values must be rejected
+// ---------------------------------------------------------------------------
+
+func TestLoad_ARMRateLimitRPS_NaN_Fails(t *testing.T) {
+	t.Setenv("CLUSTER_NAME", "test-cluster")
+	t.Setenv("ARM_RATE_LIMIT_RPS", "NaN")
+
+	_, err := Load()
+	if err == nil {
+		t.Error("expected error for ARM_RATE_LIMIT_RPS=NaN, got nil")
+	}
+}
+
+func TestLoad_ARMRateLimitRPS_PosInf_Fails(t *testing.T) {
+	t.Setenv("CLUSTER_NAME", "test-cluster")
+	t.Setenv("ARM_RATE_LIMIT_RPS", "+Inf")
+
+	_, err := Load()
+	if err == nil {
+		t.Error("expected error for ARM_RATE_LIMIT_RPS=+Inf, got nil")
+	}
+}
+
+func TestLoad_ARMRateLimitRPS_NegInf_Fails(t *testing.T) {
+	t.Setenv("CLUSTER_NAME", "test-cluster")
+	t.Setenv("ARM_RATE_LIMIT_RPS", "-Inf")
+
+	_, err := Load()
+	if err == nil {
+		t.Error("expected error for ARM_RATE_LIMIT_RPS=-Inf, got nil")
+	}
+}
+
+func TestLoadARMTuningConfig_NaN_FileFails(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(dir+"/ARM_RATE_LIMIT_RPS", []byte("NaN\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(dir+"/MAX_CONCURRENT_ACTIONS", []byte("10\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("ARM_TUNING_DIR", dir)
+
+	_, err := LoadARMTuningConfig()
+	if err == nil {
+		t.Error("expected error for NaN in ARM_RATE_LIMIT_RPS file, got nil")
+	}
+}
+
+func TestLoadARMTuningConfig_PosInf_FileFails(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(dir+"/ARM_RATE_LIMIT_RPS", []byte("+Inf\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(dir+"/MAX_CONCURRENT_ACTIONS", []byte("10\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("ARM_TUNING_DIR", dir)
+
+	_, err := LoadARMTuningConfig()
+	if err == nil {
+		t.Error("expected error for +Inf in ARM_RATE_LIMIT_RPS file, got nil")
+	}
+}
+
+func TestLoadARMTuningConfig_NegInf_FileFails(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(dir+"/ARM_RATE_LIMIT_RPS", []byte("-Inf\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(dir+"/MAX_CONCURRENT_ACTIONS", []byte("10\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("ARM_TUNING_DIR", dir)
+
+	_, err := LoadARMTuningConfig()
+	if err == nil {
+		t.Error("expected error for -Inf in ARM_RATE_LIMIT_RPS file, got nil")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Phase 6: LoadARMTuningForReload — per-field independent results
+// ---------------------------------------------------------------------------
+
+func TestLoadARMTuningForReload_BothValid(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(dir+"/ARM_RATE_LIMIT_RPS", []byte("30\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(dir+"/MAX_CONCURRENT_ACTIONS", []byte("15\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("ARM_TUNING_DIR", dir)
+
+	result := LoadARMTuningForReload()
+	if result.FilesAbsent {
+		t.Error("expected FilesAbsent=false when both files present")
+	}
+	if result.ARMRateLimitRPS == nil {
+		t.Fatal("expected non-nil ARMRateLimitRPS")
+	}
+	if *result.ARMRateLimitRPS != 30 {
+		t.Errorf("ARMRateLimitRPS = %v, want 30", *result.ARMRateLimitRPS)
+	}
+	if result.ARMRateLimitRPSError != nil {
+		t.Errorf("unexpected ARMRateLimitRPSError: %v", result.ARMRateLimitRPSError)
+	}
+	if result.MaxConcurrentActions == nil {
+		t.Fatal("expected non-nil MaxConcurrentActions")
+	}
+	if *result.MaxConcurrentActions != 15 {
+		t.Errorf("MaxConcurrentActions = %v, want 15", *result.MaxConcurrentActions)
+	}
+	if result.MaxConcurrentActionsErr != nil {
+		t.Errorf("unexpected MaxConcurrentActionsErr: %v", result.MaxConcurrentActionsErr)
+	}
+}
+
+func TestLoadARMTuningForReload_ValidRPS_InvalidConcurrency(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(dir+"/ARM_RATE_LIMIT_RPS", []byte("25\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(dir+"/MAX_CONCURRENT_ACTIONS", []byte("garbage\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("ARM_TUNING_DIR", dir)
+
+	result := LoadARMTuningForReload()
+	// RPS should be valid.
+	if result.ARMRateLimitRPS == nil {
+		t.Fatal("expected non-nil ARMRateLimitRPS for valid field")
+	}
+	if *result.ARMRateLimitRPS != 25 {
+		t.Errorf("ARMRateLimitRPS = %v, want 25", *result.ARMRateLimitRPS)
+	}
+	// Concurrency should have error.
+	if result.MaxConcurrentActionsErr == nil {
+		t.Error("expected MaxConcurrentActionsErr for invalid file, got nil")
+	}
+	if result.MaxConcurrentActions != nil {
+		t.Errorf("expected nil MaxConcurrentActions for invalid value, got %v", *result.MaxConcurrentActions)
+	}
+}
+
+func TestLoadARMTuningForReload_InvalidRPS_ValidConcurrency(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(dir+"/ARM_RATE_LIMIT_RPS", []byte("not-a-number\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(dir+"/MAX_CONCURRENT_ACTIONS", []byte("12\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("ARM_TUNING_DIR", dir)
+
+	result := LoadARMTuningForReload()
+	// RPS should have error.
+	if result.ARMRateLimitRPSError == nil {
+		t.Error("expected ARMRateLimitRPSError for invalid file, got nil")
+	}
+	if result.ARMRateLimitRPS != nil {
+		t.Errorf("expected nil ARMRateLimitRPS for invalid value, got %v", *result.ARMRateLimitRPS)
+	}
+	// Concurrency should be valid.
+	if result.MaxConcurrentActions == nil {
+		t.Fatal("expected non-nil MaxConcurrentActions for valid field")
+	}
+	if *result.MaxConcurrentActions != 12 {
+		t.Errorf("MaxConcurrentActions = %v, want 12", *result.MaxConcurrentActions)
+	}
+}
+
+func TestLoadARMTuningForReload_BothFilesAbsent(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("ARM_TUNING_DIR", dir)
+
+	result := LoadARMTuningForReload()
+	if !result.FilesAbsent {
+		t.Error("expected FilesAbsent=true when both files missing")
+	}
+}
+
+func TestLoadARMTuningForReload_RPSFileMissing_ConcurrencyValid(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(dir+"/MAX_CONCURRENT_ACTIONS", []byte("8\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("ARM_TUNING_DIR", dir)
+
+	result := LoadARMTuningForReload()
+	if result.FilesAbsent {
+		t.Error("expected FilesAbsent=false when one file is present")
+	}
+	// Missing file → error for that field.
+	if result.ARMRateLimitRPSError == nil {
+		t.Error("expected ARMRateLimitRPSError for missing file, got nil")
+	}
+	// Present file → valid value.
+	if result.MaxConcurrentActions == nil {
+		t.Fatal("expected non-nil MaxConcurrentActions for present valid file")
+	}
+	if *result.MaxConcurrentActions != 8 {
+		t.Errorf("MaxConcurrentActions = %v, want 8", *result.MaxConcurrentActions)
+	}
+}
+
+func TestLoadARMTuningForReload_NaN_RPS_Rejected(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(dir+"/ARM_RATE_LIMIT_RPS", []byte("NaN\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(dir+"/MAX_CONCURRENT_ACTIONS", []byte("10\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("ARM_TUNING_DIR", dir)
+
+	result := LoadARMTuningForReload()
+	if result.ARMRateLimitRPSError == nil {
+		t.Error("expected ARMRateLimitRPSError for NaN, got nil")
+	}
+	if result.ARMRateLimitRPS != nil {
+		t.Errorf("expected nil ARMRateLimitRPS for NaN, got %v", *result.ARMRateLimitRPS)
+	}
+}
+
 func TestLoadARMTuningConfig_RuntimeReload_FilesRemovedReturnsAbsent(t *testing.T) {
 	// Simulates files being removed at runtime (e.g., ConfigMap unmounted).
 	dir := t.TempDir()

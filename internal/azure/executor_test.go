@@ -2089,3 +2089,162 @@ func (f *fakeExecutorMetricsObserver) ObserveETagConflict(subscriptionID, operat
 	defer f.mu.Unlock()
 	f.etagConflictCount++
 }
+
+// ---------------------------------------------------------------------------
+// Phase 6: metricOperationLabel — HTTP verb mapping for executor metrics
+// ---------------------------------------------------------------------------
+
+func TestPhase6_Executor_Metrics_DurationLabel_UsesHTTPVerb(t *testing.T) {
+	// Phase 6 design: ObserveCallDuration operation label must be HTTP verb
+	// (PUT/DELETE/UNKNOWN) not the internal enum (PutPrefixSet/DeletePrefixSet).
+	tests := []struct {
+		name     string
+		kind     engine.ActionKind
+		wantVerb string
+	}{
+		{"CreatePrefixSet→PUT", engine.CreatePrefixSet, "PUT"},
+		{"UpdatePrefixSet→PUT", engine.UpdatePrefixSet, "PUT"},
+		{"PatchPrefixSet→PUT", engine.PatchPrefixSet, "PUT"},
+		{"DeletePrefixSet→DELETE", engine.DeletePrefixSet, "DELETE"},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			log := zaptest.NewLogger(t)
+			factory := newStubFactory()
+			client := newStubClient()
+			factory.Register("sub1", client)
+
+			obs := &labelCapturingObserver{}
+			executor := NewExecutor(log, factory, 1, WithExecutorMetrics(obs))
+
+			actions := []engine.Action{
+				{
+					Kind:       tc.kind,
+					Target:     engine.ASGTarget{SubscriptionID: "sub1", ResourceGroup: "rg1", ASGName: "asg1", PrefixSetName: "ps1"},
+					DesiredIPs: []string{"10.0.0.1/32"},
+				},
+			}
+
+			_ = executor.Execute(context.Background(), actions)
+
+			obs.mu.Lock()
+			defer obs.mu.Unlock()
+			if len(obs.durationOps) == 0 {
+				t.Fatal("no duration observations recorded")
+			}
+			got := obs.durationOps[0]
+			if got != tc.wantVerb {
+				t.Errorf("ObserveCallDuration operation = %q, want HTTP verb %q", got, tc.wantVerb)
+			}
+		})
+	}
+}
+
+func TestPhase6_Executor_Metrics_ETagConflictLabel_UsesHTTPVerb(t *testing.T) {
+	// Phase 6 design: ObserveETagConflict must use HTTP verb labels (PUT/DELETE).
+	log := zaptest.NewLogger(t)
+	factory := newStubFactory()
+	client := newStubClient()
+	// Pre-populate so Get works during ETag retry.
+	client.store[stubKey("sub1", "rg1", "asg1", "ps1")] = []string{"10.0.0.1/32"}
+	client.fail412Count = 1
+	factory.Register("sub1", client)
+
+	obs := &labelCapturingObserver{}
+	executor := NewExecutor(log, factory, 1, WithExecutorMetrics(obs))
+
+	actions := []engine.Action{
+		{
+			Kind:       engine.UpdatePrefixSet,
+			Target:     engine.ASGTarget{SubscriptionID: "sub1", ResourceGroup: "rg1", ASGName: "asg1", PrefixSetName: "ps1"},
+			DesiredIPs: []string{"10.0.0.1/32", "10.0.0.2/32"},
+		},
+	}
+
+	_ = executor.Execute(context.Background(), actions)
+
+	obs.mu.Lock()
+	defer obs.mu.Unlock()
+	if len(obs.etagOps) == 0 {
+		t.Fatal("no ETag conflict observations recorded")
+	}
+	got := obs.etagOps[0]
+	if got != "PUT" {
+		t.Errorf("ObserveETagConflict operation = %q, want HTTP verb %q", got, "PUT")
+	}
+}
+
+func TestPhase6_Executor_Metrics_DurationLabel_TerminalActionKind(t *testing.T) {
+	// Phase 6 design: when ETag retry recomputes to a different action kind,
+	// the duration label must reflect the terminal (final) action kind.
+	log := zaptest.NewLogger(t)
+	factory := newStubFactory()
+	client := newStubClient()
+	// Pre-populate target so Get during ETag retry finds data.
+	client.store[stubKey("sub1", "rg1", "asg1", "ps1")] = []string{"10.0.0.1/32"}
+	// Force one 412 to trigger a recompute.
+	client.fail412Count = 1
+	factory.Register("sub1", client)
+
+	obs := &labelCapturingObserver{}
+	executor := NewExecutor(log, factory, 1, WithExecutorMetrics(obs))
+
+	actions := []engine.Action{
+		{
+			Kind:       engine.UpdatePrefixSet,
+			Target:     engine.ASGTarget{SubscriptionID: "sub1", ResourceGroup: "rg1", ASGName: "asg1", PrefixSetName: "ps1"},
+			DesiredIPs: []string{"10.0.0.1/32", "10.0.0.2/32"},
+		},
+	}
+
+	results := executor.Execute(context.Background(), actions)
+	if len(results) != 1 || !results[0].Success {
+		t.Fatalf("expected success, got: %+v", results)
+	}
+
+	obs.mu.Lock()
+	defer obs.mu.Unlock()
+	if len(obs.durationOps) == 0 {
+		t.Fatal("no duration observations recorded")
+	}
+	// The operation label must be an HTTP verb, not an internal enum string.
+	got := obs.durationOps[0]
+	validVerbs := map[string]bool{"PUT": true, "DELETE": true, "UNKNOWN": true}
+	if !validVerbs[got] {
+		t.Errorf("ObserveCallDuration operation = %q, want one of PUT/DELETE/UNKNOWN (HTTP verb)", got)
+	}
+}
+
+// labelCapturingObserver captures the operation label values for assertions.
+type labelCapturingObserver struct {
+	mu          sync.Mutex
+	durationOps []string
+	etagOps     []string
+	incCount    int
+	decCount    int
+}
+
+func (o *labelCapturingObserver) ObserveCallDuration(subscriptionID, operation string, d time.Duration) {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	o.durationOps = append(o.durationOps, operation)
+}
+
+func (o *labelCapturingObserver) IncConcurrentActions() {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	o.incCount++
+}
+
+func (o *labelCapturingObserver) DecConcurrentActions() {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	o.decCount++
+}
+
+func (o *labelCapturingObserver) ObserveETagConflict(subscriptionID, operation string) {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	o.etagOps = append(o.etagOps, operation)
+}

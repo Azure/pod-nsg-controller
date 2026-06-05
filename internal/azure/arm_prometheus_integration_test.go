@@ -398,3 +398,80 @@ func TestPhase6_Integration_ExecutorMetrics_PrometheusRegistry(t *testing.T) {
 		t.Errorf("arm_etag_conflicts_total{sub-p6, PUT} = %v, want >= 1", etagVal)
 	}
 }
+
+// ---------------------------------------------------------------------------
+// Phase 6: Integration — executor metrics use HTTP verb labels in prometheus
+// ---------------------------------------------------------------------------
+
+func TestPhase6_Integration_ExecutorMetrics_HTTPVerbLabels(t *testing.T) {
+	metrics.ResetForTesting()
+	defer metrics.ResetForTesting()
+
+	reg := prometheus.NewRegistry()
+	rec, err := metrics.RegisterWith(reg)
+	if err != nil {
+		t.Fatalf("RegisterWith failed: %v", err)
+	}
+
+	// Exercise with explicit HTTP verb labels (Phase 6 contract).
+	rec.ARM.ObserveCallDuration("sub-verb", "PUT", 100*time.Millisecond)
+	rec.ARM.ObserveCallDuration("sub-verb", "DELETE", 200*time.Millisecond)
+	rec.ARM.ObserveETagConflict("sub-verb", "PUT")
+	rec.ARM.ObserveETagConflict("sub-verb", "DELETE")
+
+	mfs, err := reg.Gather()
+	if err != nil {
+		t.Fatalf("Gather() failed: %v", err)
+	}
+
+	// Verify arm_call_duration_seconds has observations with PUT and DELETE labels.
+	callDuration := findMetricFamily(mfs, "pod_nsg_controller_arm_call_duration_seconds")
+	if callDuration == nil {
+		t.Fatal("pod_nsg_controller_arm_call_duration_seconds not found")
+	}
+
+	putHistCount := findHistogramCountWithLabels(callDuration, map[string]string{
+		"subscription_id": "sub-verb",
+		"operation":       "PUT",
+	})
+	if putHistCount < 1 {
+		t.Errorf("arm_call_duration_seconds{operation=PUT} count = %d, want >= 1", putHistCount)
+	}
+
+	deleteHistCount := findHistogramCountWithLabels(callDuration, map[string]string{
+		"subscription_id": "sub-verb",
+		"operation":       "DELETE",
+	})
+	if deleteHistCount < 1 {
+		t.Errorf("arm_call_duration_seconds{operation=DELETE} count = %d, want >= 1", deleteHistCount)
+	}
+
+	// Verify arm_etag_conflicts_total with verb labels.
+	etagConflicts := findMetricFamily(mfs, "pod_nsg_controller_arm_etag_conflicts_total")
+	if etagConflicts == nil {
+		t.Fatal("pod_nsg_controller_arm_etag_conflicts_total not found")
+	}
+	putEtag := findCounterWithLabels(etagConflicts, map[string]string{
+		"subscription_id": "sub-verb",
+		"operation":       "PUT",
+	})
+	if putEtag < 1 {
+		t.Errorf("arm_etag_conflicts_total{operation=PUT} = %v, want >= 1", putEtag)
+	}
+	deleteEtag := findCounterWithLabels(etagConflicts, map[string]string{
+		"subscription_id": "sub-verb",
+		"operation":       "DELETE",
+	})
+	if deleteEtag < 1 {
+		t.Errorf("arm_etag_conflicts_total{operation=DELETE} = %v, want >= 1", deleteEtag)
+	}
+}
+
+func findHistogramCountWithLabels(mf *dto.MetricFamily, filter map[string]string) uint64 {
+	for _, m := range mf.GetMetric() {
+		if matchMetricLabels(m, filter) && m.GetHistogram() != nil {
+			return m.GetHistogram().GetSampleCount()
+		}
+	}
+	return 0
+}
