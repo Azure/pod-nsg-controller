@@ -853,6 +853,10 @@ func TestDesiredStateEngine(t *testing.T) {
 | `MAX_CONCURRENT_ACTIONS` | No | `10` | Maximum parallel ARM calls per reconcile cycle |
 
 > **Note:** `ARM_RATE_LIMIT_RPS` and `MAX_CONCURRENT_ACTIONS` support runtime tuning without restart. In-cluster, these values are sourced from a ConfigMap-mounted directory (`ARM_TUNING_DIR`). Updating the ConfigMap applies new values on the next poll cycle (~30s).
+>
+> **Startup fallback semantics:** At startup, if `ARM_TUNING_DIR` is set but both tuning files are absent, the controller falls back to environment variables / defaults (non-fatal). If `ARM_TUNING_DIR` is unset, environment variables are used directly.
+>
+> **Per-field last-good retention:** At runtime, each field is loaded and validated independently. If one tuning file is invalid or missing while the other is valid, the valid field is applied and the invalid/missing field retains its last-good value. Both fields absent at runtime is non-fatal — current values are preserved with an info-level log.
 
 > **Note:** `AZURE_NSG_NAME` from the current config is no longer needed — the new design manages ASG addressPrefixSets, not NSG rules directly.
 

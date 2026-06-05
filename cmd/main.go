@@ -282,7 +282,11 @@ func (r *armTuningReloader) Start(ctx context.Context) error {
 
 func (r *armTuningReloader) reload() {
 	result := config.LoadARMTuningForReload()
-	if result.NotConfigured || result.FilesAbsent {
+	if result.NotConfigured {
+		return
+	}
+	if result.FilesAbsent {
+		r.log.Info("ARM tuning files absent at runtime, keeping current values")
 		return
 	}
 
