@@ -330,12 +330,12 @@ func LoadARMTuningFromEnv() (ARMTuningConfig, error) {
 // Unlike LoadARMTuningConfig (which is atomic), this allows applying
 // valid fields independently during runtime reload.
 type ARMTuningReloadResult struct {
-ARMRateLimitRPS         *float64
-MaxConcurrentActions    *int
-ARMRateLimitRPSError    error
-MaxConcurrentActionsErr error
-FilesAbsent             bool
-NotConfigured           bool // true when ARM_TUNING_DIR env var is unset
+	ARMRateLimitRPS         *float64
+	MaxConcurrentActions    *int
+	ARMRateLimitRPSError    error
+	MaxConcurrentActionsErr error
+	FilesAbsent             bool
+	NotConfigured           bool // true when ARM_TUNING_DIR env var is unset
 }
 
 // LoadARMTuningForReload loads ARM tuning with per-field granularity for runtime
