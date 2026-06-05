@@ -14,9 +14,9 @@ import (
 
 // ErrTuningFilesAbsent is returned by LoadARMTuningConfig when ARM_TUNING_DIR
 // is set but both tuning files are missing. At startup this is non-fatal
-// (caller falls back to defaults); at runtime the reloader treats it as an
-// error and preserves last-good values.
-var ErrTuningFilesAbsent = stderrors.New("ARM_TUNING_DIR set but both tuning files absent")
+// (caller falls back to env/defaults). Runtime reload uses LoadARMTuningForReload,
+// which reports file absence via ARMTuningReloadResult.FilesAbsent so callers can
+// preserve last-good values.
 
 const (
 	// LabelASG is the pod label for single-ASG assignment.
