@@ -247,23 +247,10 @@ func TestPhase6_ARMRecorder_AcceptsVerbLabelSet(t *testing.T) {
 }
 
 func TestPhase6_ARMRecorder_RejectsNonVerbOperation(t *testing.T) {
-	// Phase 6 design: old-style labels like "PutPrefixSet" must NOT appear.
-	// This test verifies the contract by asserting the recorder's operation
-	// dimension should only contain HTTP verbs. Since the recorder accepts any
-	// string (it's counter-based), this test documents the expected contract
-	// by verifying the metricOperationLabel helper produces only verbs.
-	//
-	// If metricOperationLabel doesn't exist, this test documents that the
-	// operation labels observed must be from the verb set.
-	rec := newARMRecorder()
-
-	// Record with an old-style label — this should NOT be the pattern used.
-	rec.ObserveCallDuration("sub-old", "PutPrefixSet", 100*time.Millisecond)
-	count := getHistogramSampleCount(t, rec.callDuration, "sub-old", "PutPrefixSet")
-	// The recorder technically accepts it (it's just a string label), but
-	// we assert metricOperationLabel() maps to "PUT" not "PutPrefixSet".
-	// This test will pass — the real contract is tested in executor_test.go.
-	if count == 0 {
-		t.Skip("recorder accepts arbitrary strings; contract is enforced at executor level")
-	}
+	// The recorder itself accepts arbitrary operation strings — it is a
+	// label-value on a Prometheus counter/histogram, so no validation
+	// happens at this layer. The real contract that only HTTP verbs
+	// ("GET", "PUT", "DELETE", …) appear as operation labels is enforced
+	// by metricOperationLabel() at the executor level (see executor_test.go).
+	t.Skip("recorder accepts arbitrary strings; operation-label contract is enforced at executor level — see executor_test.go")
 }
