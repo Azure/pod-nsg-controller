@@ -208,6 +208,15 @@ func TestPhase9_T93_ScaleDown_FiveToTwo_RemovesThreeIPs(t *testing.T) {
 		if len(ips) != 2 {
 			return false, fmt.Sprintf("got %d IPs, want 2: %v", len(ips), ips)
 		}
+		sorted := make([]string, len(ips))
+		copy(sorted, ips)
+		sort.Strings(sorted)
+		expected := []string{"10.0.0.1/32", "10.0.0.2/32"}
+		for i, ip := range expected {
+			if sorted[i] != ip {
+				return false, fmt.Sprintf("expected IPs %v, got %v", expected, sorted)
+			}
+		}
 		return true, ""
 	})
 }
