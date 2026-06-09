@@ -1,0 +1,59 @@
+name: "Phase 9: Integration & E2E Tests"
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  integration:
+    name: Integration Tests (envtest)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Run phase9 integration tests
+        run: make test-phase9-integration
+
+  e2e:
+    name: E2E Tests (live Azure)
+    runs-on: ubuntu-latest
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    environment: azure-e2e
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Azure Login
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Set up kubeconfig
+        uses: azure/aks-set-context@v4
+        with:
+          resource-group: ${{ secrets.AKS_RESOURCE_GROUP }}
+          cluster-name: ${{ secrets.AKS_CLUSTER_NAME }}
+
+      - name: Run E2E tests
+        env:
+          AZURE_E2E: "true"
+          E2E_CLUSTER_NAME: ${{ secrets.E2E_CLUSTER_NAME }}
+          E2E_PRIMARY_ASG_RESOURCE_ID: ${{ secrets.E2E_PRIMARY_ASG_RESOURCE_ID }}
+          E2E_CROSS_SUB_ASG_RESOURCE_IDS: ${{ secrets.E2E_CROSS_SUB_ASG_RESOURCE_IDS }}
+        run: make test-phase9-e2e
