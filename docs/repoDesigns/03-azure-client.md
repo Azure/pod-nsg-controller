@@ -1,10 +1,10 @@
 # 03 — Azure Client Design
 
-> Package: `internal/azure` · ARM REST client, retry, rate limiting, executor
+> Package: `internal/azure` · ARM REST client, SDK helpers, retry, rate limiting, executor
 
 ## Overview
 
-The Azure layer provides a direct REST client for ARM Address Prefix Set resources (a child resource of Application Security Groups), along with retry policies, per-subscription rate limiting, and a concurrency-bounded executor for parallel action dispatch.
+The Azure layer provides a direct REST client for ARM Address Prefix Set resources (a child resource of Application Security Groups), along with retry policies, per-subscription rate limiting, and a concurrency-bounded executor for parallel action dispatch. It also includes Azure SDK-backed ASG/NIC helper clients plus shared option and metrics wiring used across clients, the factory, the executor, and the rate limiter.
 
 ## Component Map
 
@@ -12,8 +12,12 @@ The Azure layer provides a direct REST client for ARM Address Prefix Set resourc
 internal/azure/
 ├── interfaces.go                  # AddressPrefixSetAPI, ClientFactory, errors
 ├── address_prefix_set_client.go   # HTTP client implementation
+├── asg_client.go                  # ASG CRUD client (Get, CreateOrUpdate, Delete, UpdateTags, List, ListAll)
+├── nic_client.go                  # NIC client for ASG membership updates (Get, UpdateASGs, ListByResourceGroup)
 ├── client_factory.go              # Per-subscription client caching
+├── client_options.go              # Shared option helpers + ARM error parsing with retry context
 ├── executor.go                    # Bounded-concurrency action runner
+├── metrics_options.go             # Metrics observer wiring for client/factory/executor/rate limiter
 ├── retry.go                       # Retry policy, backoff, ARM classification
 ├── ratelimit.go                   # Per-subscription token bucket limiter
 └── fake/
@@ -46,8 +50,7 @@ Direct ARM REST client (no Azure SDK dependency for this resource type).
 ```go
 WithRetryPolicy(policy RetryPolicy)
 WithSubscriptionRateLimiter(limiter SubscriptionRateLimiter)
-WithHTTPClient(client *http.Client)
-WithBaseURL(url string)
+WithARMBaseURL(url string)
 ```
 
 ### Request Flow
@@ -61,7 +64,7 @@ API method (Get/Put/Delete/List)
          ├─ http.NewRequestWithContext(...)
          ├─ acquireToken(ctx)                        ← Azure credential
          ├─ httpClient.Do(req)
-         ├─ parseARMError(resp, body, op)            ← build ARMStatusError
+         ├─ ParseARMErrorWithContext(...)             ← build ARMStatusError
          ├─ DecideRetry(err, attempt, policy)        ← retry decision
          └─ sleep(decision.Delay) or return
 ```
@@ -89,18 +92,28 @@ type ARMStatusError struct {
 
 `Unwrap()` returns `ErrNotFound` for 404 status, enabling `errors.Is(err, ErrNotFound)`.
 
+## Client Options
+
+`client_options.go` provides shared option helpers and ARM error parsing utilities used by the direct ARM client:
+
+- `WithRetryPolicy(policy RetryPolicy)` — set the retry policy on `AddressPrefixSetClient`
+- `WithSubscriptionRateLimiter(limiter SubscriptionRateLimiter)` — attach a per-subscription rate limiter to `AddressPrefixSetClient`
+- `ParseARMErrorWithContext(statusCode, body, headers, retryCtx)` — enrich `ARMStatusError` with operation, request URL, and `Retry-After` metadata from the retry context
+
 ## Client Factory
 
 ```go
 type ClientFactory struct {
-    log         *zap.Logger
-    credential  azcore.TokenCredential
-    httpClient  *http.Client
-    baseURL     string
-    retryPolicy RetryPolicy
-    rateLimiter SubscriptionRateLimiter
-    mu          sync.Mutex
-    clients     map[string]AddressPrefixSetAPI
+    log              *zap.Logger
+    credential       azcore.TokenCredential
+    httpClient       *http.Client
+    baseURL          string
+    retryPolicy      RetryPolicy
+    rateLimiter      SubscriptionRateLimiter
+    armObserver      armRequestObserver
+    armRetryObserver armRetryObserver
+    mu               sync.RWMutex
+    clients          map[string]AddressPrefixSetAPI
 }
 ```
 
@@ -186,12 +199,21 @@ A `NoopSubscriptionRateLimiter()` is provided for testing.
 
 ```go
 type Executor struct {
-    log         *zap.Logger
-    factory     AddressPrefixSetClientFactory
-    maxParallel int    // concurrency bound (default from config)
-    maxRetries  int    // ETag retry limit (default 3)
+    log                   *zap.Logger
+    factory               AddressPrefixSetClientFactory
+    maxParallel           int
+    maxRetries            int
+    retryObserver         armRetryObserver
+    metricsObserver       ARMExecutorObserver
+    patchThresholdPercent int
 }
 ```
+
+### Executor Options
+
+- `WithPatchThresholdPercent(pct)` — controls whether recomputed diffs produce patch or update actions during the 412 retry path
+- `WithExecutorMetrics(observer)` — records executor action duration, concurrency, and ETag conflict events
+- `WithExecutorRetryMetrics(observer)` — records ETag conflict retries
 
 ### Execution Flow
 
@@ -230,3 +252,108 @@ If the recomputed diff produces no action (state already converged), the result 
 - Per-operation error injection via `InjectKey` and FIFO queues
 - `fake.ClientFactory` returns per-subscription fakes
 - Thread-safe via `sync.Mutex`
+
+## ASG Client
+
+`asg_client.go` provides a typed Azure SDK client for Application Security Group management. The client is scoped to a resource group at construction time.
+
+### Struct
+
+```go
+type ASGClient struct {
+    client        *armnetwork.ApplicationSecurityGroupsClient
+    resourceGroup string
+    log           logr.Logger
+}
+```
+
+### Constructor
+
+```go
+func NewASGClient(subscriptionID, resourceGroup string, logger logr.Logger) (*ASGClient, error)
+```
+
+### Operations
+
+| Method | Description |
+|--------|-------------|
+| `Get(ctx, asgName)` | Fetch a single ASG in the configured resource group |
+| `CreateOrUpdate(ctx, asgName, location, tags)` | Create or update an ASG |
+| `Delete(ctx, asgName)` | Delete an ASG |
+| `UpdateTags(ctx, asgName, tags)` | Patch ASG tags |
+| `List(ctx)` | List ASGs in the configured resource group |
+| `ListAll(ctx)` | List all ASGs in the subscription |
+
+Used by `cmd/testops/` for smoke testing and by future NIC-based ASG membership flows.
+
+## NIC Client
+
+`nic_client.go` provides a typed Azure SDK client for Network Interface operations. The client is scoped to a resource group at construction time.
+
+### Struct
+
+```go
+type NICClient struct {
+    client        *armnetwork.InterfacesClient
+    resourceGroup string
+}
+```
+
+### Constructor
+
+```go
+func NewNICClient(subscriptionID, resourceGroup string) (*NICClient, error)
+```
+
+### Operations
+
+| Method | Description |
+|--------|-------------|
+| `Get(ctx, nicName)` | Fetch a single NIC in the configured resource group |
+| `UpdateASGs(ctx, nicName, nic)` | Persist updated ASG membership on a NIC |
+| `ListByResourceGroup(ctx)` | List NICs in the configured resource group |
+
+Supports future direct NIC→ASG assignment flows as an alternative to Address Prefix Sets.
+
+## Metrics Wiring
+
+`metrics_options.go` provides functional options to inject Prometheus-facing metrics observers into the Azure layer.
+
+### Client-Level Options
+
+| Option | Target | Description |
+|--------|--------|-------------|
+| `WithARMMetrics(observer, retryObserver)` | `AddressPrefixSetClient` | Observe per-request ARM duration/status plus retry decisions |
+| `WithARMRecorder(recorder)` | `AddressPrefixSetClient` | Attach a single recorder that implements both ARM request and retry observers |
+
+### Factory-Level Options
+
+| Option | Target | Description |
+|--------|--------|-------------|
+| `WithFactoryARMMetrics(observer, retryObserver)` | `ClientFactory` | Propagate ARM request and retry observers to all created clients |
+| `WithFactoryARMRecorder(recorder)` | `ClientFactory` | Propagate a shared recorder to all created clients |
+
+### Executor-Level Options
+
+| Option | Target | Description |
+|--------|--------|-------------|
+| `WithExecutorMetrics(observer)` | `Executor` | Record executor call duration, concurrency, and ETag conflict events |
+| `WithExecutorRetryMetrics(observer)` | `Executor` | Record ETag conflict retries |
+| `WithPatchThresholdPercent(pct)` | `Executor` | Control the patch-vs-update decision threshold used during recompute |
+
+### Rate Limiter Options
+
+| Option | Target | Description |
+|--------|--------|-------------|
+| `WithRateLimitMetrics(observer)` | `ARMRateLimiter` | Record rate-limit delay events and durations |
+
+### Observer Interface
+
+```go
+type ARMExecutorObserver interface {
+    ObserveCallDuration(subscriptionID, operation string, d time.Duration)
+    IncConcurrentActions()
+    DecConcurrentActions()
+    ObserveETagConflict(subscriptionID, operation string)
+}
+```

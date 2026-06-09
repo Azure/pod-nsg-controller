@@ -96,6 +96,41 @@ Otherwise:
   → RequeueAfter = ExhaustedRetryBackoff
 ```
 
+## Error Policy Functions
+
+`error_policy.go` centralizes the post-reconcile error→requeue decision path:
+
+### `finalizeSystemError`
+
+```go
+func finalizeSystemError(
+    ctx context.Context,
+    key types.NamespacedName,
+    observedGeneration int64,
+    err error,
+    statusUpdater StatusUpdater,
+    policy RequeuePolicy,
+) (ctrl.Result, error)
+```
+
+Called when a system error occurs before or during Azure operations:
+1. Writes `Reconciled=False` status (if `StatusUpdater != nil`)
+2. Classifies the error and computes the requeue decision
+3. If the status write itself fails, delegates to `finalizeStatusWriteError`
+
+### `finalizeStatusWriteError`
+
+```go
+func finalizeStatusWriteError(statusErr error, reconcileResult ctrl.Result) (ctrl.Result, error)
+```
+
+Determines whether a status write failure should override the original reconcile result:
+- `ErrStatusStaleGeneration` → return original result (stale status is harmless)
+- `ErrStatusObjectNotFound` → return original result (CR deleted)
+- Other errors → return the status error directly (takes precedence)
+
+These functions eliminate duplicated error handling across the reconcile, delete, and validation paths.
+
 ## Reconciler Error Handling Patterns
 
 ### Validation Failures
