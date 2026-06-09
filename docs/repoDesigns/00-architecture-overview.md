@@ -44,15 +44,30 @@ The **pod-nsg-controller** is a Kubernetes controller that manages Azure Applica
 ```
 pod-nsg-controller/
 ├── api/v1alpha1/            # CRD types: PodASGMapping, status, conditions
-├── cmd/main.go              # Entry point — wires all components
+├── cmd/
+│   ├── main.go              # Entry point — wires controller, metrics, and tuning runnables
+│   └── testops/             # Standalone smoke-test binary for ASG + AddressPrefixSet ops
 ├── internal/
 │   ├── azure/               # ARM REST client, retry, rate limiting, executor
 │   │   └── fake/            # In-memory fake client for tests
 │   ├── config/              # Environment-based configuration
 │   ├── controller/          # Reconciler, status updater, predicates, pod handler
 │   ├── engine/              # Desired-state computation and diffing
-│   └── model/               # Resource ID parsing, ownership keys, selectors
+│   ├── metrics/             # Prometheus metrics, trackers, and queue instrumentation
+│   ├── model/               # Resource ID parsing, ownership keys, selectors
+│   └── testing/             # Test-only helpers for acceptance/status validation
+├── scripts/
+│   └── poc/                 # Multi-cluster PoC provisioning and validation scripts
 ├── test/integration/        # Per-phase integration tests (envtest)
+│   ├── phase1/              # Integration suite phase 1
+│   ├── phase2/              # Integration suite phase 2
+│   ├── phase3/              # Integration suite phase 3
+│   ├── phase4/              # Integration suite phase 4
+│   ├── phase5/              # Integration suite phase 5
+│   ├── phase6/              # Integration suite phase 6
+│   ├── phase7/              # Integration suite phase 7
+│   ├── phase8/              # Integration suite phase 8
+│   └── testutil/            # Shared integration helpers
 ├── config/                  # Kubernetes manifests (CRD, RBAC, manager)
 └── docs/                    # Specification and design documents
 ```
@@ -62,21 +77,35 @@ pod-nsg-controller/
 ```
 cmd/main.go
   ├── config.Load()
+  ├── config.LoadARMTuningConfig()
+  ├── metrics.RegisterWith()
+  ├── metrics.NewInitialReconcileTracker()
+  ├── metrics.NewPodChurnTracker()
+  ├── metrics.NewConvergenceTracker()
   ├── azure.NewClientFactory()
   ├── azure.NewARMRateLimiter()
   ├── azure.NewExecutor()
+  ├── engine.NewDesiredStateCache()
   ├── controller.NewMappingStatusUpdater()
-  └── controller.MappingReconciler
+  │     └── controller.SetConvergenceCommitter()
+  ├── controller.MappingReconciler
         ├── uses engine.ComputeDesiredState()
         ├── uses engine.ComputeDiff()
+        ├── uses engine.DesiredStateCache
         ├── uses azure.Executor.Execute()
+        ├── records reconcile / queue / ARM metrics
+        ├── tracks pod churn, convergence, and first reconcile timing
         └── uses controller.MappingStatusUpdater
               └── uses controller.ComputeStatus()
+  ├── controller.NewInitialReconcileInitializer()
+  │     └── manager Runnable for initial reconcile detection
+  └── ARM tuning reloader
+        └── manager Runnable for runtime ARM tuning updates
 ```
 
 ## Key Design Principles
 
-1. **Desired-state convergence** — Every reconcile computes the full desired state and diffs it against Azure. The controller converges towards the desired state, never applying incremental patches.
+1. **Desired-state convergence** — Every reconcile computes the full desired state and diffs it against Azure. The controller converges towards the desired state, with the executor choosing patch vs full update based on the configured diff threshold.
 
 2. **Ownership-based cleanup** — Each `PodASGMapping` tracks the ASGs it owns via a JSON annotation (`networking.azure.com/owned-asgs.v1`). On deletion, only owned resources are cleaned up.
 
@@ -87,6 +116,8 @@ cmd/main.go
 5. **Testability via interfaces** — All Azure operations go through `AddressPrefixSetAPI`. Tests use `fake.Client` for deterministic, in-memory behaviour.
 
 6. **Structured logging** — All code uses `go.uber.org/zap`. Controller-runtime code uses `logr.Logger` backed by `zapr`. Azure clients use `*zap.Logger` directly.
+
+7. **Observability** — All ARM calls, reconcile cycles, pod churn, and convergence events emit Prometheus metrics. The `internal/metrics` package provides sub-recorders with per-mapping, per-subscription label cardinality.
 
 ## Reconciliation Lifecycle
 
@@ -139,6 +170,7 @@ All configuration is read from environment variables:
 | `RESYNC_INTERVAL_SECONDS` | No | `60` | Periodic resync interval |
 | `ARM_RATE_LIMIT_RPS` | No | `10` | Per-subscription ARM rate limit |
 | `MAX_CONCURRENT_ACTIONS` | No | `5` | Max parallel ARM mutations |
+| `POD_NSG_PATCH_THRESHOLD_PERCENT` | No | `50` | Patch vs update threshold percentage |
 
 ## Related Design Documents
 
@@ -150,3 +182,5 @@ All configuration is read from environment variables:
 | [04 — Engine](04-engine.md) | Desired-state computation and diff algorithm |
 | [05 — Model & Config](05-model-and-config.md) | Resource ID parsing, ownership keys, config loading |
 | [06 — Error Handling](06-error-handling.md) | Error classification, requeue strategy, resilience |
+| [07 — Metrics](07-metrics.md) | Prometheus metrics subsystem, recorders, trackers, queue instrumentation |
+| [08 — Testing & Infrastructure](08-testing-and-infrastructure.md) | Test utilities, testops binary, integration test phases, PoC scripts |

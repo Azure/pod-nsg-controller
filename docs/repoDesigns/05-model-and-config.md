@@ -57,6 +57,25 @@ func CompileSelector(sel v1alpha1.PodSelector) (labels.Selector, error)
 
 Converts the CRD `PodSelector.MatchLabels` into a Kubernetes `labels.Selector` for pod matching.
 
+### Mapping Index
+
+`index.go` provides a precomputed index for efficient pod-to-ASG lookups:
+
+```go
+type MappingIndex struct {
+    // Precomputed selector→ASG mappings for a namespace
+}
+
+func BuildIndex(mappings []v1alpha1.PodASGMapping) *MappingIndex
+```
+
+Functions:
+- `BuildIndex(mappings)` — precompiles all pod selectors and ASG references into an index
+- `MatchingASGs(podLabels)` — returns ASG targets matching a pod's labels in O(n) selector evaluations
+- `canonicalASGKey(ref)` — normalizes ASG reference for deduplication (case-insensitive)
+
+The index is used by the desired-state cache for incremental pod add/update/delete operations without re-evaluating all mapping rules.
+
 ---
 
 ## Config Package
@@ -86,6 +105,7 @@ type Config struct {
     ResyncInterval       time.Duration // RESYNC_INTERVAL_SECONDS (default: 60s)
     ARMRateLimitRPS      float64       // ARM_RATE_LIMIT_RPS (default: 10)
     MaxConcurrentActions int           // MAX_CONCURRENT_ACTIONS (default: 5)
+    PatchThresholdPercent int           // POD_NSG_PATCH_THRESHOLD_PERCENT (default: 50)
 }
 ```
 
@@ -121,6 +141,7 @@ func (c *Config) Validate() error
 | `RESYNC_INTERVAL_SECONDS` | No | `60` | Positive integer |
 | `ARM_RATE_LIMIT_RPS` | No | `10` | Positive float |
 | `MAX_CONCURRENT_ACTIONS` | No | `5` | Positive integer ≥ 1 |
+| `POD_NSG_PATCH_THRESHOLD_PERCENT` | No | `50` | Patch vs full-update threshold (0-100) |
 
 ### Wiring in main.go
 
@@ -132,4 +153,5 @@ cfg, err := config.Load()
 // - MappingReconciler.ResyncInterval
 // - azure.NewARMRateLimiter(log, cfg.ARMRateLimitRPS)
 // - azure.NewExecutor(log, factory, cfg.MaxConcurrentActions)
+// - azure.NewExecutor(..., azure.WithPatchThresholdPercent(cfg.PatchThresholdPercent))
 ```
