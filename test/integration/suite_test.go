@@ -1,4 +1,4 @@
-package phase9_test
+package integration_test
 
 import (
 	"context"
@@ -53,7 +53,7 @@ func repoRootFromCWD() (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("get working directory: %w", err)
 	}
-	return filepath.Clean(filepath.Join(wd, "..", "..", "..")), nil
+	return filepath.Clean(filepath.Join(wd, "..", "..")), nil
 }
 
 func configureEnvtestAssets(repoRoot string) error {
@@ -99,10 +99,10 @@ func hasEnvtestBinaries(assetsPath string) bool {
 }
 
 // ---------------------------------------------------------------------------
-// phase9Env — envtest harness for Phase 9 integration tests
+// integrationEnv — envtest harness for integration tests
 // ---------------------------------------------------------------------------
 
-type phase9Env struct {
+type integrationEnv struct {
 	env              *envtest.Environment
 	scheme           *runtime.Scheme
 	mgr              ctrl.Manager
@@ -114,10 +114,10 @@ type phase9Env struct {
 	fakeClientsBySub map[string]*fake.Client
 	desiredCache     *engine.DesiredStateCache
 	zapLog           *zap.Logger
-	opts             phase9EnvOptions
+	opts             integrationEnvOptions
 }
 
-type phase9EnvOptions struct {
+type integrationEnvOptions struct {
 	ClusterName             string
 	ResyncInterval          time.Duration
 	MaxConcurrentReconciles int
@@ -137,7 +137,7 @@ func integrationScheme(t *testing.T) *runtime.Scheme {
 	return s
 }
 
-func setupPhase9Env(t *testing.T, opts phase9EnvOptions) *phase9Env {
+func setupIntegrationEnv(t *testing.T, opts integrationEnvOptions) *integrationEnv {
 	t.Helper()
 
 	metrics.ResetForTesting()
@@ -163,7 +163,7 @@ func setupPhase9Env(t *testing.T, opts phase9EnvOptions) *phase9Env {
 	ctrl.SetLogger(zapr.NewLogger(zapLog))
 
 	env := &envtest.Environment{
-		CRDDirectoryPaths: []string{"../../../config/crd"},
+		CRDDirectoryPaths: []string{"../../config/crd"},
 		Scheme:            scheme,
 	}
 
@@ -184,7 +184,7 @@ func setupPhase9Env(t *testing.T, opts phase9EnvOptions) *phase9Env {
 
 	desiredCache := engine.NewDesiredStateCache(opts.ClusterName)
 
-	pe := &phase9Env{
+	ie := &integrationEnv{
 		env:              env,
 		scheme:           scheme,
 		mgr:              mgr,
@@ -196,10 +196,10 @@ func setupPhase9Env(t *testing.T, opts phase9EnvOptions) *phase9Env {
 		opts:             opts,
 	}
 
-	return pe
+	return ie
 }
 
-func (e *phase9Env) startManager(t *testing.T, exec controller.Executor) {
+func (e *integrationEnv) startManager(t *testing.T, exec controller.Executor) {
 	t.Helper()
 
 	statusUpdater := controller.NewMappingStatusUpdater(e.mgr.GetClient(), ctrl.Log.WithName("status-updater"))
@@ -238,72 +238,24 @@ func (e *phase9Env) startManager(t *testing.T, exec controller.Executor) {
 	}
 }
 
-func (e *phase9Env) restartManager(t *testing.T, exec controller.Executor) {
+func (e *integrationEnv) teardown(t *testing.T) {
 	t.Helper()
-
-	// Stop old manager
-	e.mgrCancel()
-	select {
-	case err := <-e.mgrDone:
-		if err != nil {
-			t.Logf("old manager stopped with: %v", err)
-		}
-	case <-time.After(10 * time.Second):
-		t.Fatal("timeout waiting for old manager to stop")
+	if e.mgrCancel != nil {
+		e.mgrCancel()
+		<-e.mgrDone
 	}
-
-	// Create new manager against same envtest
-	cfg := e.env.Config
-	mgr := testutil.NewEnvtestManager(t, cfg, e.scheme)
-	e.mgr = mgr
-	e.k8sClient = mgr.GetClient()
-
-	// Create a fresh DesiredStateCache to simulate real process restart where
-	// in-memory state is lost. This ensures the restart test validates that
-	// the controller can converge from a cold cache.
-	freshCache := engine.NewDesiredStateCache(e.opts.ClusterName)
-	e.desiredCache = freshCache
-
-	// Register reconciler with new executor
-	statusUpdater := controller.NewMappingStatusUpdater(mgr.GetClient(), ctrl.Log.WithName("status-updater"))
-	reconciler := &controller.MappingReconciler{
-		Client:                  mgr.GetClient(),
-		Scheme:                  e.scheme,
-		ClusterName:             e.opts.ClusterName,
-		ResyncInterval:          e.opts.ResyncInterval,
-		MaxConcurrentReconciles: e.opts.MaxConcurrentReconciles,
-		AzureReadSem:            make(chan struct{}, e.opts.MaxConcurrentAzureReads),
-		PrefixSetFactory:        e.fakeFactory,
-		Executor:                exec,
-		StatusUpdater:           statusUpdater,
-		DesiredStateCache:       freshCache,
+	if err := e.env.Stop(); err != nil {
+		t.Errorf("failed to stop envtest: %v", err)
 	}
-
-	if err := reconciler.SetupWithManager(mgr); err != nil {
-		t.Fatalf("failed to setup reconciler on restart: %v", err)
-	}
-
-	ctx, cancel := context.WithCancel(context.Background())
-	e.mgrCtx = ctx
-	e.mgrCancel = cancel
-	e.mgrDone = make(chan error, 1)
-
-	go func() {
-		e.mgrDone <- mgr.Start(ctx)
-	}()
-
-	if !mgr.GetCache().WaitForCacheSync(ctx) {
-		cancel()
-		t.Fatal("cache sync failed after restart")
-	}
+	metrics.ResetForTesting()
 }
 
-func (e *phase9Env) triggerReconcile(t *testing.T, key types.NamespacedName, reason string) {
+func (e *integrationEnv) triggerReconcile(t *testing.T, key types.NamespacedName) {
 	t.Helper()
 
 	var mapping v1alpha1.PodASGMapping
 	if err := e.k8sClient.Get(context.Background(), key, &mapping); err != nil {
-		t.Fatalf("triggerReconcile[%s]: get mapping: %v", reason, err)
+		t.Fatalf("triggerReconcile: get mapping: %v", err)
 	}
 	patch := client.MergeFrom(mapping.DeepCopy())
 	// Toggle a test-only finalizer to trigger MappingPredicate (watches finalizer changes).
@@ -327,20 +279,8 @@ func (e *phase9Env) triggerReconcile(t *testing.T, key types.NamespacedName, rea
 		mapping.Finalizers = append(mapping.Finalizers, triggerFinalizer)
 	}
 	if err := e.k8sClient.Patch(context.Background(), &mapping, patch); err != nil {
-		t.Fatalf("triggerReconcile[%s]: patch mapping: %v", reason, err)
+		t.Fatalf("triggerReconcile: patch mapping: %v", err)
 	}
-}
-
-func (e *phase9Env) teardown(t *testing.T) {
-	t.Helper()
-	if e.mgrCancel != nil {
-		e.mgrCancel()
-		<-e.mgrDone
-	}
-	if err := e.env.Stop(); err != nil {
-		t.Errorf("failed to stop envtest: %v", err)
-	}
-	metrics.ResetForTesting()
 }
 
 // ---------------------------------------------------------------------------
@@ -397,19 +337,6 @@ func createPodWithIP(t *testing.T, c client.Client, ns, name, ip string, labels 
 	}
 }
 
-func deletePod(t *testing.T, c client.Client, ns, name string) {
-	t.Helper()
-	pod := &corev1.Pod{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      name,
-			Namespace: ns,
-		},
-	}
-	if err := c.Delete(context.Background(), pod); err != nil {
-		t.Fatalf("delete pod %s/%s: %v", ns, name, err)
-	}
-}
-
 func createMapping(t *testing.T, c client.Client, ns, name string, spec v1alpha1.PodASGMappingSpec) {
 	t.Helper()
 	mapping := &v1alpha1.PodASGMapping{
@@ -434,6 +361,73 @@ func deleteMapping(t *testing.T, c client.Client, ns, name string) {
 	}
 	if err := c.Delete(context.Background(), mapping); err != nil {
 		t.Fatalf("delete mapping %s/%s: %v", ns, name, err)
+	}
+}
+
+func deletePod(t *testing.T, c client.Client, ns, name string) {
+	t.Helper()
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      name,
+			Namespace: ns,
+		},
+	}
+	if err := c.Delete(context.Background(), pod); err != nil {
+		t.Fatalf("delete pod %s/%s: %v", ns, name, err)
+	}
+}
+
+func (e *integrationEnv) restartManager(t *testing.T, exec controller.Executor) {
+	t.Helper()
+
+	e.mgrCancel()
+	select {
+	case err := <-e.mgrDone:
+		if err != nil {
+			t.Logf("old manager stopped with: %v", err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("timeout waiting for old manager to stop")
+	}
+
+	cfg := e.env.Config
+	mgr := testutil.NewEnvtestManager(t, cfg, e.scheme)
+	e.mgr = mgr
+	e.k8sClient = mgr.GetClient()
+
+	freshCache := engine.NewDesiredStateCache(e.opts.ClusterName)
+	e.desiredCache = freshCache
+
+	statusUpdater := controller.NewMappingStatusUpdater(mgr.GetClient(), ctrl.Log.WithName("status-updater"))
+	reconciler := &controller.MappingReconciler{
+		Client:                  mgr.GetClient(),
+		Scheme:                  e.scheme,
+		ClusterName:             e.opts.ClusterName,
+		ResyncInterval:          e.opts.ResyncInterval,
+		MaxConcurrentReconciles: e.opts.MaxConcurrentReconciles,
+		AzureReadSem:            make(chan struct{}, e.opts.MaxConcurrentAzureReads),
+		PrefixSetFactory:        e.fakeFactory,
+		Executor:                exec,
+		StatusUpdater:           statusUpdater,
+		DesiredStateCache:       freshCache,
+	}
+
+	if err := reconciler.SetupWithManager(mgr); err != nil {
+		t.Fatalf("failed to setup reconciler on restart: %v", err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	e.mgrCtx = ctx
+	e.mgrCancel = cancel
+	e.mgrDone = make(chan error, 1)
+
+	go func() {
+		e.mgrDone <- mgr.Start(ctx)
+	}()
+
+	if !mgr.GetCache().WaitForCacheSync(ctx) {
+		cancel()
+		t.Fatal("cache sync failed after restart")
 	}
 }
 
@@ -462,18 +456,14 @@ func (b *blockingExecutor) Execute(ctx context.Context, actions []engine.Action)
 	case <-b.release:
 		return b.delegate.Execute(ctx, actions)
 	case <-ctx.Done():
-		return canceledResults(actions, ctx.Err())
-	}
-}
-
-func canceledResults(actions []engine.Action, err error) []azure.ActionResult {
-	results := make([]azure.ActionResult, len(actions))
-	for i, a := range actions {
-		results[i] = azure.ActionResult{
-			Action:  a,
-			Success: false,
-			Err:     err,
+		results := make([]azure.ActionResult, len(actions))
+		for i, a := range actions {
+			results[i] = azure.ActionResult{
+				Action:  a,
+				Success: false,
+				Err:     ctx.Err(),
+			}
 		}
+		return results
 	}
-	return results
 }
