@@ -105,32 +105,37 @@ func requireLiveE2EConfig(t *testing.T) liveE2EConfig {
 		PollInterval:         time.Duration(envIntOrDefault("E2E_POLL_INTERVAL_MS", 1000)) * time.Millisecond,
 	}
 
-	// Parse cross-subscription targets (required for T9.E2 when AZURE_E2E=true)
+	return cfg
+}
+
+func requireCrossSubTargets(t *testing.T) []e2eASGTarget {
+	t.Helper()
+
 	crossSubRaw := os.Getenv("E2E_CROSS_SUB_ASG_RESOURCE_IDS")
 	if crossSubRaw == "" {
-		t.Fatal("E2E_CROSS_SUB_ASG_RESOURCE_IDS is required when AZURE_E2E=true")
-	}
-	{
-		ids := strings.Split(crossSubRaw, ",")
-		seenSubs := make(map[string]struct{})
-		for _, id := range ids {
-			id = strings.TrimSpace(id)
-			if id == "" {
-				continue
-			}
-			p, err := model.ParseASGResourceID(id)
-			if err != nil {
-				t.Fatalf("invalid E2E_CROSS_SUB_ASG_RESOURCE_IDS entry %q: %v", id, err)
-			}
-			seenSubs[strings.ToLower(p.SubscriptionID)] = struct{}{}
-			cfg.CrossSubTargets = append(cfg.CrossSubTargets, e2eASGTarget{ResourceID: id, Parsed: p})
-		}
-		if len(seenSubs) < 2 {
-			t.Fatal("E2E_CROSS_SUB_ASG_RESOURCE_IDS must contain at least 2 distinct subscriptions")
-		}
+		t.Fatal("E2E_CROSS_SUB_ASG_RESOURCE_IDS is required for T9.E2")
 	}
 
-	return cfg
+	ids := strings.Split(crossSubRaw, ",")
+	seenSubs := make(map[string]struct{})
+	targets := make([]e2eASGTarget, 0, len(ids))
+	for _, id := range ids {
+		id = strings.TrimSpace(id)
+		if id == "" {
+			continue
+		}
+		p, err := model.ParseASGResourceID(id)
+		if err != nil {
+			t.Fatalf("invalid E2E_CROSS_SUB_ASG_RESOURCE_IDS entry %q: %v", id, err)
+		}
+		seenSubs[strings.ToLower(p.SubscriptionID)] = struct{}{}
+		targets = append(targets, e2eASGTarget{ResourceID: id, Parsed: p})
+	}
+	if len(seenSubs) < 2 {
+		t.Fatal("E2E_CROSS_SUB_ASG_RESOURCE_IDS must contain at least 2 distinct subscriptions")
+	}
+
+	return targets
 }
 
 func envOrDefault(key, defaultVal string) string {
@@ -234,10 +239,14 @@ func newLivePrefixSetFactory(t *testing.T, zapLog *zap.Logger) azure.AddressPref
 func waitForPrefixSetIPs(t *testing.T, api azure.AddressPrefixSetAPI, target e2eASGTarget, prefixSetName string, want []string, timeout, interval time.Duration) {
 	t.Helper()
 	deadline := time.Now().Add(timeout)
-	for time.Now().Before(deadline) {
-		// Bound the individual Azure call so a stalled GET cannot bypass the
-		// outer timeout loop.
-		callCtx, callCancel := context.WithTimeout(context.Background(), timeout)
+	for {
+		remaining := time.Until(deadline)
+		if remaining <= 0 {
+			break
+		}
+		// Bound the individual Azure call to the remaining budget so a stalled
+		// GET cannot run past the outer deadline.
+		callCtx, callCancel := context.WithTimeout(context.Background(), remaining)
 		ps, err := api.Get(callCtx, target.Parsed.SubscriptionID, target.Parsed.ResourceGroup, target.Parsed.ASGName, prefixSetName)
 		callCancel()
 		if err == nil && ps != nil && ps.Properties != nil {
@@ -245,6 +254,10 @@ func waitForPrefixSetIPs(t *testing.T, api azure.AddressPrefixSetAPI, target e2e
 			if ipsMatch(got, want) {
 				return
 			}
+		}
+		// Recompute remaining after the call to avoid sleeping past deadline.
+		if time.Until(deadline) <= interval {
+			break
 		}
 		time.Sleep(interval)
 	}
@@ -275,10 +288,18 @@ func waitForPodsWithIPsTimestamped(t *testing.T, c client.Client, ns, workload s
 	// is always conservative (≤ true start).
 	lastUnderCountTime := time.Now()
 	deadline := lastUnderCountTime.Add(timeout)
-	for time.Now().Before(deadline) {
-		// Bound the individual Kubernetes call so a stalled LIST cannot
-		// bypass the outer timeout loop.
-		callCtx, callCancel := context.WithTimeout(context.Background(), timeout)
+	for {
+		remaining := time.Until(deadline)
+		if remaining <= 0 {
+			break
+		}
+		// Capture timestamp BEFORE the LIST call. If the LIST shows the target
+		// is still unmet, this conservative timestamp guarantees the recorded
+		// lower bound precedes any state transition that occurred during the call.
+		preCallTime := time.Now()
+		// Bound the individual Kubernetes call to remaining budget so a
+		// stalled LIST cannot run past the outer deadline.
+		callCtx, callCancel := context.WithTimeout(context.Background(), remaining)
 		var pods corev1.PodList
 		err := c.List(callCtx, &pods,
 			client.InNamespace(ns),
@@ -289,11 +310,16 @@ func waitForPodsWithIPsTimestamped(t *testing.T, c client.Client, ns, workload s
 			if len(ips) >= replicas {
 				return ips[:replicas], lastUnderCountTime
 			}
-			// Successful list confirmed target not yet met — advance lower bound.
-			lastUnderCountTime = time.Now()
+			// Successful list confirmed target not yet met — advance lower bound
+			// using the pre-call timestamp to stay conservative.
+			lastUnderCountTime = preCallTime
 		}
 		// On list error, do NOT advance lastUnderCountTime — we cannot confirm
 		// whether the target was met, so the bound must remain conservative.
+		// Recompute remaining after the call to avoid sleeping past deadline.
+		if time.Until(deadline) <= 2*time.Second {
+			break
+		}
 		time.Sleep(2 * time.Second)
 	}
 	t.Fatalf("timed out waiting for %d pods with IPs in %s", replicas, ns)
@@ -316,9 +342,17 @@ func collectReadyIPs(pods []corev1.Pod) []string {
 func measureScaleConvergence(t *testing.T, start time.Time, pollFn func() bool, timeout, interval time.Duration) time.Duration {
 	t.Helper()
 	deadline := start.Add(timeout)
-	for time.Now().Before(deadline) {
+	for {
+		if time.Until(deadline) <= 0 {
+			break
+		}
 		if pollFn() {
 			return time.Since(start)
+		}
+		// Recompute remaining after pollFn (which may include API calls)
+		// to avoid sleeping past the deadline.
+		if time.Until(deadline) <= interval {
+			break
 		}
 		time.Sleep(interval)
 	}
@@ -346,6 +380,36 @@ func ipsMatch(got, want []string) bool {
 		}
 	}
 	return true
+}
+
+func diffIPs(got, want []string) (missing []string, extra []string) {
+	gotCounts := make(map[string]int, len(got))
+	for _, s := range got {
+		gotCounts[normalizeToCIDR(s)]++
+	}
+	wantCounts := make(map[string]int, len(want))
+	for _, s := range want {
+		wantCounts[normalizeToCIDR(s)]++
+	}
+
+	for normalizedWant, wantCount := range wantCounts {
+		if delta := wantCount - gotCounts[normalizedWant]; delta > 0 {
+			for i := 0; i < delta; i++ {
+				missing = append(missing, normalizedWant)
+			}
+		}
+	}
+	for normalizedGot, gotCount := range gotCounts {
+		if delta := gotCount - wantCounts[normalizedGot]; delta > 0 {
+			for i := 0; i < delta; i++ {
+				extra = append(extra, normalizedGot)
+			}
+		}
+	}
+
+	sortStrings(missing)
+	sortStrings(extra)
+	return missing, extra
 }
 
 // normalizeToCIDR converts a bare IP to CIDR notation (/32 for IPv4, /128 for IPv6).
@@ -468,11 +532,21 @@ func TestPhase9E2E_T9E1_FullLifecycle_CreateVerifyDelete(t *testing.T) {
 	}
 
 	// Verify prefix set is cleaned up
-	deadline := time.Now().Add(cfg.Timeout)
-	for time.Now().Before(deadline) {
-		_, getErr := api.Get(ctx, target.Parsed.SubscriptionID, target.Parsed.ResourceGroup, target.Parsed.ASGName, prefixSetName)
+	cleanupDeadline := time.Now().Add(cfg.Timeout)
+	for {
+		remaining := time.Until(cleanupDeadline)
+		if remaining <= 0 {
+			break
+		}
+		callCtx, callCancel := context.WithTimeout(context.Background(), remaining)
+		_, getErr := api.Get(callCtx, target.Parsed.SubscriptionID, target.Parsed.ResourceGroup, target.Parsed.ASGName, prefixSetName)
+		callCancel()
 		if azure.IsNotFound(getErr) {
 			return // Success: cleaned up
+		}
+		// Recompute remaining after the call to avoid sleeping past deadline.
+		if time.Until(cleanupDeadline) <= cfg.PollInterval {
+			break
 		}
 		time.Sleep(cfg.PollInterval)
 	}
@@ -485,6 +559,7 @@ func TestPhase9E2E_T9E1_FullLifecycle_CreateVerifyDelete(t *testing.T) {
 
 func TestPhase9E2E_T9E2_CrossSubscriptionPropagation(t *testing.T) {
 	cfg := requireLiveE2EConfig(t)
+	cfg.CrossSubTargets = requireCrossSubTargets(t)
 
 	zapLog := zaptest.NewLogger(t)
 	ctrl.SetLogger(zapr.NewLogger(zapLog))
@@ -673,8 +748,13 @@ func TestPhase9E2E_T9E3_ScaleTo100Pods_ConvergesWithin10Seconds(t *testing.T) {
 	}
 	prefixSetName := model.OwnershipKey(cfg.ClusterName, ns.Name, "scale-mapping")
 
+	pollDeadline := start.Add(cfg.Timeout)
 	elapsed := measureScaleConvergence(t, start, func() bool {
-		callCtx, callCancel := context.WithTimeout(context.Background(), cfg.Timeout)
+		remaining := time.Until(pollDeadline)
+		if remaining <= 0 {
+			return false
+		}
+		callCtx, callCancel := context.WithTimeout(context.Background(), remaining)
 		defer callCancel()
 		ps, err := api.Get(callCtx, target.Parsed.SubscriptionID, target.Parsed.ResourceGroup, target.Parsed.ASGName, prefixSetName)
 		if err != nil || ps == nil || ps.Properties == nil {
@@ -691,12 +771,17 @@ func TestPhase9E2E_T9E3_ScaleTo100Pods_ConvergesWithin10Seconds(t *testing.T) {
 
 	if elapsed > cfg.ScaleSLO {
 		// Gather diagnostics
-		ps, _ := api.Get(ctx, target.Parsed.SubscriptionID, target.Parsed.ResourceGroup, target.Parsed.ASGName, prefixSetName)
+		diagCtx, diagCancel := context.WithTimeout(context.Background(), 10*time.Second)
+		ps, _ := api.Get(diagCtx, target.Parsed.SubscriptionID, target.Parsed.ResourceGroup, target.Parsed.ASGName, prefixSetName)
+		diagCancel()
+		var observedIPs []string
 		observedCount := 0
 		if ps != nil && ps.Properties != nil {
-			observedCount = len(ps.Properties.AddressPrefixes)
+			observedIPs = append(observedIPs, ps.Properties.AddressPrefixes...)
+			observedCount = len(observedIPs)
 		}
-		t.Fatalf("SLO violated: convergence took %v (SLO=%v), expected=%d observed=%d",
-			elapsed, cfg.ScaleSLO, cfg.ScaleReplicaGoal, observedCount)
+		missingIPs, extraIPs := diffIPs(observedIPs, podIPs)
+		t.Fatalf("SLO violated: convergence took %v (SLO=%v), expected=%d observed=%d missingIPs=%v extraIPs=%v",
+			elapsed, cfg.ScaleSLO, cfg.ScaleReplicaGoal, observedCount, missingIPs, extraIPs)
 	}
 }

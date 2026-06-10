@@ -252,5 +252,21 @@ func TestPhase6_ARMRecorder_RejectsNonVerbOperation(t *testing.T) {
 	// happens at this layer. The real contract that only HTTP verbs
 	// ("GET", "PUT", "DELETE", …) appear as operation labels is enforced
 	// by metricOperationLabel() at the executor level (see executor_test.go).
-	t.Skip("recorder accepts arbitrary strings; operation-label contract is enforced at executor level — see executor_test.go")
+	//
+	// This test verifies the recorder does NOT reject non-verb strings,
+	// confirming validation lives at the executor layer, not here.
+	rec := newARMRecorder()
+
+	// Arbitrary non-verb string should be accepted without panic or error.
+	rec.ObserveCallDuration("sub-nonverb", "INVALID_OP", 50*time.Millisecond)
+	count := getHistogramSampleCount(t, rec.callDuration, "sub-nonverb", "INVALID_OP")
+	if count != 1 {
+		t.Errorf("recorder should accept arbitrary operation strings; got count=%d, want 1", count)
+	}
+
+	rec.ObserveETagConflict("sub-nonverb", "NOT_A_VERB")
+	val := getARMCounterValue(t, rec.etagConflictsTotal, "sub-nonverb", "NOT_A_VERB")
+	if val != 1 {
+		t.Errorf("recorder should accept arbitrary operation strings; got val=%v, want 1", val)
+	}
 }

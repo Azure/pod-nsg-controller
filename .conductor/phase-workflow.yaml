@@ -77,7 +77,7 @@ workflow:
     mode: accumulate
 
   limits:
-    max_iterations: 80
+    max_iterations: 160
 
 # ═══════════════════════════════════════════════════════════════════
 # AGENTS

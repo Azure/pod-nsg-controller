@@ -17,6 +17,7 @@ import (
 // (caller falls back to env/defaults). Runtime reload uses LoadARMTuningForReload,
 // which reports file absence via ARMTuningReloadResult.FilesAbsent so callers can
 // preserve last-good values.
+var ErrTuningFilesAbsent = stderrors.New("ARM tuning files absent")
 
 const (
 	// LabelASG is the pod label for single-ASG assignment.

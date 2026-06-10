@@ -2,10 +2,10 @@ package azure
 
 import (
 	"context"
-	"fmt"
 
 	"github.com/Azure/azure-sdk-for-go/sdk/azidentity"
 	"github.com/Azure/azure-sdk-for-go/sdk/resourcemanager/network/armnetwork/v6"
+	"github.com/pkg/errors"
 )
 
 // NICClient wraps the Azure SDK to manage Network Interface operations.
@@ -18,12 +18,12 @@ type NICClient struct {
 func NewNICClient(subscriptionID, resourceGroup string) (*NICClient, error) {
 	cred, err := azidentity.NewDefaultAzureCredential(nil)
 	if err != nil {
-		return nil, fmt.Errorf("creating Azure credential: %w", err)
+		return nil, errors.Wrap(err, "creating Azure credential")
 	}
 
 	client, err := armnetwork.NewInterfacesClient(subscriptionID, cred, nil)
 	if err != nil {
-		return nil, fmt.Errorf("creating NIC client: %w", err)
+		return nil, errors.Wrap(err, "creating NIC client")
 	}
 
 	return &NICClient{
@@ -36,7 +36,7 @@ func NewNICClient(subscriptionID, resourceGroup string) (*NICClient, error) {
 func (c *NICClient) Get(ctx context.Context, nicName string) (*armnetwork.Interface, error) {
 	resp, err := c.client.Get(ctx, c.resourceGroup, nicName, nil)
 	if err != nil {
-		return nil, fmt.Errorf("getting NIC %q: %w", nicName, err)
+		return nil, errors.Wrapf(err, "getting NIC %q", nicName)
 	}
 	return &resp.Interface, nil
 }
@@ -46,12 +46,12 @@ func (c *NICClient) Get(ctx context.Context, nicName string) (*armnetwork.Interf
 func (c *NICClient) UpdateASGs(ctx context.Context, nicName string, nic *armnetwork.Interface) error {
 	poller, err := c.client.BeginCreateOrUpdate(ctx, c.resourceGroup, nicName, *nic, nil)
 	if err != nil {
-		return fmt.Errorf("starting NIC update for %q: %w", nicName, err)
+		return errors.Wrapf(err, "starting NIC update for %q", nicName)
 	}
 
 	_, err = poller.PollUntilDone(ctx, nil)
 	if err != nil {
-		return fmt.Errorf("updating NIC %q: %w", nicName, err)
+		return errors.Wrapf(err, "updating NIC %q", nicName)
 	}
 
 	return nil
@@ -64,7 +64,7 @@ func (c *NICClient) ListByResourceGroup(ctx context.Context) ([]*armnetwork.Inte
 	for pager.More() {
 		page, err := pager.NextPage(ctx)
 		if err != nil {
-			return nil, fmt.Errorf("listing NICs: %w", err)
+			return nil, errors.Wrap(err, "listing NICs")
 		}
 		nics = append(nics, page.Value...)
 	}

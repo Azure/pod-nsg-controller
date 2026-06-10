@@ -7,7 +7,6 @@ import (
 	"time"
 
 	"github.com/Azure/azure-sdk-for-go/sdk/azcore/to"
-	"github.com/go-logr/zapr"
 	"go.uber.org/zap"
 	"go.uber.org/zap/zapcore"
 
@@ -44,7 +43,6 @@ func main() {
 	defer func() {
 		_ = zapLog.Sync()
 	}()
-	logger := zapr.NewLogger(zapLog)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 	defer cancel()
@@ -52,7 +50,7 @@ func main() {
 	results := make([]testResult, 0, 10)
 
 	// --- SDK-based ASG operations ---
-	asgClient, err := azure.NewASGClient(subscriptionID, resourceGroup, logger)
+	asgClient, err := azure.NewASGClient(subscriptionID, resourceGroup, zapLog)
 	if err != nil {
 		zapLog.Fatal("cannot create ASG client", zap.Error(err))
 	}
@@ -192,10 +190,10 @@ func main() {
 	results = append(results, r)
 
 	// Print results
-	fmt.Println("\n========================================")
-	fmt.Println("  REST Operations Test Results")
-	fmt.Println("  API Version: 2025-07-01 (AddressPrefixSets)")
-	fmt.Println("========================================")
+	zapLog.Info("========================================")
+	zapLog.Info("REST Operations Test Results")
+	zapLog.Info("API Version: 2025-07-01 (AddressPrefixSets)")
+	zapLog.Info("========================================")
 	passed, failed := 0, 0
 	for _, r := range results {
 		zapLog.Info("test result",
