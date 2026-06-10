@@ -249,7 +249,28 @@ func waitForPrefixSetIPs(t *testing.T, api azure.AddressPrefixSetAPI, target e2e
 
 func waitForPodsWithIPs(t *testing.T, c client.Client, ns, workload string, replicas int, timeout time.Duration) []string {
 	t.Helper()
-	deadline := time.Now().Add(timeout)
+	ips, _ := waitForPodsWithIPsTimestamped(t, c, ns, workload, replicas, timeout)
+	return ips
+}
+
+// waitForPodsWithIPsTimestamped returns the pod IPs and a conservative SLO
+// start timestamp: the last poll time at which fewer than `replicas` pods had
+// IPs. This is guaranteed to be ≤ the true instant all pods obtained IPs,
+// because the condition was still unsatisfied at that recorded time. Using this
+// as the SLO clock start means the test can never under-report convergence
+// time (false pass); it may over-report by up to one poll interval (false
+// fail), which is the conservative direction for an acceptance test.
+//
+// This avoids anchoring the SLO to PodReady LastTransitionTime, which can lag
+// IP assignment and cause under-reporting.
+func waitForPodsWithIPsTimestamped(t *testing.T, c client.Client, ns, workload string, replicas int, timeout time.Duration) ([]string, time.Time) {
+	t.Helper()
+	// lastUnderCountTime tracks the most recent poll instant where the
+	// replica target was NOT yet met. The true "all pods have IPs" event
+	// must have occurred after this instant, so using it as the SLO start
+	// is always conservative (≤ true start).
+	lastUnderCountTime := time.Now()
+	deadline := lastUnderCountTime.Add(timeout)
 	for time.Now().Before(deadline) {
 		var pods corev1.PodList
 		if err := c.List(context.Background(), &pods,
@@ -257,13 +278,17 @@ func waitForPodsWithIPs(t *testing.T, c client.Client, ns, workload string, repl
 			client.MatchingLabels{"app": workload}); err == nil {
 			ips := collectReadyIPs(pods.Items)
 			if len(ips) >= replicas {
-				return ips[:replicas]
+				return ips[:replicas], lastUnderCountTime
 			}
+			// Successful list confirmed target not yet met — advance lower bound.
+			lastUnderCountTime = time.Now()
 		}
+		// On list error, do NOT advance lastUnderCountTime — we cannot confirm
+		// whether the target was met, so the bound must remain conservative.
 		time.Sleep(2 * time.Second)
 	}
 	t.Fatalf("timed out waiting for %d pods with IPs in %s", replicas, ns)
-	return nil
+	return nil, time.Time{}
 }
 
 func collectReadyIPs(pods []corev1.Pod) []string {
@@ -622,11 +647,12 @@ func TestPhase9E2E_T9E3_ScaleTo100Pods_ConvergesWithin10Seconds(t *testing.T) {
 		t.Fatalf("create deployment: %v", err)
 	}
 
-	// Wait for all pods to have IPs
-	podIPs := waitForPodsWithIPs(t, c, ns.Name, "scale-e2e", cfg.ScaleReplicaGoal, cfg.Timeout)
+	// Wait for all pods to have IPs, capturing the readiness timestamp for
+	// accurate SLO measurement (avoids under-reporting due to poll cadence).
+	podIPs, readyAt := waitForPodsWithIPsTimestamped(t, c, ns.Name, "scale-e2e", cfg.ScaleReplicaGoal, cfg.Timeout)
 
-	// Measure convergence time from when all pods are ready
-	start := time.Now()
+	// Measure convergence time from when pods actually became ready
+	start := readyAt
 
 	factory := newLivePrefixSetFactory(t, zapLog)
 	api, err := factory.ForSubscription(target.Parsed.SubscriptionID)
