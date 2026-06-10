@@ -513,6 +513,16 @@ func TestPhase9_T97_CrossSubscription_TwoASGsRoutedCorrectly(t *testing.T) {
 		}
 		return true, ""
 	})
+
+	// Negative routing isolation checks: ensure writes were exclusive to the correct client.
+	// fakeClientA must NOT contain sub-b's resource (proves no broadcast to wrong client).
+	if _, found := fakeClientA.PeekPrefixes("sub-b", "rg-b", "asg-b", prefixSetName); found {
+		t.Fatal("routing isolation violated: fakeClientA contains sub-b prefix set")
+	}
+	// fakeClientB must NOT contain sub-a's resource (proves no broadcast to wrong client).
+	if _, found := fakeClientB.PeekPrefixes("sub-a", "rg-a", "asg-a", prefixSetName); found {
+		t.Fatal("routing isolation violated: fakeClientB contains sub-a prefix set")
+	}
 }
 
 // ---------------------------------------------------------------------------

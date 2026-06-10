@@ -127,12 +127,24 @@ func TestReconcile_ScaleUp_ThreeToFive_AddsTwoIPs(t *testing.T) {
 	createPodWithIP(t, ie.k8sClient, ns, "pod-4", "10.1.0.4", labels)
 	createPodWithIP(t, ie.k8sClient, ns, "pod-5", "10.1.0.5", labels)
 
-	eventually(t, 30*time.Second, 500*time.Millisecond, "scaled to 5 IPs", func() (bool, string) {
+	eventually(t, 30*time.Second, 500*time.Millisecond, "scaled to 5 IPs with correct content", func() (bool, string) {
 		ips, ok := fakeClient.PeekPrefixes("sub1", "rg1", "asg-api", prefixSetName)
 		if !ok {
 			return false, "prefix set not found"
 		}
-		return len(ips) == 5, fmt.Sprintf("got %d IPs, want 5: %v", len(ips), ips)
+		if len(ips) != 5 {
+			return false, fmt.Sprintf("got %d IPs, want 5: %v", len(ips), ips)
+		}
+		expected := []string{"10.1.0.1/32", "10.1.0.2/32", "10.1.0.3/32", "10.1.0.4/32", "10.1.0.5/32"}
+		sorted := make([]string, len(ips))
+		copy(sorted, ips)
+		sort.Strings(sorted)
+		for i, ip := range expected {
+			if sorted[i] != ip {
+				return false, fmt.Sprintf("IP mismatch at index %d: got %v, want %v", i, sorted, expected)
+			}
+		}
+		return true, ""
 	})
 }
 
@@ -238,21 +250,55 @@ func TestReconcile_CrossSubscription_TwoASGsRoutedCorrectly(t *testing.T) {
 	fakeClientA := ie.fakeClientsBySub["sub-a"]
 	fakeClientB := ie.fakeClientsBySub["sub-b"]
 
-	eventually(t, 30*time.Second, 500*time.Millisecond, "IPs in sub-a ASG", func() (bool, string) {
+	expectedIPs := []string{"10.7.0.1/32", "10.7.0.2/32"}
+
+	eventually(t, 30*time.Second, 500*time.Millisecond, "correct IPs in sub-a ASG", func() (bool, string) {
 		ips, ok := fakeClientA.PeekPrefixes("sub-a", "rg-a", "asg-frontend", prefixSetName)
 		if !ok {
 			return false, "prefix set not found in sub-a"
 		}
-		return len(ips) == 2, fmt.Sprintf("sub-a: got %d IPs, want 2", len(ips))
+		if len(ips) != 2 {
+			return false, fmt.Sprintf("sub-a: got %d IPs, want 2: %v", len(ips), ips)
+		}
+		sorted := make([]string, len(ips))
+		copy(sorted, ips)
+		sort.Strings(sorted)
+		for i, ip := range expectedIPs {
+			if sorted[i] != ip {
+				return false, fmt.Sprintf("sub-a IP mismatch: got %v, want %v", sorted, expectedIPs)
+			}
+		}
+		return true, ""
 	})
 
-	eventually(t, 30*time.Second, 500*time.Millisecond, "IPs in sub-b ASG", func() (bool, string) {
+	eventually(t, 30*time.Second, 500*time.Millisecond, "correct IPs in sub-b ASG", func() (bool, string) {
 		ips, ok := fakeClientB.PeekPrefixes("sub-b", "rg-b", "asg-frontend-mirror", prefixSetName)
 		if !ok {
 			return false, "prefix set not found in sub-b"
 		}
-		return len(ips) == 2, fmt.Sprintf("sub-b: got %d IPs, want 2", len(ips))
+		if len(ips) != 2 {
+			return false, fmt.Sprintf("sub-b: got %d IPs, want 2: %v", len(ips), ips)
+		}
+		sorted := make([]string, len(ips))
+		copy(sorted, ips)
+		sort.Strings(sorted)
+		for i, ip := range expectedIPs {
+			if sorted[i] != ip {
+				return false, fmt.Sprintf("sub-b IP mismatch: got %v, want %v", sorted, expectedIPs)
+			}
+		}
+		return true, ""
 	})
+
+	// Negative routing isolation checks: ensure no cross-contamination.
+	// fakeClientA must NOT contain the sub-b prefix set (it should only receive sub-a writes).
+	if _, found := fakeClientA.PeekPrefixes("sub-b", "rg-b", "asg-frontend-mirror", prefixSetName); found {
+		t.Fatal("routing isolation violated: fakeClientA contains sub-b prefix set")
+	}
+	// fakeClientB must NOT contain the sub-a prefix set (it should only receive sub-b writes).
+	if _, found := fakeClientB.PeekPrefixes("sub-a", "rg-a", "asg-frontend", prefixSetName); found {
+		t.Fatal("routing isolation violated: fakeClientB contains sub-a prefix set")
+	}
 }
 
 // ---------------------------------------------------------------------------
@@ -782,7 +828,7 @@ func TestReconcile_TwoMappings_IsolatedOwnership(t *testing.T) {
 	// Delete mapping-a → only prefix set A is removed, B stays
 	deleteMapping(t, ie.k8sClient, ns, "mapping-a")
 
-	eventually(t, 30*time.Second, 500*time.Millisecond, "prefix set A cleaned, B intact", func() (bool, string) {
+	eventually(t, 30*time.Second, 500*time.Millisecond, "prefix set A cleaned, B intact with correct IP", func() (bool, string) {
 		_, okA := fakeClient.PeekPrefixes("sub1", "rg1", "asg-shared", prefixSetA)
 		ipsB, okB := fakeClient.PeekPrefixes("sub1", "rg1", "asg-shared", prefixSetB)
 		if okA {
@@ -790,6 +836,9 @@ func TestReconcile_TwoMappings_IsolatedOwnership(t *testing.T) {
 		}
 		if !okB || len(ipsB) != 1 {
 			return false, fmt.Sprintf("prefix set B missing or wrong: ok=%v ips=%v", okB, ipsB)
+		}
+		if ipsB[0] != "10.11.0.2/32" {
+			return false, fmt.Sprintf("prefix set B has wrong IP: got %s, want 10.11.0.2/32", ipsB[0])
 		}
 		return true, ""
 	})
