@@ -5,6 +5,7 @@ package e2e_test
 import (
 	"context"
 	"fmt"
+	"net"
 	"os"
 	"strconv"
 	"strings"
@@ -104,9 +105,12 @@ func requireLiveE2EConfig(t *testing.T) liveE2EConfig {
 		PollInterval:         time.Duration(envIntOrDefault("E2E_POLL_INTERVAL_MS", 1000)) * time.Millisecond,
 	}
 
-	// Parse cross-subscription targets
+	// Parse cross-subscription targets (required for T9.E2 when AZURE_E2E=true)
 	crossSubRaw := os.Getenv("E2E_CROSS_SUB_ASG_RESOURCE_IDS")
-	if crossSubRaw != "" {
+	if crossSubRaw == "" {
+		t.Fatal("E2E_CROSS_SUB_ASG_RESOURCE_IDS is required when AZURE_E2E=true")
+	}
+	{
 		ids := strings.Split(crossSubRaw, ",")
 		seenSubs := make(map[string]struct{})
 		for _, id := range ids {
@@ -290,9 +294,13 @@ func ipsMatch(got, want []string) bool {
 		return false
 	}
 	gotSorted := make([]string, len(got))
-	copy(gotSorted, got)
+	for i, s := range got {
+		gotSorted[i] = normalizeToCIDR(s)
+	}
 	wantSorted := make([]string, len(want))
-	copy(wantSorted, want)
+	for i, s := range want {
+		wantSorted[i] = normalizeToCIDR(s)
+	}
 	sortStrings(gotSorted)
 	sortStrings(wantSorted)
 	for i := range gotSorted {
@@ -301,6 +309,18 @@ func ipsMatch(got, want []string) bool {
 		}
 	}
 	return true
+}
+
+// normalizeToCIDR converts a bare IP to CIDR notation (/32 for IPv4, /128 for IPv6).
+// If the input already contains a slash it is returned unchanged.
+func normalizeToCIDR(ip string) string {
+	if strings.Contains(ip, "/") {
+		return ip
+	}
+	if parsed := net.ParseIP(ip); parsed != nil && parsed.To4() == nil {
+		return ip + "/128"
+	}
+	return ip + "/32"
 }
 
 func sortStrings(s []string) {
@@ -428,10 +448,6 @@ func TestPhase9E2E_T9E1_FullLifecycle_CreateVerifyDelete(t *testing.T) {
 
 func TestPhase9E2E_T9E2_CrossSubscriptionPropagation(t *testing.T) {
 	cfg := requireLiveE2EConfig(t)
-
-	if len(cfg.CrossSubTargets) < 2 {
-		t.Skip("E2E_CROSS_SUB_ASG_RESOURCE_IDS not set or insufficient; skipping T9.E2")
-	}
 
 	zapLog := zaptest.NewLogger(t)
 	ctrl.SetLogger(zapr.NewLogger(zapLog))
