@@ -235,7 +235,11 @@ func waitForPrefixSetIPs(t *testing.T, api azure.AddressPrefixSetAPI, target e2e
 	t.Helper()
 	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {
-		ps, err := api.Get(context.Background(), target.Parsed.SubscriptionID, target.Parsed.ResourceGroup, target.Parsed.ASGName, prefixSetName)
+		// Bound the individual Azure call so a stalled GET cannot bypass the
+		// outer timeout loop.
+		callCtx, callCancel := context.WithTimeout(context.Background(), timeout)
+		ps, err := api.Get(callCtx, target.Parsed.SubscriptionID, target.Parsed.ResourceGroup, target.Parsed.ASGName, prefixSetName)
+		callCancel()
 		if err == nil && ps != nil && ps.Properties != nil {
 			got := ps.Properties.AddressPrefixes
 			if ipsMatch(got, want) {
@@ -272,10 +276,15 @@ func waitForPodsWithIPsTimestamped(t *testing.T, c client.Client, ns, workload s
 	lastUnderCountTime := time.Now()
 	deadline := lastUnderCountTime.Add(timeout)
 	for time.Now().Before(deadline) {
+		// Bound the individual Kubernetes call so a stalled LIST cannot
+		// bypass the outer timeout loop.
+		callCtx, callCancel := context.WithTimeout(context.Background(), timeout)
 		var pods corev1.PodList
-		if err := c.List(context.Background(), &pods,
+		err := c.List(callCtx, &pods,
 			client.InNamespace(ns),
-			client.MatchingLabels{"app": workload}); err == nil {
+			client.MatchingLabels{"app": workload})
+		callCancel()
+		if err == nil {
 			ips := collectReadyIPs(pods.Items)
 			if len(ips) >= replicas {
 				return ips[:replicas], lastUnderCountTime
@@ -291,10 +300,13 @@ func waitForPodsWithIPsTimestamped(t *testing.T, c client.Client, ns, workload s
 	return nil, time.Time{}
 }
 
+// collectReadyIPs returns IPs of pods that the controller considers eligible
+// for propagation: any pod with a non-empty PodIP, regardless of phase.
+// This matches the controller's desired-state logic (desired_state.go:52).
 func collectReadyIPs(pods []corev1.Pod) []string {
 	var ips []string
 	for _, p := range pods {
-		if p.Status.PodIP != "" && p.Status.Phase == corev1.PodRunning {
+		if p.Status.PodIP != "" {
 			ips = append(ips, p.Status.PodIP)
 		}
 	}
@@ -662,7 +674,9 @@ func TestPhase9E2E_T9E3_ScaleTo100Pods_ConvergesWithin10Seconds(t *testing.T) {
 	prefixSetName := model.OwnershipKey(cfg.ClusterName, ns.Name, "scale-mapping")
 
 	elapsed := measureScaleConvergence(t, start, func() bool {
-		ps, err := api.Get(ctx, target.Parsed.SubscriptionID, target.Parsed.ResourceGroup, target.Parsed.ASGName, prefixSetName)
+		callCtx, callCancel := context.WithTimeout(context.Background(), cfg.Timeout)
+		defer callCancel()
+		ps, err := api.Get(callCtx, target.Parsed.SubscriptionID, target.Parsed.ResourceGroup, target.Parsed.ASGName, prefixSetName)
 		if err != nil || ps == nil || ps.Properties == nil {
 			return false
 		}
