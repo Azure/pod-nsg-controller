@@ -20,6 +20,12 @@ type testResult struct {
 	details string
 }
 
+const addressPrefixSetVersionLabelSuffix = " (AddressPrefixSets)"
+
+func addressPrefixSetAPIVersionLabel() string {
+	return azure.AddressPrefixSetAPIVersion + addressPrefixSetVersionLabelSuffix
+}
+
 func main() {
 	subscriptionID := os.Getenv("AZURE_SUBSCRIPTION_ID")
 	resourceGroup := os.Getenv("AZURE_RESOURCE_GROUP")
@@ -192,7 +198,7 @@ func main() {
 	// Print results
 	zapLog.Info("========================================")
 	zapLog.Info("REST Operations Test Results")
-	zapLog.Info("API Version: 2025-07-01 (AddressPrefixSets)")
+	zapLog.Info("API Version: " + addressPrefixSetAPIVersionLabel())
 	zapLog.Info("========================================")
 	passed, failed := 0, 0
 	for _, r := range results {
@@ -209,7 +215,7 @@ func main() {
 		}
 	}
 	zapLog.Info("REST Operations Test Results",
-		zap.String("apiVersion", "2026-01-01 (AddressPrefixSets)"),
+		zap.String("apiVersion", addressPrefixSetAPIVersionLabel()),
 		zap.Int("passed", passed),
 		zap.Int("failed", failed),
 		zap.Int("total", len(results)),

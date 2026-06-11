@@ -13,14 +13,16 @@ import (
 	"time"
 
 	"github.com/Azure/azure-sdk-for-go/sdk/azcore"
-	"github.com/pkg/errors"
 	"github.com/Azure/azure-sdk-for-go/sdk/azcore/policy"
+	"github.com/pkg/errors"
 	"go.uber.org/zap"
 )
 
 const (
-	apiVersion  = "2025-07-01"
-	armEndpoint = "https://management.azure.com"
+	// AddressPrefixSetAPIVersion is the Azure Network API version used for
+	// addressPrefixSet child-resource operations.
+	AddressPrefixSetAPIVersion = "2025-07-01"
+	armEndpoint                = "https://management.azure.com"
 
 	// tokenRefreshMargin is how long before expiry we proactively refresh the
 	// cached token, matching the Azure SDK's default behaviour.
@@ -105,12 +107,12 @@ func NewAddressPrefixSetClient(
 
 func (c *AddressPrefixSetClient) resourceURL(subscriptionID, resourceGroup, asgName, prefixSetName string) string {
 	return fmt.Sprintf("%s/subscriptions/%s/resourceGroups/%s/providers/Microsoft.Network/applicationSecurityGroups/%s/addressPrefixSets/%s?api-version=%s",
-		c.baseURL, url.PathEscape(subscriptionID), url.PathEscape(resourceGroup), url.PathEscape(asgName), url.PathEscape(prefixSetName), apiVersion)
+		c.baseURL, url.PathEscape(subscriptionID), url.PathEscape(resourceGroup), url.PathEscape(asgName), url.PathEscape(prefixSetName), AddressPrefixSetAPIVersion)
 }
 
 func (c *AddressPrefixSetClient) listURL(subscriptionID, resourceGroup, asgName string) string {
 	return fmt.Sprintf("%s/subscriptions/%s/resourceGroups/%s/providers/Microsoft.Network/applicationSecurityGroups/%s/addressPrefixSets?api-version=%s",
-		c.baseURL, url.PathEscape(subscriptionID), url.PathEscape(resourceGroup), url.PathEscape(asgName), apiVersion)
+		c.baseURL, url.PathEscape(subscriptionID), url.PathEscape(resourceGroup), url.PathEscape(asgName), AddressPrefixSetAPIVersion)
 }
 
 func (c *AddressPrefixSetClient) acquireToken(ctx context.Context) (string, error) {

@@ -19,6 +19,9 @@ type ASGClient struct {
 
 // NewASGClient creates a new ASGClient using DefaultAzureCredential.
 func NewASGClient(subscriptionID, resourceGroup string, logger *zap.Logger) (*ASGClient, error) {
+	if logger == nil {
+		logger = zap.NewNop()
+	}
 	log := logger.Named("ASGClient")
 	cred, err := azidentity.NewDefaultAzureCredential(nil)
 	if err != nil {
