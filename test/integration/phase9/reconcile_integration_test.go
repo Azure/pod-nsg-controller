@@ -570,7 +570,23 @@ func TestPhase9_T98_ControllerRestartMidReconcile_DeterministicConvergence(t *te
 		t.Fatal("executor was never called")
 	}
 
-	// Restart the manager while executor is blocked (simulates crash)
+	// Inject partial write state directly into the fake client to simulate
+	// a crash that occurred mid-reconcile AFTER a partial Azure write completed.
+	// Only 1 of the 2 expected IPs is persisted — this is the "post-read/pre-write-complete"
+	// scenario the reviewer identified as the interesting recovery case.
+	prefixSetNamePreRestart := model.OwnershipKey("test-cluster", ns, "mapping1")
+	fakeClientPreRestart := pe.fakeClientsBySub["sub1"]
+	if err := fakeClientPreRestart.Put(context.Background(), "sub1", "rg1", "asg-restart", prefixSetNamePreRestart, []string{"10.0.0.1/32"}); err != nil {
+		t.Fatalf("failed to inject partial write: %v", err)
+	}
+
+	// Verify partial state is present before restart (only 1 IP)
+	partialIPs, _ := fakeClientPreRestart.PeekPrefixes("sub1", "rg1", "asg-restart", prefixSetNamePreRestart)
+	if len(partialIPs) != 1 || partialIPs[0] != "10.0.0.1/32" {
+		t.Fatalf("partial state injection failed: got %v", partialIPs)
+	}
+
+	// Restart the manager while executor is blocked (simulates crash after partial write)
 	newExecutor := azure.NewExecutor(pe.zapLog, pe.fakeFactory, 5)
 	pe.restartManager(t, newExecutor)
 
