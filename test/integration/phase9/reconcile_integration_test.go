@@ -12,6 +12,7 @@ import (
 	"github.com/Azure/pod-nsg-controller/internal/azure/fake"
 	"github.com/Azure/pod-nsg-controller/internal/model"
 	"go.uber.org/zap/zaptest"
+	corev1 "k8s.io/api/core/v1"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 )
 
@@ -544,6 +545,32 @@ func TestPhase9_T98_ControllerRestartMidReconcile_DeterministicConvergence(t *te
 	ns := "t98-ns"
 	createNamespace(t, pe.k8sClient, ns)
 
+	// Create pods BEFORE the mapping so both IPs are visible in the informer
+	// cache when the first mapping-triggered reconcile fires.
+	labels := map[string]string{"app": "restart"}
+	createPodWithIP(t, pe.k8sClient, ns, "pod-1", "10.0.0.1", labels)
+	createPodWithIP(t, pe.k8sClient, ns, "pod-2", "10.0.0.2", labels)
+
+	// Wait until the informer cache reflects both pods to eliminate any
+	// race between pod cache sync and the mapping-triggered reconcile.
+	eventually(t, 10*time.Second, 100*time.Millisecond, "both pods visible in cache", func() (bool, string) {
+		var podList corev1.PodList
+		if err := pe.k8sClient.List(context.Background(), &podList, client.InNamespace(ns), client.MatchingLabels(labels)); err != nil {
+			return false, fmt.Sprintf("list error: %v", err)
+		}
+		ready := 0
+		for i := range podList.Items {
+			if podList.Items[i].Status.PodIP != "" {
+				ready++
+			}
+		}
+		if ready < 2 {
+			return false, fmt.Sprintf("only %d pods with IPs", ready)
+		}
+		return true, ""
+	})
+
+	// Now create the mapping — the resulting reconcile will see both pod IPs.
 	spec := v1alpha1.PodASGMappingSpec{
 		Mappings: []v1alpha1.Mapping{
 			{
@@ -558,16 +585,26 @@ func TestPhase9_T98_ControllerRestartMidReconcile_DeterministicConvergence(t *te
 	}
 	createMapping(t, pe.k8sClient, ns, "mapping1", spec)
 
-	labels := map[string]string{"app": "restart"}
-	createPodWithIP(t, pe.k8sClient, ns, "pod-1", "10.0.0.1", labels)
-	createPodWithIP(t, pe.k8sClient, ns, "pod-2", "10.0.0.2", labels)
-
 	// Wait for executor to be called (blocked)
 	select {
 	case <-blocker.started:
 		// Executor was invoked and is now blocked
 	case <-time.After(30 * time.Second):
 		t.Fatal("executor was never called")
+	}
+
+	// Assert the blocked reconcile's action set contains both IPs.
+	// This guarantees the partial-write injection below is genuinely partial
+	// relative to what the blocked reconcile intended to write.
+	capturedActions := blocker.Actions()
+	var allDesiredIPs []string
+	for _, a := range capturedActions {
+		allDesiredIPs = append(allDesiredIPs, a.DesiredIPs...)
+		allDesiredIPs = append(allDesiredIPs, a.AddIPs...)
+	}
+	sort.Strings(allDesiredIPs)
+	if !containsAll(allDesiredIPs, []string{"10.0.0.1/32", "10.0.0.2/32"}) {
+		t.Fatalf("blocked reconcile did not target both IPs; captured actions desired: %v", allDesiredIPs)
 	}
 
 	// Inject partial write state directly into the fake client to simulate
@@ -614,6 +651,20 @@ func TestPhase9_T98_ControllerRestartMidReconcile_DeterministicConvergence(t *te
 		}
 		return true, ""
 	})
+}
+
+// containsAll checks that haystack contains all elements in needles.
+func containsAll(haystack, needles []string) bool {
+	set := make(map[string]struct{}, len(haystack))
+	for _, s := range haystack {
+		set[s] = struct{}{}
+	}
+	for _, n := range needles {
+		if _, ok := set[n]; !ok {
+			return false
+		}
+	}
+	return true
 }
 
 // ---------------------------------------------------------------------------

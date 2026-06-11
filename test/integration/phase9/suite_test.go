@@ -443,6 +443,10 @@ type blockingExecutor struct {
 	started     chan struct{}
 	release     chan struct{}
 	startedOnce sync.Once
+
+	// capturedActions stores the actions from the first Execute call.
+	capturedActions []engine.Action
+	capturedMu      sync.Mutex
 }
 
 func newBlockingExecutor(delegate controller.Executor) *blockingExecutor {
@@ -453,8 +457,20 @@ func newBlockingExecutor(delegate controller.Executor) *blockingExecutor {
 	}
 }
 
+// Actions returns a copy of the actions captured by the first Execute call.
+func (b *blockingExecutor) Actions() []engine.Action {
+	b.capturedMu.Lock()
+	defer b.capturedMu.Unlock()
+	cp := make([]engine.Action, len(b.capturedActions))
+	copy(cp, b.capturedActions)
+	return cp
+}
+
 func (b *blockingExecutor) Execute(ctx context.Context, actions []engine.Action) []azure.ActionResult {
 	b.startedOnce.Do(func() {
+		b.capturedMu.Lock()
+		b.capturedActions = actions
+		b.capturedMu.Unlock()
 		close(b.started)
 	})
 
