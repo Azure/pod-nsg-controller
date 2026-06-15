@@ -54,7 +54,7 @@ func (c *ASGClient) Get(ctx context.Context, asgName string) (*armnetwork.Applic
 
 	c.log.Info("GET ASG succeeded", zap.String("asgName", asgName),
 		zap.String("id", ptrVal(resp.ID)), zap.String("location", ptrVal(resp.Location)),
-		zap.String("provisioningState", provisioningStateVal(resp.Properties.ProvisioningState)))
+		zap.String("provisioningState", asgProvisioningState(resp.Properties)))
 	return &resp.ApplicationSecurityGroup, nil
 }
 
@@ -82,7 +82,7 @@ func (c *ASGClient) CreateOrUpdate(ctx context.Context, asgName, location string
 	}
 
 	c.log.Info("PUT ASG succeeded", zap.String("asgName", asgName),
-		zap.String("id", ptrVal(resp.ID)), zap.String("provisioningState", provisioningStateVal(resp.Properties.ProvisioningState)))
+		zap.String("id", ptrVal(resp.ID)), zap.String("provisioningState", asgProvisioningState(resp.Properties)))
 	return &resp.ApplicationSecurityGroup, nil
 }
 
@@ -123,7 +123,7 @@ func (c *ASGClient) UpdateTags(ctx context.Context, asgName string, tags map[str
 	}
 
 	c.log.Info("PATCH ASG tags succeeded", zap.String("asgName", asgName),
-		zap.String("id", ptrVal(resp.ID)), zap.String("provisioningState", provisioningStateVal(resp.Properties.ProvisioningState)))
+		zap.String("id", ptrVal(resp.ID)), zap.String("provisioningState", asgProvisioningState(resp.Properties)))
 	return &resp.ApplicationSecurityGroup, nil
 }
 
@@ -177,4 +177,11 @@ func provisioningStateVal(s *armnetwork.ProvisioningState) string {
 		return "<nil>"
 	}
 	return string(*s)
+}
+
+func asgProvisioningState(props *armnetwork.ApplicationSecurityGroupPropertiesFormat) string {
+	if props == nil {
+		return "<nil>"
+	}
+	return provisioningStateVal(props.ProvisioningState)
 }
