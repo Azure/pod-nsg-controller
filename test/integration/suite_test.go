@@ -12,6 +12,7 @@ import (
 
 	v1alpha1 "github.com/Azure/pod-nsg-controller/api/v1alpha1"
 	"github.com/Azure/pod-nsg-controller/internal/azure"
+	pkgerrors "github.com/pkg/errors"
 	"github.com/Azure/pod-nsg-controller/internal/azure/fake"
 	"github.com/Azure/pod-nsg-controller/internal/controller"
 	"github.com/Azure/pod-nsg-controller/internal/engine"
@@ -51,7 +52,7 @@ func TestMain(m *testing.M) {
 func repoRootFromCWD() (string, error) {
 	wd, err := os.Getwd()
 	if err != nil {
-		return "", fmt.Errorf("get working directory: %w", err)
+		return "", pkgerrors.Wrap(err, "get working directory")
 	}
 	return filepath.Clean(filepath.Join(wd, "..", "..")), nil
 }
@@ -59,7 +60,7 @@ func repoRootFromCWD() (string, error) {
 func configureEnvtestAssets(repoRoot string) error {
 	if assets := strings.TrimSpace(os.Getenv("KUBEBUILDER_ASSETS")); assets != "" {
 		if _, err := os.Stat(assets); err != nil {
-			return fmt.Errorf("stat KUBEBUILDER_ASSETS %q: %w", assets, err)
+			return pkgerrors.Wrapf(err, "stat KUBEBUILDER_ASSETS %q", assets)
 		}
 		return nil
 	}
@@ -74,7 +75,7 @@ func localEnvtestAssetsPath(repoRoot string) (string, error) {
 	assetsRoot := filepath.Join(repoRoot, "bin", "k8s")
 	entries, err := os.ReadDir(assetsRoot)
 	if err != nil {
-		return "", fmt.Errorf("read envtest assets directory %q: %w", assetsRoot, err)
+		return "", pkgerrors.Wrapf(err, "read envtest assets directory %q", assetsRoot)
 	}
 	versionPrefix := strings.TrimSuffix(envtestK8sVersion, ".x") + "."
 	for _, entry := range entries {
