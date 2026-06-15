@@ -11,7 +11,6 @@ import (
 	"github.com/Azure/pod-nsg-controller/internal/azure"
 	"github.com/Azure/pod-nsg-controller/internal/azure/fake"
 	"github.com/Azure/pod-nsg-controller/internal/model"
-	"go.uber.org/zap/zaptest"
 	corev1 "k8s.io/api/core/v1"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 )
@@ -21,9 +20,6 @@ import (
 // ---------------------------------------------------------------------------
 
 func TestPhase9_T91_CreateMappingAndThreePods_AllIPsPresent(t *testing.T) {
-	zapLog := zaptest.NewLogger(t)
-	_ = zapLog
-
 	pe := setupPhase9Env(t, phase9EnvOptions{
 		ClusterName:   "test-cluster",
 		Subscriptions: []string{"sub1"},
