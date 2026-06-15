@@ -46,6 +46,13 @@ func TestMain(m *testing.M) {
 		os.Exit(1)
 	}
 
+	// Set the global controller-runtime logger once for the entire test binary
+	// using a process-scoped logger. Using zaptest.NewLogger(t) would tie the
+	// global logger to a single test's lifetime, causing panics when
+	// controller-runtime goroutines log after that test completes.
+	globalLog, _ := zap.NewDevelopment()
+	ctrl.SetLogger(zapr.NewLogger(globalLog))
+
 	os.Exit(m.Run())
 }
 
@@ -161,7 +168,6 @@ func setupIntegrationEnv(t *testing.T, opts integrationEnvOptions) *integrationE
 
 	scheme := integrationScheme(t)
 	zapLog := zaptest.NewLogger(t)
-	ctrl.SetLogger(zapr.NewLogger(zapLog))
 
 	env := &envtest.Environment{
 		CRDDirectoryPaths: []string{"../../config/crd"},
