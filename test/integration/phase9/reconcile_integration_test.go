@@ -9,7 +9,6 @@ import (
 
 	v1alpha1 "github.com/Azure/pod-nsg-controller/api/v1alpha1"
 	"github.com/Azure/pod-nsg-controller/internal/azure"
-	"github.com/Azure/pod-nsg-controller/internal/azure/fake"
 	"github.com/Azure/pod-nsg-controller/internal/model"
 	corev1 "k8s.io/api/core/v1"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -985,6 +984,3 @@ func TestPhase9_T912_OverlappingSelectors_UnionAcrossASGs(t *testing.T) {
 		return true, ""
 	})
 }
-
-// Ensure fake import is used (prevents unused import error in compilation).
-var _ *fake.Client
