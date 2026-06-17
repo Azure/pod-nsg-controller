@@ -463,10 +463,12 @@ func TestPhase8_Integration_FullReconcile_EmitsMetricsPipeline(t *testing.T) {
 		t.Error("reconcile_actions_per_cycle not emitted")
 	}
 
-	// prefix_set_actions_total should show create action
-	if !metricFamilyExists(mfs, "pod_nsg_controller_prefix_set_actions_total") {
-		t.Error("prefix_set_actions_total not emitted")
-	}
+	// prefix_set_actions_total should show create action (may arrive on
+	// a subsequent reconcile after the finalizer-only first pass).
+	waitForCondition(t, 10*time.Second, "prefix_set_actions_total emitted", func() bool {
+		mfs, _ = te.registry.Gather()
+		return metricFamilyExists(mfs, "pod_nsg_controller_prefix_set_actions_total")
+	})
 }
 
 // ---------------------------------------------------------------------------

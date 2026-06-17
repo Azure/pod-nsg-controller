@@ -1,0 +1,12 @@
+apiVersion: networking.azure.com/v1alpha1
+kind: PodASGMapping
+metadata:
+  name: sample-mapping
+  namespace: default
+spec:
+  mappings:
+    - podSelector:
+        matchLabels:
+          app: web
+      applicationSecurityGroups:
+        - resourceId: /subscriptions/00000000-0000-0000-0000-000000000001/resourceGroups/rg-prod/providers/Microsoft.Network/applicationSecurityGroups/WebAsg

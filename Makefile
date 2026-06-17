@@ -39,6 +39,15 @@ test: generate manifests fmt vet setup-envtest ## Run tests.
 	@grep -hv '^mode:' cover-unit.out cover-envtest.out >> cover.out
 	@rm -f cover-unit.out cover-envtest.out
 
+.PHONY: test-phase9-integration
+test-phase9-integration: generate manifests setup-envtest ## Run phase9 integration tests.
+	KUBEBUILDER_ASSETS="$$(cd "$$( $(SETUP_ENVTEST) use $(ENVTEST_K8S_VERSION) --bin-dir $(LOCALBIN) -p path )" && pwd)" \
+	go test -p 1 -count=1 -timeout 180s ./test/integration/phase9/...
+
+.PHONY: test-phase9-e2e
+test-phase9-e2e: ## Run phase9 E2E tests (requires AZURE_E2E=true and live cluster).
+	go test -count=1 -timeout 1200s -tags=e2e ./test/e2e/...
+
 .PHONY: test-coverage
 test-coverage: test ## Run tests with coverage report.
 	go tool cover -html=cover.out -o coverage.html
