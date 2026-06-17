@@ -9,6 +9,21 @@ import (
 func TestNewASGClient_LoggerHandling(t *testing.T) {
 	const subscriptionID = "00000000-0000-0000-0000-000000000000"
 
+	// Clear Azure auth env vars so azidentity.NewDefaultAzureCredential does not
+	// fail to construct from a partially-configured environment (e.g. AZURE_CLIENT_ID
+	// set without AZURE_TENANT_ID), which would make this logger-guard test flaky.
+	for _, k := range []string{
+		"AZURE_TENANT_ID",
+		"AZURE_CLIENT_ID",
+		"AZURE_CLIENT_SECRET",
+		"AZURE_CLIENT_CERTIFICATE_PATH",
+		"AZURE_USERNAME",
+		"AZURE_PASSWORD",
+		"AZURE_FEDERATED_TOKEN_FILE",
+	} {
+		t.Setenv(k, "")
+	}
+
 	t.Run("nil logger defaults to nop", func(t *testing.T) {
 		var (
 			client *ASGClient
