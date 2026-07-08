@@ -178,10 +178,11 @@ Run it on each worker:
 ```bash
 for n in $WORKERS; do
   echo "=== installing TT on ${RG}-$n ==="
+  # az vm run-command invoke's --scripts is single-valued (a repeated flag would
+  # override, not append), so prepend the env exports into one combined payload.
+  { echo "export CNI_BINARY_URL='$CNI_BINARY_URL' CNI_CONFLIST_URL='$CNI_CONFLIST_URL'"; cat tt_install.sh; } > tt_run.sh
   az vm run-command invoke -g "$RG" -n "${RG}-$n" --subscription "$SUB" \
-    --command-id RunShellScript \
-    --scripts "export CNI_BINARY_URL='$CNI_BINARY_URL' CNI_CONFLIST_URL='$CNI_CONFLIST_URL'" \
-    --scripts @tt_install.sh \
+    --command-id RunShellScript --scripts @tt_run.sh \
     --query 'value[0].message' -o tsv | sed 's/\\n/\n/g'
 done
 ```
