@@ -1,0 +1,115 @@
+# =============================================================================
+# E2E Validation & Release pipeline.
+#
+# EPIC-001 foundation: this file currently implements only the deterministic
+# `meta` job (run metadata + topology-aware name maps + run-manifest foundation)
+# and a `naming-tests` job that exercises the naming/lib/meta helpers. The full
+# trigger matrix, GitHub Environments, concurrency policy, and the build /
+# provision / deploy / validate / diagnostics / cleanup / release jobs are added
+# by later epics (see docs/projects/infrastructure-e2e-validation-pipeline).
+#
+# Traceability: ITEM-001..ITEM-003, FR-011, FR-012, FR-015, NFR-007, PRD 3.4/9.1.
+# =============================================================================
+name: E2E Validation & Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      validation_topologies:
+        description: "Topologies to validate: comma-separated ss and/or xs. A release forces ss,xs."
+        type: string
+        default: "ss,xs"
+      regions:
+        description: "Canary regions (comma-separated): eastus2euap and/or centraluseuap."
+        type: string
+        default: "eastus2euap,centraluseuap"
+      release:
+        description: "Promote the validated artifact set to the public ACR (requires ss,xs)."
+        type: boolean
+        default: false
+      release_version:
+        description: "Semantic version to release, e.g. v1.2.3 (required when release=true)."
+        type: string
+        default: ""
+      primary_subscription_id:
+        description: "Primary subscription (Cluster A + shared ASGs). Non-sensitive identifier."
+        type: string
+        default: ""
+      secondary_subscription_id:
+        description: "Secondary subscription (Cluster B, xs only). MUST differ from primary."
+        type: string
+        default: ""
+  pull_request:
+    branches: [main]
+    paths:
+      - "scripts/e2e/**"
+      - ".github/workflows/e2e-validation-release.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  meta:
+    name: Compute run metadata & names
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      date_utc: ${{ steps.meta.outputs.date_utc }}
+      run_suffix: ${{ steps.meta.outputs.run_suffix }}
+      git_sha: ${{ steps.meta.outputs.git_sha }}
+      validation_topologies: ${{ steps.meta.outputs.validation_topologies }}
+      regions: ${{ steps.meta.outputs.regions }}
+      release_requested: ${{ steps.meta.outputs.release_requested }}
+      release_version: ${{ steps.meta.outputs.release_version }}
+      controller_staging_repo: ${{ steps.meta.outputs.controller_staging_repo }}
+      controller_staging_tag: ${{ steps.meta.outputs.controller_staging_tag }}
+      cni_staging_repo: ${{ steps.meta.outputs.cni_staging_repo }}
+      cni_staging_tag: ${{ steps.meta.outputs.cni_staging_tag }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Compute run metadata, names, and run-manifest foundation
+        id: meta
+        env:
+          REPO: ${{ github.repository }}
+          RUN_ID: ${{ github.run_id }}
+          RUN_ATTEMPT: ${{ github.run_attempt }}
+          GIT_SHA: ${{ github.sha }}
+          GIT_REF: ${{ github.ref }}
+          EVENT_NAME: ${{ github.event_name }}
+          REF_TYPE: ${{ github.ref_type }}
+          REF_NAME: ${{ github.ref_name }}
+          INPUT_TOPOLOGIES: ${{ inputs.validation_topologies || 'ss,xs' }}
+          INPUT_REGIONS: ${{ inputs.regions || 'eastus2euap,centraluseuap' }}
+          INPUT_RELEASE: ${{ inputs.release || false }}
+          INPUT_RELEASE_VERSION: ${{ inputs.release_version || '' }}
+          PRIMARY_SUBSCRIPTION_ID: ${{ inputs.primary_subscription_id || '' }}
+          SECONDARY_SUBSCRIPTION_ID: ${{ inputs.secondary_subscription_id || '' }}
+          MANIFEST_PATH: run-manifest.json
+        run: bash scripts/e2e/meta.sh
+
+      - name: Upload run-manifest foundation
+        uses: actions/upload-artifact@v4
+        with:
+          name: run-manifest
+          path: run-manifest.json
+          retention-days: 30
+
+  naming-tests:
+    name: Naming & metadata tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: shellcheck e2e scripts
+        run: shellcheck scripts/e2e/*.sh scripts/e2e/naming_test/*.sh
+
+      - name: Run naming, lib, and meta test suites
+        run: |
+          bash scripts/e2e/naming_test/naming_test.sh
+          bash scripts/e2e/naming_test/lib_test.sh
+          bash scripts/e2e/naming_test/meta_test.sh
+
+      - name: Verify naming self-check
+        run: bash scripts/e2e/naming.sh self-check

@@ -1,0 +1,5 @@
+# Transient per-run work directories created by the test suites (auto-cleaned
+# on normal exit; ignored here so an interrupted run never leaks into git).
+.lib_test_work/
+.meta_test_work/
+.metawork/
