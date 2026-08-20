@@ -101,6 +101,35 @@ manifest::merge() {
   manifest::_write "$1" '. * $add' --argjson add "$2"
 }
 
+# manifest::record_controller_artifact <path> <registry> <repo> <tag> <digest> <pushed>
+# Records the candidate controller image coordinates and the immutable digest
+# reference that every downstream job (deploy/validate/release) MUST consume,
+# under `.artifacts.controller` (EPIC-002 / ITEM-006 / AC-001 / FR-002).
+#
+#   * pushed=true  -> reference is BY @sha256 digest: "<registry>/<repo>@<digest>"
+#                     (the only form later jobs are allowed to pull, FR-002).
+#   * pushed=false + registry -> "<registry>/<repo>:<tag>" (candidate not yet pushed).
+#   * pushed=false, no registry -> bare "<repo>:<tag>" (PR local build, no cloud).
+#
+# The <digest> (registry manifest digest when pushed, local image id otherwise)
+# is always recorded so the build->validate->release chain is auditable (NFR-006).
+manifest::record_controller_artifact() {
+  local path="$1" registry="$2" repo="$3" tag="$4" digest="$5" pushed="${6:-false}"
+  local reference pushed_json
+  if [[ "$pushed" == "true" && -n "$digest" ]]; then
+    reference="${registry:+${registry}/}${repo}@${digest}"
+    pushed_json=true
+  else
+    reference="${registry:+${registry}/}${repo}:${tag}"
+    pushed_json=false
+  fi
+  manifest::put_json "$path" artifacts.controller "$(jq -n \
+    --arg registry "$registry" --arg repo "$repo" --arg tag "$tag" \
+    --arg digest "$digest" --arg reference "$reference" --argjson pushed "$pushed_json" \
+    '{registry: $registry, repo: $repo, tag: $tag,
+      digest: $digest, reference: $reference, pushed: $pushed}')"
+}
+
 # manifest::get <path> <jq-filter> : print a raw value from the manifest.
 manifest::get() { jq -r "$2" "$1"; }
 

@@ -587,13 +587,13 @@ Each scenario below is a discrete, independently-reported validation gate derive
 | ITEM-002 | Add `meta` computing date, both topology name maps, explicit subscription-role maps, artifact refs, and release flags; fail if release omits either topology or `xs` IDs are equal. | Done | .github/workflows/e2e-validation-release.yml, scripts/e2e/lib.sh |
 | ITEM-003 | Add naming tests for determinism, topology separation, charset/length limits, truncation, and the prefix-set invariant. | Done | scripts/e2e/naming_test/, scripts/e2e/naming.sh |
 
-- EPIC-002: Build and candidate publish — one image, digest capture, SBOM, OIDC push to staging.
+- EPIC-002 (Status: Done): Build and candidate publish — one image, digest capture, SBOM, OIDC push to staging.
 
 | Task | Description | Status | Relevant Files |
 |------|-------------|--------|----------------|
-| ITEM-004 | Implement the `build` job: `docker build` from `Dockerfile` (reuse `make docker-build`), push to staging ACR via OIDC, capture and output `sha256` digest. Validation: `build` outputs a digest; PR runs build without push/cloud. | Not Started | .github/workflows/e2e-validation-release.yml, Dockerfile, Makefile |
-| ITEM-005 | Generate SBOM (syft) for the candidate digest and upload as artifact. Validation: SBOM artifact exists and lists the Go module `github.com/Azure/pod-nsg-controller`. | Not Started | .github/workflows/e2e-validation-release.yml |
-| ITEM-006 | Record candidate controller image digest + staging ref into `run-manifest.json` (the CNI artifact digest is added by EPIC-009). Validation: manifest shows one controller digest referenced by later jobs (AC-001). | Not Started | scripts/e2e/lib.sh |
+| ITEM-004 | Implement the `build` job: `docker build` from `Dockerfile` (reuse `make docker-build`), push to staging ACR via OIDC, capture and output `sha256` digest. Validation: `build` outputs a digest; PR runs build without push/cloud. | Done | .github/workflows/e2e-validation-release.yml, Dockerfile, Makefile |
+| ITEM-005 | Generate SBOM (syft) for the candidate digest and upload as artifact. Validation: SBOM artifact exists and lists the Go module `github.com/Azure/pod-nsg-controller`. | Done | .github/workflows/e2e-validation-release.yml |
+| ITEM-006 | Record candidate controller image digest + staging ref into `run-manifest.json` (the CNI artifact digest is added by EPIC-009). Validation: manifest shows one controller digest referenced by later jobs (AC-001). | Done | scripts/e2e/lib.sh |
 
 - EPIC-003: Provisioning generalization — parameterized self-managed clusters + shared ASGs + cross-region RBAC.
 

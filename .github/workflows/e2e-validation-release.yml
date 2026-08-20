@@ -3,12 +3,18 @@
 #
 # EPIC-001 foundation: this file currently implements only the deterministic
 # `meta` job (run metadata + topology-aware name maps + run-manifest foundation)
-# and a `naming-tests` job that exercises the naming/lib/meta helpers. The full
-# trigger matrix, GitHub Environments, concurrency policy, and the build /
-# provision / deploy / validate / diagnostics / cleanup / release jobs are added
-# by later epics (see docs/projects/infrastructure-e2e-validation-pipeline).
+# and a `naming-tests` job that exercises the naming/lib/meta/build helpers.
 #
-# Traceability: ITEM-001..ITEM-003, FR-011, FR-012, FR-015, NFR-007, PRD 3.4/9.1.
+# EPIC-002 adds the `build` job: it builds the candidate controller image once
+# (reusing `make docker-build`), publishes it to the staging ACR BY DIGEST via
+# OIDC (skipped on PRs), generates an SBOM (syft), and records the immutable
+# digest/reference into the run manifest for downstream jobs (build-once,
+# promote-by-digest). The trigger matrix, GitHub Environments, concurrency
+# policy, and the provision / deploy / validate / diagnostics / cleanup /
+# release jobs are added by later epics (see docs/projects/...).
+#
+# Traceability: ITEM-001..ITEM-006, FR-001, FR-002, FR-011, FR-012, FR-015,
+# FR-016, NFR-006, NFR-007, SEC-001, SEC-003, PRD 3.1/3.4/3.5/9.1.
 # =============================================================================
 name: E2E Validation & Release
 
@@ -95,6 +101,76 @@ jobs:
           path: run-manifest.json
           retention-days: 30
 
+  build:
+    name: Build & publish candidate (by digest)
+    needs: meta
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    # Cloud publish uses GitHub OIDC only (no standing secrets, NFR-005/SEC-001).
+    # PRs build to validate the Dockerfile but never authenticate or push
+    # (RD-009). GitHub Environment approval for the cloud path is added in
+    # EPIC-007 (FR-013) together with the trigger matrix and concurrency policy.
+    permissions:
+      contents: read
+      id-token: write
+    outputs:
+      image_reference: ${{ steps.build.outputs.image_reference }}
+      image_digest: ${{ steps.build.outputs.image_digest }}
+      image_repo: ${{ steps.build.outputs.image_repo }}
+      image_tag: ${{ steps.build.outputs.image_tag }}
+      image_registry: ${{ steps.build.outputs.image_registry }}
+      pushed: ${{ steps.build.outputs.pushed }}
+      sbom_path: ${{ steps.build.outputs.sbom_path }}
+    steps:
+      - uses: actions/checkout@v4
+
+      # Start from the meta job's run-manifest so the recorded controller digest
+      # is threaded through the single run manifest (ITEM-006 / NFR-006).
+      - name: Download run-manifest foundation
+        uses: actions/download-artifact@v4
+        with:
+          name: run-manifest
+          path: .
+
+      # syft provides the SBOM generator on PATH for both PR and cloud runs.
+      - name: Install syft (SBOM)
+        uses: anchore/sbom-action/download-syft@v0.17.9
+
+      # OIDC login only for cloud-publishing runs (skipped on PRs). Mirrors the
+      # existing phase9-integration-e2e.yml pattern (SEC-001).
+      - name: Azure Login (OIDC)
+        if: ${{ github.event_name != 'pull_request' }}
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Build candidate, publish by digest, generate SBOM
+        id: build
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          STAGING_ACR: ${{ vars.E2E_STAGING_ACR }}
+          CONTROLLER_STAGING_REPO: ${{ needs.meta.outputs.controller_staging_repo }}
+          CONTROLLER_STAGING_TAG: ${{ needs.meta.outputs.controller_staging_tag }}
+          MANIFEST_PATH: run-manifest.json
+          SBOM_PATH: sbom/controller.spdx.json
+        run: bash scripts/e2e/build.sh
+
+      - name: Upload controller SBOM
+        uses: actions/upload-artifact@v4
+        with:
+          name: sbom-controller
+          path: sbom/controller.spdx.json
+          retention-days: 30
+
+      - name: Upload run-manifest (with candidate digest)
+        uses: actions/upload-artifact@v4
+        with:
+          name: run-manifest-build
+          path: run-manifest.json
+          retention-days: 30
+
   naming-tests:
     name: Naming & metadata tests
     runs-on: ubuntu-latest
@@ -105,11 +181,12 @@ jobs:
       - name: shellcheck e2e scripts
         run: shellcheck scripts/e2e/*.sh scripts/e2e/naming_test/*.sh
 
-      - name: Run naming, lib, and meta test suites
+      - name: Run naming, lib, meta, and build test suites
         run: |
           bash scripts/e2e/naming_test/naming_test.sh
           bash scripts/e2e/naming_test/lib_test.sh
           bash scripts/e2e/naming_test/meta_test.sh
+          bash scripts/e2e/naming_test/build_test.sh
 
       - name: Verify naming self-check
         run: bash scripts/e2e/naming.sh self-check
