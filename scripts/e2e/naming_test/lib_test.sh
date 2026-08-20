@@ -108,6 +108,68 @@ manifest::record_controller_artifact "$ART" "pncstg.azurecr.io" "candidate/pod-n
   "run-20260820-vahdkc" "sha256:abc" true
 assert_eq "record preserves prior run.* keys" "vahdkc" "$(manifest::get "$ART" '.run.run_suffix')"
 
+echo "== lib::validate_canary_region (EPIC-003 / ITEM-010 / CON-001) =="
+assert_eq "accepts eastus2euap"   "eastus2euap"   "$(lib::validate_canary_region eastus2euap)"
+assert_eq "accepts centraluseuap" "centraluseuap" "$(lib::validate_canary_region centraluseuap)"
+assert_eq "normalizes case + surrounding space" "eastus2euap" "$(lib::validate_canary_region '  EastUS2EUAP ')"
+if lib::validate_canary_region westus2 >/dev/null 2>&1; then
+  fail "non-canary westus2 must be rejected (CON-001)"; else pass "rejects non-canary region westus2"; fi
+if lib::validate_canary_region '' >/dev/null 2>&1; then
+  fail "empty region must be rejected"; else pass "rejects empty region"; fi
+
+echo "== lib::csv_to_json_array (EPIC-003 / ITEM-010 provision matrix) =="
+assert_eq "two regions -> JSON array" '["eastus2euap","centraluseuap"]' \
+  "$(lib::csv_to_json_array 'eastus2euap,centraluseuap')"
+assert_eq "trims spaces and drops trailing empty" '["eastus2euap","centraluseuap"]' \
+  "$(lib::csv_to_json_array ' eastus2euap , centraluseuap ,')"
+assert_eq "single element" '["eastus2euap"]' "$(lib::csv_to_json_array 'eastus2euap')"
+assert_eq "empty string -> []" '[]' "$(lib::csv_to_json_array '')"
+
+echo "== lib::az_vm_quota_preflight (EPIC-003 / ITEM-010 / RISK-003) =="
+QWORK="${WORK}/quota"; QBIN="${QWORK}/bin"; mkdir -p "$QBIN"
+QAZLOG="${QWORK}/az.log"
+cat > "${QBIN}/az" <<'AZ'
+#!/usr/bin/env bash
+echo "$*" >> "${MOCK_AZ_LOG}"
+fam_limit="${MOCK_QUOTA_FAMILY_LIMIT:-100}"; fam_used="${MOCK_QUOTA_FAMILY_USED:-0}"
+tot_limit="${MOCK_QUOTA_TOTAL_LIMIT:-200}";  tot_used="${MOCK_QUOTA_TOTAL_USED:-0}"
+fam='{"currentValue":'"$fam_used"',"limit":'"$fam_limit"',"name":{"value":"standardDSv5Family","localizedValue":"Standard DSv5 Family vCPUs"},"unit":"Count"}'
+tot='{"currentValue":'"$tot_used"',"limit":'"$tot_limit"',"name":{"value":"cores","localizedValue":"Total Regional vCPUs"},"unit":"Count"}'
+if [[ "${MOCK_QUOTA_OMIT_FAMILY:-0}" == "1" ]]; then printf '[%s]\n' "$tot"; else printf '[%s,%s]\n' "$fam" "$tot"; fi
+exit 0
+AZ
+chmod +x "${QBIN}/az"
+
+# Mock knobs are exported at top level (no subshells) so the mock child sees
+# them and shellcheck stays clean; each case mutates one knob then resets it.
+export MOCK_AZ_LOG="$QAZLOG"
+export MOCK_QUOTA_FAMILY_LIMIT=100 MOCK_QUOTA_FAMILY_USED=0
+export MOCK_QUOTA_TOTAL_LIMIT=200 MOCK_QUOTA_TOTAL_USED=0 MOCK_QUOTA_OMIT_FAMILY=0
+
+: > "$QAZLOG"
+if lib::az_vm_quota_preflight "${QBIN}/az" sub-123 eastus2euap standardDSv5Family 16 >/dev/null 2>&1; then
+  pass "sufficient quota passes"; else fail "sufficient quota should pass"; fi
+assert_eq "quota preflight passes explicit --subscription" "1" "$(grep -c -- '--subscription sub-123' "$QAZLOG")"
+assert_eq "quota preflight passes --location region"       "1" "$(grep -c -- '--location eastus2euap' "$QAZLOG")"
+
+MOCK_QUOTA_FAMILY_LIMIT=10
+if lib::az_vm_quota_preflight "${QBIN}/az" sub eastus2euap standardDSv5Family 16 >/dev/null 2>&1; then
+  fail "insufficient family quota should gate provisioning"; else pass "insufficient family quota fails (gates provisioning)"; fi
+MOCK_QUOTA_FAMILY_LIMIT=100
+
+MOCK_QUOTA_TOTAL_LIMIT=8
+if lib::az_vm_quota_preflight "${QBIN}/az" sub eastus2euap standardDSv5Family 16 >/dev/null 2>&1; then
+  fail "insufficient total regional vCPUs should fail"; else pass "insufficient total regional vCPUs fails"; fi
+MOCK_QUOTA_TOTAL_LIMIT=200
+
+MOCK_QUOTA_OMIT_FAMILY=1
+if lib::az_vm_quota_preflight "${QBIN}/az" sub eastus2euap standardDSv5Family 16 >/dev/null 2>&1; then
+  fail "missing family usage entry should fail closed"; else pass "missing family usage entry fails closed"; fi
+MOCK_QUOTA_OMIT_FAMILY=0
+
+if lib::az_vm_quota_preflight "${QBIN}/az" sub eastus2euap standardDSv5Family notanumber >/dev/null 2>&1; then
+  fail "non-integer required vCPUs should be rejected"; else pass "rejects non-integer required vCPUs"; fi
+
 echo
 printf 'lib_test: %s passed, %s failed\n' "$PASS" "$FAIL"
 (( FAIL == 0 ))

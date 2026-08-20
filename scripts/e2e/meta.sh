@@ -141,11 +141,15 @@ manifest::put_json "$MANIFEST_PATH" subscriptions \
 # ---- step outputs (consumed by downstream jobs in later epics) --------------
 topos_csv="$(IFS=,; printf '%s' "${effective_topos[*]}")"
 regions_csv="$(IFS=,; printf '%s' "${regions[*]}")"
+# JSON array form of the canary regions, consumed as a GitHub Actions matrix by
+# the per-region `provision` job (EPIC-003 / ITEM-010, PAT-002).
+regions_json="$(lib::csv_to_json_array "$regions_csv")"
 gha::output date_utc "$DATE_UTC"
 gha::output run_suffix "$run_suffix"
 gha::output git_sha "$git_sha"
 gha::output validation_topologies "$topos_csv"
 gha::output regions "$regions_csv"
+gha::output regions_json "$regions_json"
 gha::output release_requested "$release_requested"
 gha::output release_version "$INPUT_RELEASE_VERSION"
 gha::output controller_staging_repo "$ctrl_repo"

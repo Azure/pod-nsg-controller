@@ -595,14 +595,14 @@ Each scenario below is a discrete, independently-reported validation gate derive
 | ITEM-005 | Generate SBOM (syft) for the candidate digest and upload as artifact. Validation: SBOM artifact exists and lists the Go module `github.com/Azure/pod-nsg-controller`. | Done | .github/workflows/e2e-validation-release.yml |
 | ITEM-006 | Record candidate controller image digest + staging ref into `run-manifest.json` (the CNI artifact digest is added by EPIC-009). Validation: manifest shows one controller digest referenced by later jobs (AC-001). | Done | scripts/e2e/lib.sh |
 
-- EPIC-003: Provisioning generalization — parameterized self-managed clusters + shared ASGs + cross-region RBAC.
+- EPIC-003 (Status: Done): Provisioning generalization — parameterized self-managed clusters + shared ASGs + cross-region RBAC.
 
 | Task | Description | Status | Relevant Files |
 |------|-------------|--------|----------------|
-| ITEM-007 | Generalize provisioning with mandatory explicit `(subscription, topology, region, RG, names…)`; provision both `ss` and `xs` without implicit `az account` context. Validation: four Ready nodes/cluster and resource IDs under expected subscriptions. | Not Started | scripts/e2e/provision-cluster.sh, scripts/poc/setup-cluster-eastus2euap.sh |
-| ITEM-008 | Provision shared `asg-backend`/`asg-frontend` in each topology's primary region RG and apply topology/subscription-role tags to every RG. Validation: ASGs and expected tags exist under explicit subscription IDs. | Not Started | scripts/e2e/provision-cluster.sh |
-| ITEM-009 | Implement `cross-region-rbac.sh` granting both clusters' node identities the minimal role on the primary RG scope only; wait for propagation with bounded retry. Validation: a pod on Cluster B can `az rest GET` the shared ASG; no subscription-scope grant exists. | Not Started | scripts/e2e/cross-region-rbac.sh, scripts/poc/setup-cross-sub-rbac.sh |
-| ITEM-010 | Add a per-region matrix `provision` job with region input validation (canary-only) and VM quota preflight. Validation: non-canary region input fails fast; quota check gates provisioning. | Not Started | .github/workflows/e2e-validation-release.yml, scripts/e2e/lib.sh |
+| ITEM-007 | Generalize provisioning with mandatory explicit `(subscription, topology, region, RG, names…)`; provision both `ss` and `xs` without implicit `az account` context. Validation: four Ready nodes/cluster and resource IDs under expected subscriptions. | Done | scripts/e2e/provision-cluster.sh, scripts/poc/setup-cluster-eastus2euap.sh |
+| ITEM-008 | Provision shared `asg-backend`/`asg-frontend` in each topology's primary region RG and apply topology/subscription-role tags to every RG. Validation: ASGs and expected tags exist under explicit subscription IDs. | Done | scripts/e2e/provision-cluster.sh |
+| ITEM-009 | Implement `cross-region-rbac.sh` granting both clusters' node identities the minimal role on the primary RG scope only; wait for propagation with bounded retry. Validation: a pod on Cluster B can `az rest GET` the shared ASG; no subscription-scope grant exists. | Done | scripts/e2e/cross-region-rbac.sh, scripts/poc/setup-cross-sub-rbac.sh |
+| ITEM-010 | Add a per-region matrix `provision` job with region input validation (canary-only) and VM quota preflight. Validation: non-canary region input fails fast; quota check gates provisioning. | Done | .github/workflows/e2e-validation-release.yml, scripts/e2e/lib.sh |
 
 - EPIC-004: Deploy and validation — candidate deploy plus the four documented tests.
 

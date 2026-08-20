@@ -50,6 +50,8 @@ if [[ "$(jq -r '.names.xs.centraluseuap.subscription_role' "$MANIFEST" 2>/dev/nu
   pass "xs centraluseuap role=secondary"; else fail "xs role map wrong"; fi
 if grep -q '^validation_topologies=ss,xs$' "${WORK}/happy.out"; then
   pass "step output validation_topologies set"; else fail "missing step output"; fi
+if grep -q '^regions_json=\["eastus2euap","centraluseuap"\]$' "${WORK}/happy.out"; then
+  pass "step output regions_json is a JSON array (provision matrix, ITEM-010)"; else fail "missing regions_json matrix output"; fi
 
 echo "== release must include BOTH topologies (CON-009) =="
 run_meta rel_ss_only INPUT_TOPOLOGIES="ss" INPUT_RELEASE="true" INPUT_RELEASE_VERSION="v1.2.3"

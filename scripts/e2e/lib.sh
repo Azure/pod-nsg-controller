@@ -58,6 +58,100 @@ lib::retry() {
   done
 }
 
+# ---- provisioning preflight helpers (EPIC-003 / ITEM-010) -------------------
+# Side-effect-free helpers shared by the `provision` job, provision-cluster.sh,
+# and cross-region-rbac.sh. Every Azure call takes an explicit subscription so
+# nothing depends on mutable `az account` context (RISK-013 / RD-020).
+
+# The documented canary regions where the addressPrefixSets API is available
+# (CON-001). Overridable for testing, but the pipeline pins the two defaults.
+: "${E2E_CANARY_REGIONS:=eastus2euap centraluseuap}"
+
+# lib::validate_canary_region <region> [allowed_space_separated]
+# Normalizes (lowercase, strip surrounding space) and prints the region when it
+# is a supported canary region; otherwise logs and returns non-zero (CON-001).
+lib::validate_canary_region() {
+  local region="$1" allowed="${2:-$E2E_CANARY_REGIONS}" r
+  region="$(printf '%s' "$region" | tr '[:upper:]' '[:lower:]' | tr -d '[:space:]')"
+  [[ -n "$region" ]] || { log::error "region is empty (allowed canary regions: ${allowed})"; return 1; }
+  for r in $allowed; do
+    if [[ "$region" == "$r" ]]; then printf '%s' "$region"; return 0; fi
+  done
+  log::error "region '${region}' is not a supported canary region (allowed: ${allowed})"
+  return 1
+}
+
+# lib::csv_to_json_array <csv> : compact JSON array from a comma-separated list,
+# trimming surrounding whitespace and dropping empty elements ('' -> []). Used
+# to feed a GitHub Actions matrix from a CSV step output (ITEM-010).
+lib::csv_to_json_array() {
+  jq -n -c --arg s "${1:-}" \
+    '$s | split(",") | map(gsub("^[[:space:]]+|[[:space:]]+$";"")) | map(select(length > 0))'
+}
+
+# lib::_quota_available <list-usage-json> <filter> : print the smallest
+# (limit-currentValue) among usage entries whose machine or localized name
+# EQUALS <filter> (case-insensitive); empty when nothing matches. Exact match
+# avoids false positives such as "cores" matching "lowPriorityCores" (whose
+# limit is often 0 in canary subscriptions and would wrongly gate provisioning).
+lib::_quota_available() {
+  printf '%s' "$1" | jq -r --arg f "$(printf '%s' "$2" | tr '[:upper:]' '[:lower:]')" '
+    [ .[]
+      | select(
+          ((.name.value // "" | ascii_downcase) == $f)
+          or ((.name.localizedValue // "" | ascii_downcase) == $f)
+        )
+      | ((.limit // 0) - (.currentValue // 0))
+    ] | if length == 0 then "" else min end'
+}
+
+# lib::az_vm_quota_preflight <az_bin> <subscription> <region> <family_filter>
+#                            <required_vcpus> [total_filter=cores]
+# Gates provisioning (RISK-003): fails when the target VM family OR the total
+# regional vCPU headroom in <region>/<subscription> is below <required_vcpus>.
+# Uses `az vm list-usage` with an explicit --subscription and bounded retries.
+lib::az_vm_quota_preflight() {
+  local az_bin="$1" sub="$2" region="$3" family="$4" required="$5" total_filter="${6:-cores}"
+  if [[ -z "$az_bin" || -z "$sub" || -z "$region" || -z "$family" || -z "$required" ]]; then
+    log::error "az_vm_quota_preflight: usage <az_bin> <subscription> <region> <family_filter> <required_vcpus> [total_filter]"
+    return 2
+  fi
+  [[ "$required" =~ ^[0-9]+$ ]] || { log::error "required vCPUs must be a non-negative integer (got '${required}')"; return 2; }
+
+  local json attempt=1 max="${QUOTA_PREFLIGHT_ATTEMPTS:-3}" delay="${QUOTA_PREFLIGHT_DELAY:-5}"
+  while true; do
+    if json="$("$az_bin" vm list-usage --location "$region" --subscription "$sub" -o json 2>/dev/null)" \
+       && printf '%s' "$json" | jq -e 'type == "array"' >/dev/null 2>&1; then
+      break
+    fi
+    if (( attempt >= max )); then
+      log::error "quota preflight: 'az vm list-usage' failed for region=${region} subscription=${sub} after ${attempt} attempt(s)"
+      return 1
+    fi
+    log::warn "quota preflight: 'az vm list-usage' attempt ${attempt}/${max} failed; retrying in ${delay}s"
+    sleep "$delay"; attempt=$(( attempt + 1 )); delay=$(( delay * 2 ))
+  done
+
+  local fam_avail tot_avail rc=0
+  fam_avail="$(lib::_quota_available "$json" "$family")"
+  tot_avail="$(lib::_quota_available "$json" "$total_filter")"
+  if [[ -z "$fam_avail" ]]; then
+    log::error "quota preflight: no VM-family usage entry matching '${family}' in ${region}/${sub}"; rc=1
+  elif (( fam_avail < required )); then
+    log::error "quota preflight: insufficient '${family}' vCPUs in ${region}/${sub}: available=${fam_avail} required=${required}"; rc=1
+  else
+    log::info "quota preflight: '${family}' vCPUs OK in ${region}/${sub}: available=${fam_avail} required=${required}"
+  fi
+  if [[ -z "$tot_avail" ]]; then
+    log::warn "quota preflight: no total-regional-vCPU entry matching '${total_filter}' in ${region}/${sub}; skipping total check"
+  elif (( tot_avail < required )); then
+    log::error "quota preflight: insufficient total regional vCPUs in ${region}/${sub}: available=${tot_avail} required=${required}"; rc=1
+  else
+    log::info "quota preflight: total regional vCPUs OK in ${region}/${sub}: available=${tot_avail} required=${required}"
+  fi
+  return "$rc"
+}
+
 # ---- run-manifest helpers (jq-based JSON, FILE-023) -------------------------
 # The manifest is a plain JSON file updated via atomic sibling-temp writes (no
 # /tmp, no mktemp) so it works in restricted CI sandboxes.

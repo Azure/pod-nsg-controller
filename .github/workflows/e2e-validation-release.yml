@@ -65,6 +65,7 @@ jobs:
       git_sha: ${{ steps.meta.outputs.git_sha }}
       validation_topologies: ${{ steps.meta.outputs.validation_topologies }}
       regions: ${{ steps.meta.outputs.regions }}
+      regions_json: ${{ steps.meta.outputs.regions_json }}
       release_requested: ${{ steps.meta.outputs.release_requested }}
       release_version: ${{ steps.meta.outputs.release_version }}
       controller_staging_repo: ${{ steps.meta.outputs.controller_staging_repo }}
@@ -171,6 +172,147 @@ jobs:
           path: run-manifest.json
           retention-days: 30
 
+  # ===========================================================================
+  # EPIC-003 - Provisioning generalization (ITEM-007/008/010).
+  #
+  # Per-region matrix that provisions the same-subscription (`ss`) topology with
+  # explicit subscription context on every Azure call (RD-020). Region input is
+  # re-validated (canary-only, CON-001) and a VM-quota preflight GATES
+  # provisioning (RISK-003) before any resource is created. Cloud steps are
+  # skipped on pull_request (RD-009: no fork OIDC / no per-PR cost). GitHub
+  # Environment approval and the non-cancelable cloud concurrency group are
+  # added in EPIC-007 (FR-013/RD-008); `xs` provisioning is EPIC-010.
+  provision:
+    name: Provision ss / ${{ matrix.region }}
+    needs: meta
+    if: ${{ github.event_name != 'pull_request' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    permissions:
+      contents: read
+      id-token: write
+    strategy:
+      fail-fast: false
+      matrix:
+        region: ${{ fromJSON(needs.meta.outputs.regions_json) }}
+    env:
+      TOPOLOGY: ss
+      REGION: ${{ matrix.region }}
+      PRIMARY_SUBSCRIPTION_ID: ${{ inputs.primary_subscription_id || vars.E2E_PRIMARY_SUBSCRIPTION_ID }}
+      VM_QUOTA_FAMILY: standardDSv5Family
+      VM_QUOTA_REQUIRED: "16"
+    steps:
+      - uses: actions/checkout@v4
+
+      # Defensive canary-only re-validation (meta already rejects non-canary
+      # regions in `run`, but the provision job fails fast too, ITEM-010/CON-001).
+      - name: Validate region (canary-only)
+        run: |
+          source scripts/e2e/lib.sh
+          # shellcheck disable=SC2153  # REGION comes from the job env (matrix.region)
+          lib::validate_canary_region "${REGION}" >/dev/null
+
+      # Start from the meta foundation (names tree) and augment it with this
+      # region's provision entry; the per-region manifests are merged in the
+      # summary job (EPIC-007).
+      - name: Download run-manifest foundation
+        uses: actions/download-artifact@v4
+        with:
+          name: run-manifest
+          path: .
+
+      - name: Azure Login (OIDC)
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ env.PRIMARY_SUBSCRIPTION_ID }}
+
+      # VM quota preflight GATES provisioning: 1 control-plane + 3 workers of the
+      # smallest viable SKU (Standard_D4s_v5 = 4 vCPU) = 16 vCPUs (NFR-004).
+      - name: VM quota preflight (gates provisioning)
+        run: |
+          source scripts/e2e/lib.sh
+          # shellcheck disable=SC2153  # REGION comes from the job env (matrix.region)
+          lib::az_vm_quota_preflight az "${PRIMARY_SUBSCRIPTION_ID}" "${REGION}" \
+            "${VM_QUOTA_FAMILY}" "${VM_QUOTA_REQUIRED}"
+
+      - name: Provision self-managed cluster (explicit subscription)
+        id: provision
+        env:
+          SUBSCRIPTION_ID: ${{ env.PRIMARY_SUBSCRIPTION_ID }}
+          REPO: ${{ github.repository }}
+          RUN_ID: ${{ github.run_id }}
+          RUN_ATTEMPT: ${{ github.run_attempt }}
+          DATE_UTC: ${{ needs.meta.outputs.date_utc }}
+          GIT_SHA: ${{ github.sha }}
+          GIT_REF: ${{ github.ref }}
+          MANIFEST_PATH: run-manifest.json
+        run: bash scripts/e2e/provision-cluster.sh all
+
+      - name: Upload provisioning manifest
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: run-manifest-provision-ss-${{ matrix.region }}
+          path: run-manifest.json
+          retention-days: 30
+
+  # ===========================================================================
+  # EPIC-003 - Same-subscription, run-scoped cross-region RBAC (ITEM-009).
+  #
+  # Grants both clusters' node identities the minimal `Network Contributor` role
+  # on the PRIMARY run RG scope ONLY (never a subscription-scope grant), waits
+  # for propagation with a bounded retry, records assignment IDs, and asserts no
+  # subscription-scope grant references a run principal. The `xs` cross-subscription
+  # variant (setup-cross-sub-rbac.sh) is EPIC-010.
+  rbac:
+    name: Cross-region RBAC (ss)
+    needs: [meta, provision]
+    if: ${{ github.event_name != 'pull_request' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      TOPOLOGY: ss
+      REGIONS: ${{ needs.meta.outputs.regions }}
+      PRIMARY_SUBSCRIPTION_ID: ${{ inputs.primary_subscription_id || vars.E2E_PRIMARY_SUBSCRIPTION_ID }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download run-manifest foundation
+        uses: actions/download-artifact@v4
+        with:
+          name: run-manifest
+          path: .
+
+      - name: Azure Login (OIDC)
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ env.PRIMARY_SUBSCRIPTION_ID }}
+
+      - name: Grant run-scoped cross-region RBAC (RG-scoped, bounded propagation)
+        id: rbac
+        env:
+          REPO: ${{ github.repository }}
+          RUN_ID: ${{ github.run_id }}
+          RUN_ATTEMPT: ${{ github.run_attempt }}
+          DATE_UTC: ${{ needs.meta.outputs.date_utc }}
+          MANIFEST_PATH: run-manifest.json
+        run: bash scripts/e2e/cross-region-rbac.sh all
+
+      - name: Upload RBAC manifest
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: run-manifest-rbac-ss
+          path: run-manifest.json
+          retention-days: 30
+
   naming-tests:
     name: Naming & metadata tests
     runs-on: ubuntu-latest
@@ -181,12 +323,14 @@ jobs:
       - name: shellcheck e2e scripts
         run: shellcheck scripts/e2e/*.sh scripts/e2e/naming_test/*.sh
 
-      - name: Run naming, lib, meta, and build test suites
+      - name: Run naming, lib, meta, build, provision, and rbac test suites
         run: |
           bash scripts/e2e/naming_test/naming_test.sh
           bash scripts/e2e/naming_test/lib_test.sh
           bash scripts/e2e/naming_test/meta_test.sh
           bash scripts/e2e/naming_test/build_test.sh
+          bash scripts/e2e/naming_test/provision_cluster_test.sh
+          bash scripts/e2e/naming_test/cross_region_rbac_test.sh
 
       - name: Verify naming self-check
         run: bash scripts/e2e/naming.sh self-check
