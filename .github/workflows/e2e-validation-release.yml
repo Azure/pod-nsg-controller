@@ -67,8 +67,16 @@ on:
         description: "Semantic version to release, e.g. v1.2.3 (required when release=true)."
         type: string
         default: ""
-      keep_resources:
-        description: "Retain resources for non-release debugging. Forbidden when release=true."
+      run_full_validation:
+        description: "Force both ss and xs validation without requesting a release."
+        type: boolean
+        default: false
+      moving_tags:
+        description: "Comma-separated release moving tags: latest,vMAJOR,vMAJOR.MINOR."
+        type: string
+        default: ""
+      keep_resources_on_failure:
+        description: "Retain selected-topology resources only after upstream validation/provisioning failure. Forbidden for releases."
         type: boolean
         default: false
       primary_subscription_id:
@@ -81,9 +89,6 @@ on:
         default: ""
   pull_request:
     branches: [main]
-    paths:
-      - "scripts/e2e/**"
-      - ".github/workflows/e2e-validation-release.yml"
   schedule:
     - cron: "0 7 * * *"
   release:
@@ -112,6 +117,9 @@ jobs:
       regions_json: ${{ steps.meta.outputs.regions_json }}
       release_requested: ${{ steps.meta.outputs.release_requested }}
       release_version: ${{ steps.meta.outputs.release_version }}
+      run_full_validation: ${{ steps.meta.outputs.run_full_validation }}
+      moving_tags: ${{ steps.meta.outputs.moving_tags }}
+      keep_resources_on_failure: ${{ steps.meta.outputs.keep_resources_on_failure }}
       controller_staging_repo: ${{ steps.meta.outputs.controller_staging_repo }}
       controller_staging_tag: ${{ steps.meta.outputs.controller_staging_tag }}
       cni_staging_repo: ${{ steps.meta.outputs.cni_staging_repo }}
@@ -134,7 +142,9 @@ jobs:
           INPUT_REGIONS: ${{ inputs.regions || 'eastus2euap,centraluseuap' }}
           INPUT_RELEASE: ${{ inputs.release || false }}
           INPUT_RELEASE_VERSION: ${{ inputs.release_version || '' }}
-          INPUT_KEEP_RESOURCES: ${{ inputs.keep_resources || false }}
+          INPUT_RUN_FULL_VALIDATION: ${{ inputs.run_full_validation || false }}
+          INPUT_MOVING_TAGS: ${{ inputs.moving_tags || '' }}
+          INPUT_KEEP_RESOURCES_ON_FAILURE: ${{ inputs.keep_resources_on_failure || false }}
           PRIMARY_SUBSCRIPTION_ID: ${{ inputs.primary_subscription_id || vars.E2E_PRIMARY_SUBSCRIPTION_ID }}
           SECONDARY_SUBSCRIPTION_ID: ${{ inputs.secondary_subscription_id || vars.E2E_SECONDARY_SUBSCRIPTION_ID }}
           MANIFEST_PATH: run-manifest.json
@@ -835,7 +845,7 @@ jobs:
       TOPOLOGY: ss
       PRIMARY_SUBSCRIPTION_ID: ${{ inputs.primary_subscription_id || vars.E2E_PRIMARY_SUBSCRIPTION_ID }}
       RELEASE_REQUESTED: ${{ needs.meta.outputs.release_requested }}
-      KEEP_RESOURCES: ${{ inputs.keep_resources || false }}
+      KEEP_RESOURCES: ${{ needs.meta.outputs.keep_resources_on_failure == 'true' && (needs.provision.result == 'failure' || needs.validate_multicluster.result == 'failure' || needs.validate_tt.result == 'failure') && 'true' || 'false' }}
     steps:
       - uses: actions/checkout@v4
 
@@ -1297,7 +1307,7 @@ jobs:
   # not-found. Debug retention is forbidden for release runs (RD-007).
   cleanup_xs:
     name: Cleanup (xs, always)
-    needs: [meta, provision_xs_primary, provision_xs_secondary, rbac_xs, deploy_xs, validate_cross_subscription, diagnostics_xs]
+    needs: [meta, preflight_xs, provision_xs_primary, provision_xs_secondary, rbac_xs, deploy_xs, validate_cross_subscription, diagnostics_xs]
     if: ${{ always() && github.event_name != 'pull_request' && contains(needs.meta.outputs.validation_topologies, 'xs') }}
     runs-on: ubuntu-latest
     timeout-minutes: 45
@@ -1310,7 +1320,7 @@ jobs:
       PRIMARY_SUBSCRIPTION_ID: ${{ inputs.primary_subscription_id || vars.E2E_PRIMARY_SUBSCRIPTION_ID }}
       SECONDARY_SUBSCRIPTION_ID: ${{ inputs.secondary_subscription_id || vars.E2E_SECONDARY_SUBSCRIPTION_ID }}
       RELEASE_REQUESTED: ${{ needs.meta.outputs.release_requested }}
-      KEEP_RESOURCES: ${{ inputs.keep_resources || false }}
+      KEEP_RESOURCES: ${{ needs.meta.outputs.keep_resources_on_failure == 'true' && (needs.preflight_xs.result == 'failure' || needs.provision_xs_primary.result == 'failure' || needs.provision_xs_secondary.result == 'failure' || needs.validate_cross_subscription.result == 'failure') && 'true' || 'false' }}
     steps:
       - uses: actions/checkout@v4
 
@@ -1401,7 +1411,7 @@ jobs:
       STAGING_ACR: ${{ vars.E2E_STAGING_ACR }}
       RELEASE_VERSION: ${{ needs.meta.outputs.release_version }}
       RELEASE_TRANSACTION_TAG: _release-${{ github.run_id }}-${{ github.run_attempt }}
-      MOVING_TAGS: ${{ vars.E2E_RELEASE_MOVING_TAGS }}
+      MOVING_TAGS: ${{ needs.meta.outputs.moving_tags }}
       MANIFEST_PATH: run-manifest.json
       CONTROLLER_SBOM_PATH: sbom/controller/controller.spdx.json
       CNI_SBOM_PATH: sbom/cni/cni.spdx.json
@@ -1486,6 +1496,61 @@ jobs:
           path: run-manifest.json
           retention-days: 30
 
+  artifact_cleanup:
+    name: Delete staging candidates and pull tokens (always)
+    needs: [meta, build, build_cni, cleanup_ss, cleanup_xs, release]
+    if: ${{ always() && github.event_name != 'pull_request' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    environment: azure-e2e
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      STAGING_ACR: ${{ vars.E2E_STAGING_ACR }}
+      STAGING_ACR_SUBSCRIPTION_ID: ${{ inputs.primary_subscription_id || vars.E2E_PRIMARY_SUBSCRIPTION_ID }}
+      CONTROLLER_STAGING_REPO: ${{ needs.meta.outputs.controller_staging_repo }}
+      CONTROLLER_STAGING_TAG: ${{ needs.meta.outputs.controller_staging_tag }}
+      CNI_STAGING_REPO: ${{ needs.meta.outputs.cni_staging_repo }}
+      CNI_STAGING_TAG: ${{ needs.meta.outputs.cni_staging_tag }}
+      VALIDATION_TOPOLOGIES: ${{ needs.meta.outputs.validation_topologies }}
+      REGIONS: ${{ needs.meta.outputs.regions }}
+      MANIFEST_PATH: run-manifest.json
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download run-manifest foundation
+        if: ${{ needs.meta.result == 'success' }}
+        uses: actions/download-artifact@v4
+        with:
+          name: run-manifest
+          path: .
+
+      - name: Azure Login to staging registry context (OIDC)
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ env.STAGING_ACR_SUBSCRIPTION_ID }}
+
+      - name: Delete and verify per-run candidate tags and ACR tokens
+        env:
+          REPO: ${{ github.repository }}
+          RUN_ID: ${{ github.run_id }}
+          RUN_ATTEMPT: ${{ github.run_attempt }}
+          DATE_UTC: ${{ needs.meta.outputs.date_utc }}
+          GIT_SHA: ${{ github.sha }}
+          GIT_REF: ${{ github.ref }}
+        run: bash scripts/e2e/cleanup-artifacts.sh cleanup
+
+      - name: Upload artifact cleanup manifest
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: run-manifest-cleanup-artifacts
+          path: run-manifest.json
+          retention-days: 30
+
   naming-tests:
     name: Lint, unit, integration, and E2E script tests
     runs-on: ubuntu-latest
@@ -1528,6 +1593,7 @@ jobs:
           bash scripts/e2e/naming_test/setup_cross_sub_rbac_test.sh
           bash scripts/e2e/naming_test/run_cross_sub_validation_test.sh
           bash scripts/e2e/naming_test/teardown_test.sh
+          bash scripts/e2e/naming_test/artifact_cleanup_test.sh
           bash scripts/e2e/naming_test/collect_diagnostics_test.sh
           bash scripts/e2e/naming_test/workflow_epic010_test.sh
           bash scripts/e2e/naming_test/workflow_epic005_test.sh
@@ -1535,6 +1601,7 @@ jobs:
           bash scripts/e2e/naming_test/finalize_manifest_test.sh
           bash scripts/e2e/naming_test/workflow_epic007_test.sh
           bash scripts/e2e/naming_test/workflow_epic008_test.sh
+          bash scripts/e2e/naming_test/workflow_final_review_test.sh
 
       - name: Verify naming self-check
         run: bash scripts/e2e/naming.sh self-check
@@ -1545,7 +1612,7 @@ jobs:
   # step summary, while the validation/release jobs retain their own failures.
   summary:
     name: Finalize auditable run manifest (always)
-    needs: [meta, build, build_cni, build_pr, build_cni_pr, naming-tests, cleanup_ss, cleanup_xs, release]
+    needs: [meta, build, build_cni, build_pr, build_cni_pr, naming-tests, cleanup_ss, cleanup_xs, release, artifact_cleanup]
     if: ${{ always() }}
     runs-on: ubuntu-latest
     timeout-minutes: 10

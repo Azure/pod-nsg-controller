@@ -10,9 +10,9 @@
 #
 # The candidate CNI is pulled BY DIGEST from staging (OIDC) to the runner, its
 # binary checksum is verified against the recorded pin (NFR-010), and the exact
-# bytes are shipped inside the run-command payload (base64) - never fetched on
-# the node from a URL/credential (SEC-006/RD-016). Each worker re-verifies the
-# checksum before swapping, so tampered transit fails closed.
+# bytes are shipped in bounded, ordered Run Command chunks - never fetched on
+# the node from a URL/credential (SEC-006/RD-016). Each worker reassembles into
+# a private staging file and re-verifies size and checksum before swapping.
 #
 # Inputs (environment):
 #   TOPOLOGY                 ss|xs (TT runs on the centraluseuap cluster)   [req]
@@ -26,6 +26,8 @@
 #   TT_CNI_BIN_DIR (/opt/cni/bin) TT_CNI_CONF_DIR (/etc/cni/net.d)
 #   TT_ACTIVE_CONFLIST (10-azure.conflist) TT_BACKUP_ROOT (/opt/cni)
 #   TT_KUBELET_RESTART ("systemctl restart kubelet")   node-path/command seams
+#   TT_RUN_COMMAND_MAX_BYTES (60000) TT_CHUNK_RAW_BYTES (32768)
+#   TT_TRANSFER_ROOT (/var/lib/pnc-e2e-cni/<run-suffix>)
 #   AZ_BIN ORAS_BIN          tool seams (default az/oras)
 #
 # Commands: all(default) | workers | pull | render-node | names | help
@@ -65,6 +67,10 @@ TT_CNI_CONF_DIR="${TT_CNI_CONF_DIR:-/etc/cni/net.d}"
 TT_ACTIVE_CONFLIST="${TT_ACTIVE_CONFLIST:-10-azure.conflist}"
 TT_BACKUP_ROOT="${TT_BACKUP_ROOT:-/opt/cni}"
 TT_KUBELET_RESTART="${TT_KUBELET_RESTART:-systemctl restart kubelet}"
+TT_RUN_COMMAND_MAX_BYTES="${TT_RUN_COMMAND_MAX_BYTES:-60000}"
+TT_CHUNK_RAW_BYTES="${TT_CHUNK_RAW_BYTES:-32768}"
+TT_AZRUN_WRAPPER_RESERVE_BYTES="${TT_AZRUN_WRAPPER_RESERVE_BYTES:-1024}"
+TT_TRANSFER_ROOT="${TT_TRANSFER_ROOT:-}"
 
 CNI_BINARY_NAME="azure-vnet"
 CNI_CONFLIST_NAME="azure-linux-transparent-tunnel.conflist"
@@ -102,6 +108,14 @@ tt::_derive() {
     [[ -n "$CNI_BINARY_SHA256" ]] || CNI_BINARY_SHA256="$(manifest::get "$MANIFEST_PATH" '.artifacts.cni.binary_sha256 // empty')"
   fi
   TT_WORKERS=( "${N[worker1_vm]}" "${N[worker2_vm]}" "${N[worker3_vm]}" )
+  : "${TT_TRANSFER_ROOT:=/var/lib/pnc-e2e-cni/${RUN_SUFFIX}}"
+  if ! [[ "$TT_RUN_COMMAND_MAX_BYTES" =~ ^[0-9]+$ ]] \
+    || (( TT_RUN_COMMAND_MAX_BYTES < 4096 || TT_RUN_COMMAND_MAX_BYTES > 240000 )); then
+    log::die "TT_RUN_COMMAND_MAX_BYTES must be between 4096 and 240000"
+  fi
+  if ! [[ "$TT_CHUNK_RAW_BYTES" =~ ^[0-9]+$ ]] || (( TT_CHUNK_RAW_BYTES <= 0 )); then
+    log::die "TT_CHUNK_RAW_BYTES must be a positive integer"
+  fi
   TT_DERIVED=1
 }
 
@@ -141,22 +155,87 @@ tt::_pull() {
   fi
   grep -q '"mode":[[:space:]]*"transparent-tunnel"' "${PULLDIR}/${CNI_CONFLIST_NAME}" \
     || log::die "pulled conflist does not declare \"mode\": \"transparent-tunnel\""
-  # The exact bytes are shipped inline in the run-command payload (SEC-006/RD-016).
-  # `az vm run-command invoke --scripts` has a payload ceiling (~256KB); a large
-  # azure-vnet binary may exceed it and require chunked transfer or a runtime-
-  # scoped read-only SAS pull. Surface this at runtime rather than failing late.
-  local _bin_sz; _bin_sz="$(wc -c < "${PULLDIR}/${CNI_BINARY_NAME}")"
-  if (( _bin_sz > 262144 )); then
-    log::warn "azure-vnet is ${_bin_sz} bytes; inline az vm run-command distribution has a ~256KB payload limit - chunked transfer may be required for a production-sized binary"
-  fi
+  NODE_SIZE="$(wc -c < "${PULLDIR}/${CNI_BINARY_NAME}" | tr -d ' ')"
   NODE_SHA="$CNI_BINARY_SHA256"
   TT_PULLED=1
 }
 
+# ---- bounded, ordered per-worker transfer -----------------------------------
+tt::_exec_bounded() {
+  local vm="$1" script="$2" bytes
+  bytes="$(printf '%s' "$script" | wc -c | tr -d ' ')"
+  if (( bytes + TT_AZRUN_WRAPPER_RESERVE_BYTES > TT_RUN_COMMAND_MAX_BYTES )); then
+    log::error "refusing Run Command payload for ${vm}: ${bytes}+${TT_AZRUN_WRAPPER_RESERVE_BYTES} exceeds safe limit ${TT_RUN_COMMAND_MAX_BYTES}"
+    return 1
+  fi
+  azrun::exec "$AZ_BIN" "$CLUSTER_SUB" "${N[resource_group]}" "$vm" "$script"
+}
+
+tt::_transfer_init_script() {
+  cat <<NODE
+set -euo pipefail
+TRANSFER_ROOT='${TT_TRANSFER_ROOT}'
+rm -rf "\$TRANSFER_ROOT"
+install -d -m 0700 "\$TRANSFER_ROOT"
+: > "\$TRANSFER_ROOT/${CNI_BINARY_NAME}.part"
+chmod 0600 "\$TRANSFER_ROOT/${CNI_BINARY_NAME}.part"
+NODE
+}
+
+tt::_chunk_script() {
+  local index="$1" offset="$2" chunk_len="$3" chunk_sha="$4" chunk_b64="$5"
+  local new_size=$(( offset + chunk_len ))
+  cat <<NODE
+set -euo pipefail
+TRANSFER_FILE='${TT_TRANSFER_ROOT}/${CNI_BINARY_NAME}.part'
+CHUNK_INDEX='${index}'
+EXPECTED_OFFSET='${offset}'
+CHUNK_LENGTH='${chunk_len}'
+EXPECTED_SIZE='${new_size}'
+CHUNK_SHA='${chunk_sha}'
+[ -f "\$TRANSFER_FILE" ] || { echo "ERROR: transfer file absent for chunk \$CHUNK_INDEX"; exit 1; }
+ACTUAL_SIZE="\$(wc -c < "\$TRANSFER_FILE" | tr -d ' ')"
+if [ "\$ACTUAL_SIZE" = "\$EXPECTED_SIZE" ]; then
+  ACTUAL_CHUNK_SHA="\$(tail -c "\$CHUNK_LENGTH" "\$TRANSFER_FILE" | sha256sum | cut -c1-64)"
+  [ "\$ACTUAL_CHUNK_SHA" = "\$CHUNK_SHA" ] || { echo "ERROR: retried chunk \$CHUNK_INDEX differs"; exit 1; }
+  exit 0
+fi
+[ "\$ACTUAL_SIZE" = "\$EXPECTED_OFFSET" ] || { echo "ERROR: out-of-order chunk \$CHUNK_INDEX (offset \$ACTUAL_SIZE != \$EXPECTED_OFFSET)"; exit 1; }
+printf '%s' '${chunk_b64}' | base64 -d >> "\$TRANSFER_FILE"
+ACTUAL_SIZE="\$(wc -c < "\$TRANSFER_FILE" | tr -d ' ')"
+[ "\$ACTUAL_SIZE" = "\$EXPECTED_SIZE" ] || { echo "ERROR: chunk \$CHUNK_INDEX length mismatch"; exit 1; }
+ACTUAL_CHUNK_SHA="\$(tail -c "\$CHUNK_LENGTH" "\$TRANSFER_FILE" | sha256sum | cut -c1-64)"
+[ "\$ACTUAL_CHUNK_SHA" = "\$CHUNK_SHA" ] || { echo "ERROR: chunk \$CHUNK_INDEX checksum mismatch"; exit 1; }
+NODE
+}
+
+tt::_transfer_worker() {
+  local vm="$1" source="${PULLDIR}/${CNI_BINARY_NAME}"
+  local index=0 offset=0 chunk_file="${PULLDIR}/.${CNI_BINARY_NAME}.chunk"
+  local chunk_len chunk_sha chunk_b64 script
+
+  tt::_exec_bounded "$vm" "$(tt::_transfer_init_script)" || return 1
+  while (( offset < NODE_SIZE )); do
+    dd if="$source" of="$chunk_file" bs="$TT_CHUNK_RAW_BYTES" skip="$index" count=1 status=none
+    chunk_len="$(wc -c < "$chunk_file" | tr -d ' ')"
+    (( chunk_len > 0 )) || { rm -f "$chunk_file"; log::error "empty transfer chunk ${index}"; return 1; }
+    chunk_sha="$(sha256sum "$chunk_file" | cut -c1-64)"
+    chunk_b64="$(base64 -w0 "$chunk_file")"
+    script="$(tt::_chunk_script "$index" "$offset" "$chunk_len" "$chunk_sha" "$chunk_b64")"
+    if ! tt::_exec_bounded "$vm" "$script"; then
+      rm -f "$chunk_file"
+      return 1
+    fi
+    offset=$(( offset + chunk_len ))
+    index=$(( index + 1 ))
+  done
+  rm -f "$chunk_file"
+  tt::_exec_bounded "$vm" "$(tt::_node_script)"
+}
+
 # ---- per-worker node install script (raw; azrun wraps it for exec) -----------
 tt::_node_script() {
-  local bin_b64 conf_b64
-  bin_b64="$(base64 -w0 "${PULLDIR}/${CNI_BINARY_NAME}")"
+  local conf_b64
   conf_b64="$(base64 -w0 "${PULLDIR}/${CNI_CONFLIST_NAME}")"
   cat <<NODE
 set -euo pipefail
@@ -165,7 +244,24 @@ CONF_DIR='${TT_CNI_CONF_DIR}'
 ACTIVE_CONFLIST='${TT_ACTIVE_CONFLIST}'
 BACKUP_ROOT='${TT_BACKUP_ROOT}'
 RECORDED_SHA='${NODE_SHA}'
+RECORDED_SIZE='${NODE_SIZE}'
+TRANSFER_ROOT='${TT_TRANSFER_ROOT}'
+TRANSFER_FILE="\${TRANSFER_ROOT}/${CNI_BINARY_NAME}.part"
+cleanup_transfer() { rm -rf "\$TRANSFER_ROOT"; }
+trap cleanup_transfer EXIT
 mkdir -p "\$BIN_DIR" "\$CONF_DIR"
+if [ ! -f "\$TRANSFER_FILE" ]; then
+  INSTALLED_SHA="\$(sha256sum "\${BIN_DIR}/azure-vnet" 2>/dev/null | cut -c1-64 || true)"
+  grep -q '"mode":[[:space:]]*"transparent-tunnel"' "\${CONF_DIR}/\${ACTIVE_CONFLIST}" 2>/dev/null \
+    && [ "\$INSTALLED_SHA" = "\$RECORDED_SHA" ] \
+    && { echo "TT_INSTALL_OK already-installed"; exit 0; }
+  echo "ERROR: reassembled transfer file is absent"
+  exit 1
+fi
+ACTUAL_SIZE="\$(wc -c < "\$TRANSFER_FILE" | tr -d ' ')"
+[ "\$ACTUAL_SIZE" = "\$RECORDED_SIZE" ] || { echo "ERROR: reassembled azure-vnet size mismatch (\$ACTUAL_SIZE != \$RECORDED_SIZE)"; exit 1; }
+ACTUAL="\$(sha256sum "\$TRANSFER_FILE" | cut -c1-64)"
+[ "\$ACTUAL" = "\$RECORDED_SHA" ] || { echo "ERROR: reassembled azure-vnet checksum mismatch (\$ACTUAL != \$RECORDED_SHA)"; exit 1; }
 TS="\$(date -u +%Y%m%d-%H%M%S)"
 BK="\${BACKUP_ROOT}/tt-backup-\${TS}"
 mkdir -p "\$BK"
@@ -174,8 +270,8 @@ cp -a "\${BIN_DIR}/azure-vnet" "\$BK"/ 2>/dev/null || true
 cp -a "\${CONF_DIR}"/*.conflist "\$BK"/ 2>/dev/null || true
 [ -d "\$BK" ] || { echo "ERROR: backup dir \$BK not created"; exit 1; }
 echo "backup at \$BK"
-# 2) Install the exact digest-verified azure-vnet bytes shipped in this payload.
-printf '%s' '${bin_b64}' | base64 -d > "\${BIN_DIR}/azure-vnet.new"
+# 2) Install the exact digest-verified azure-vnet bytes reassembled from chunks.
+cp "\$TRANSFER_FILE" "\${BIN_DIR}/azure-vnet.new"
 ACTUAL="\$(sha256sum "\${BIN_DIR}/azure-vnet.new" | cut -c1-64)"
 [ "\$ACTUAL" = "\$RECORDED_SHA" ] || { echo "ERROR: distributed azure-vnet checksum mismatch (\$ACTUAL != \$RECORDED_SHA)"; rm -f "\${BIN_DIR}/azure-vnet.new"; exit 1; }
 chmod +x "\${BIN_DIR}/azure-vnet.new"
@@ -197,10 +293,9 @@ tt::workers() {
   manifest::put "$MANIFEST_PATH" validate.tt.cni_reference "${CNI_REFERENCE:-<local>}"
   manifest::put "$MANIFEST_PATH" validate.tt.cni_digest "${CNI_DIGEST:-}"
   local vm rc=0 installed=0 script
-  script="$(tt::_node_script)"
   for vm in "${TT_WORKERS[@]}"; do
     log::info "installing transparent-tunnel CNI on worker ${vm} (subscription ${CLUSTER_SUB})"
-    if azrun::exec "$AZ_BIN" "$CLUSTER_SUB" "${N[resource_group]}" "$vm" "$script"; then
+    if tt::_transfer_worker "$vm"; then
       manifest::put_json "$MANIFEST_PATH" "validate.tt.install.${vm}" \
         "$(jq -n --arg s ok '{status:$s}')"
       installed=$(( installed + 1 ))

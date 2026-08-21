@@ -42,6 +42,8 @@ jobs:
     env:
       PRIMARY_SUBSCRIPTION_ID: ${{ vars.E2E_PRIMARY_SUBSCRIPTION_ID }}
       SECONDARY_SUBSCRIPTION_ID: ${{ vars.E2E_SECONDARY_SUBSCRIPTION_ID }}
+      STAGING_ACR: ${{ vars.E2E_STAGING_ACR }}
+      STAGING_ACR_SUBSCRIPTION_ID: ${{ vars.E2E_PRIMARY_SUBSCRIPTION_ID }}
       REAP_MAX_AGE_DAYS: ${{ inputs.max_age_days || '1' }}
     steps:
       - uses: actions/checkout@v4
@@ -64,3 +66,6 @@ jobs:
 
       - name: Reap expired RGs and dangling run assignments in both subscriptions
         run: bash scripts/e2e/teardown.sh reap
+
+      - name: Reap expired staging candidates and pull tokens
+        run: bash scripts/e2e/cleanup-artifacts.sh reap

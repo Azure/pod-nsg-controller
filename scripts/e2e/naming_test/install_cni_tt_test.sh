@@ -48,10 +48,11 @@ B_RG="pnc-e2e-ss-20260820-vahdkc-centraluseuap"
 W1="${B_RG}-worker-01"; W2="${B_RG}-worker-02"; W3="${B_RG}-worker-03"
 CP="${B_RG}-cp-01"
 
-# Pulled CNI artifact bytes (as if oras-pulled by digest to the runner).
+# Pulled CNI artifact bytes (as if oras-pulled by digest to the runner). The
+# binary deliberately exceeds Azure Run Command's one-command payload ceiling.
 ART="${WORK}/artifact"
 mkdir -p "$ART"
-printf 'MOCK-tt-azure-vnet-bytes\n' > "${ART}/azure-vnet"
+dd if=/dev/zero bs=1024 count=300 2>/dev/null | tr '\0' 'x' > "${ART}/azure-vnet"
 cat > "${ART}/azure-linux-transparent-tunnel.conflist" <<'CONF'
 { "cniVersion":"0.3.0","name":"azure",
   "plugins":[ {"type":"azure-vnet","mode":"transparent-tunnel","bridge":"azure0"} ] }
@@ -66,7 +67,23 @@ vm=""; scripts=""; prev=""
 for a in "$@"; do case "$prev" in -n) vm="$a" ;; --scripts) scripts="$a" ;; esac; prev="$a"; done
 case "$1 $2" in
   "vm run-command")
-    [ -n "$vm" ] && printf '%s' "$scripts" > "${MOCK_CAP}/${vm}.script"
+    seq_file="${MOCK_CAP}/${vm}.seq"
+    seq=0; [[ -f "$seq_file" ]] && seq="$(cat "$seq_file")"
+    printf '%s' "$scripts" > "${MOCK_CAP}/${vm}.${seq}.script"
+    printf '%s' "$((seq + 1))" > "$seq_file"
+    printf '%s\n' "$(printf '%s' "$scripts" | wc -c | tr -d ' ')" >> "${MOCK_CAP}/payload-sizes"
+    if [[ -n "${MOCK_EXEC_SCRIPTS:-}" ]]; then
+      if [[ -n "${MOCK_OUT_OF_ORDER:-}" && "$scripts" == *"CHUNK_INDEX='0'"* ]]; then
+        printf '[stdout]\n__AZRUN_OK__\n[stderr]\n'
+        exit 0
+      fi
+      if [[ -n "${MOCK_TAMPER_BEFORE_FINALIZE:-}" && "$scripts" == *"TT_INSTALL_OK"* ]]; then
+        printf 'tamper' >> "${TT_TRANSFER_ROOT}/azure-vnet.part"
+      fi
+      output="$(bash -c "$scripts")"
+      printf '[stdout]\n%s\n[stderr]\n' "$output"
+      exit 0
+    fi
     printf '[stdout]\n__AZRUN_OK__\n[stderr]\n'; exit 0 ;;
   "acr login") exit 0 ;;
   *) exit 0 ;;
@@ -92,6 +109,7 @@ run_install() {
     REPO="Azure/pod-nsg-controller" RUN_ID="10293847561" RUN_ATTEMPT="1" \
     DATE_UTC="20260820" GIT_SHA="8504b2e1c3a9" GIT_REF="refs/heads/test" \
     MANIFEST_PATH="$MANIFEST" CNI_ARTIFACT_DIR="$ART" \
+    TT_TRANSFER_ROOT="${casedir}/transfer" TT_RUN_COMMAND_MAX_BYTES=60000 TT_CHUNK_RAW_BYTES=32768 \
     AZRUN_ATTEMPTS="2" AZRUN_DELAY="0" \
     GITHUB_OUTPUT="$OUT" GITHUB_STEP_SUMMARY="${casedir}/summary.md" \
     "$@" bash "$INSTALL_SH" "$cmd" >"$LOG" 2>"${LOG}.err"
@@ -108,11 +126,11 @@ assert_nonzero "missing PRIMARY_SUBSCRIPTION_ID fails" "$RC"
 echo "== install distributes TT to every worker, EXCLUDES control-plane (TTS-001) =="
 run_install ok all TOPOLOGY=ss PRIMARY_SUBSCRIPTION_ID=sub-primary
 assert_eq "install succeeds" "0" "$RC"
-assert_eq "worker-01 received an install script" "yes" "$([[ -f "${CAP}/${W1}.script" ]] && echo yes || echo no)"
-assert_eq "worker-02 received an install script" "yes" "$([[ -f "${CAP}/${W2}.script" ]] && echo yes || echo no)"
-assert_eq "worker-03 received an install script" "yes" "$([[ -f "${CAP}/${W3}.script" ]] && echo yes || echo no)"
+assert_eq "worker-01 received transfer/install scripts" "yes" "$([[ -f "${CAP}/${W1}.seq" ]] && echo yes || echo no)"
+assert_eq "worker-02 received transfer/install scripts" "yes" "$([[ -f "${CAP}/${W2}.seq" ]] && echo yes || echo no)"
+assert_eq "worker-03 received transfer/install scripts" "yes" "$([[ -f "${CAP}/${W3}.seq" ]] && echo yes || echo no)"
 assert_eq "control-plane node is NOT touched (stays stock CNI, TTS-001)" "no" \
-  "$([[ -f "${CAP}/${CP}.script" ]] && echo yes || echo no)"
+  "$([[ -f "${CAP}/${CP}.seq" ]] && echo yes || echo no)"
 assert_match "every run-command carries an explicit --subscription (RD-020)" \
   'run-command .*--subscription sub-primary' "$(grep 'run-command' "$AZLOG" | tr '\n' '|')"
 assert_eq "install recorded per-worker in manifest" "ok" \
@@ -121,7 +139,7 @@ assert_eq "output reports 3 workers installed" "3" "$(out_val installed_workers)
 assert_eq "output reports the excluded control-plane node" "$CP" "$(out_val control_plane_excluded)"
 
 echo "== the worker payload ships exact bytes, checksum, mode, backup, kubelet restart =="
-S="$(cat "${CAP}/${W1}.script")"
+S="$(cat "${CAP}/${W1}".*.script)"
 assert_match "payload backs up existing CNI to /opt/cni/tt-backup-<ts>" 'tt-backup-' "$S"
 assert_match "payload decodes base64 bytes on the node (no node-side curl)" 'base64 -d' "$S"
 assert_nomatch "payload does NOT fetch from any URL (SEC-006)" 'curl|https?://' "$S"
@@ -130,13 +148,42 @@ assert_match "payload asserts conflist mode transparent-tunnel (FR-020)" 'transp
 assert_match "payload restarts kubelet" 'systemctl restart kubelet' "$S"
 assert_match "payload installs the azure-vnet binary" 'azure-vnet' "$S"
 assert_match "payload targets the real /opt/cni/bin path" '/opt/cni/bin' "$S"
+assert_match "chunks carry explicit ordering metadata" "CHUNK_INDEX='[0-9]+'" "$S"
+assert_match "chunks enforce exact byte offsets" 'EXPECTED_OFFSET=' "$S"
+assert_eq "production-sized artifact requires multiple bounded chunk commands" "yes" \
+  "$(if (( $(cat "${CAP}/${W1}.seq") > 3 )); then echo yes; else echo no; fi)"
+assert_eq "no Run Command payload exceeds the configured safe limit" "0" \
+  "$(awk '$1 > 60000 {bad++} END {print bad+0}' "${CAP}/payload-sizes")"
 
 echo "== runner refuses to distribute when pulled bytes != recorded checksum (NFR-010) =="
 SEED_SHA="0000000000000000000000000000000000000000000000000000000000000000" \
   run_install badsum all TOPOLOGY=ss PRIMARY_SUBSCRIPTION_ID=sub-primary
 assert_nonzero "checksum mismatch between pulled bytes and manifest fails fast" "$RC"
 assert_eq "no worker was touched on a checksum failure" "no" \
-  "$([[ -f "${CAP}/${W1}.script" ]] && echo yes || echo no)"
+  "$([[ -f "${CAP}/${W1}.seq" ]] && echo yes || echo no)"
+
+echo "== ordered reassembly and checksum failure are fail-closed =="
+run_install reassemble all TOPOLOGY=ss PRIMARY_SUBSCRIPTION_ID=sub-primary \
+  MOCK_EXEC_SCRIPTS=1 TT_CNI_BIN_DIR="${WORK}/reassemble/bin" \
+  TT_CNI_CONF_DIR="${WORK}/reassemble/conf" TT_BACKUP_ROOT="${WORK}/reassemble/backup" \
+  TT_KUBELET_RESTART=:
+assert_eq "multi-command chunks reassemble and install successfully" "0" "$RC"
+assert_eq "reassembled installed bytes match the production-sized artifact" "$BIN_SHA" \
+  "$(sha256sum "${WORK}/reassemble/bin/azure-vnet" | cut -c1-64)"
+
+run_install out_of_order all TOPOLOGY=ss PRIMARY_SUBSCRIPTION_ID=sub-primary \
+  MOCK_EXEC_SCRIPTS=1 MOCK_OUT_OF_ORDER=1 TT_CNI_BIN_DIR="${WORK}/ooo/bin" \
+  TT_CNI_CONF_DIR="${WORK}/ooo/conf" TT_BACKUP_ROOT="${WORK}/ooo/backup" TT_KUBELET_RESTART=:
+assert_nonzero "a missing/out-of-order first chunk fails closed" "$RC"
+assert_eq "out-of-order transfer never installs azure-vnet" "no" \
+  "$([[ -e "${WORK}/ooo/bin/azure-vnet" ]] && echo yes || echo no)"
+
+run_install tampered_transfer all TOPOLOGY=ss PRIMARY_SUBSCRIPTION_ID=sub-primary \
+  MOCK_EXEC_SCRIPTS=1 MOCK_TAMPER_BEFORE_FINALIZE=1 TT_CNI_BIN_DIR="${WORK}/tamper/bin" \
+  TT_CNI_CONF_DIR="${WORK}/tamper/conf" TT_BACKUP_ROOT="${WORK}/tamper/backup" TT_KUBELET_RESTART=:
+assert_nonzero "tampered reassembled bytes fail checksum verification" "$RC"
+assert_eq "checksum failure never installs azure-vnet" "no" \
+  "$([[ -e "${WORK}/tamper/bin/azure-vnet" ]] && echo yes || echo no)"
 
 echo "== rendered node script actually installs when executed in a sandbox fake-node =="
 SANDBOX="${WORK}/node"
@@ -150,6 +197,8 @@ run_install render render-node TOPOLOGY=ss PRIMARY_SUBSCRIPTION_ID=sub-primary \
   TT_BACKUP_ROOT="${SANDBOX}/opt/cni" TT_KUBELET_RESTART=":"
 assert_eq "render-node succeeds" "0" "$RC"
 # The node script is printed to LOG; execute it in the sandbox.
+mkdir -p "$(dirname "${WORK}/render/transfer/azure-vnet.part")"
+cp "${ART}/azure-vnet" "${WORK}/render/transfer/azure-vnet.part"
 bash "$LOG" >"${WORK}/node_run.out" 2>&1; NODE_RC=$?
 assert_eq "node install script runs clean in the sandbox" "0" "$NODE_RC"
 assert_eq "installed azure-vnet bytes equal the pulled artifact" \
@@ -168,6 +217,8 @@ printf 'OLD\n' > "${SANDBOX2}/opt/cni/bin/azure-vnet"
 run_install render2 render-node TOPOLOGY=ss PRIMARY_SUBSCRIPTION_ID=sub-primary TT_WORKER_INDEX=1 \
   TT_CNI_BIN_DIR="${SANDBOX2}/opt/cni/bin" TT_CNI_CONF_DIR="${SANDBOX2}/etc/cni/net.d" \
   TT_BACKUP_ROOT="${SANDBOX2}/opt/cni" TT_KUBELET_RESTART=":"
+mkdir -p "$(dirname "${WORK}/render2/transfer/azure-vnet.part")"
+cp "${ART}/azure-vnet" "${WORK}/render2/transfer/azure-vnet.part"
 # Corrupt the recorded sha embedded in the script to simulate tampered transit.
 sed 's/'"$BIN_SHA"'/deadbeef/' "$LOG" > "${WORK}/tampered.sh"
 bash "${WORK}/tampered.sh" >/dev/null 2>&1; TRC=$?

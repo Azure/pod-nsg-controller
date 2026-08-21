@@ -11,7 +11,8 @@
 #   REPO RUN_ID RUN_ATTEMPT GIT_SHA GIT_REF                (naming context)
 #   INPUT_TOPOLOGIES  (default "ss,xs")   INPUT_REGIONS (default canary pair)
 #   INPUT_RELEASE (true|false)            INPUT_RELEASE_VERSION
-#   INPUT_KEEP_RESOURCES (true|false)
+#   INPUT_RUN_FULL_VALIDATION (true|false) INPUT_MOVING_TAGS
+#   INPUT_KEEP_RESOURCES_ON_FAILURE (true|false)
 #   PRIMARY_SUBSCRIPTION_ID  SECONDARY_SUBSCRIPTION_ID
 #   EVENT_NAME REF_TYPE REF_NAME          (release-trigger detection)
 #   MANIFEST_PATH     (default ./run-manifest.json)
@@ -34,7 +35,9 @@ INPUT_TOPOLOGIES="${INPUT_TOPOLOGIES:-ss,xs}"
 INPUT_REGIONS="${INPUT_REGIONS:-eastus2euap,centraluseuap}"
 INPUT_RELEASE="${INPUT_RELEASE:-false}"
 INPUT_RELEASE_VERSION="${INPUT_RELEASE_VERSION:-}"
-INPUT_KEEP_RESOURCES="${INPUT_KEEP_RESOURCES:-false}"
+INPUT_RUN_FULL_VALIDATION="${INPUT_RUN_FULL_VALIDATION:-false}"
+INPUT_MOVING_TAGS="${INPUT_MOVING_TAGS:-}"
+INPUT_KEEP_RESOURCES_ON_FAILURE="${INPUT_KEEP_RESOURCES_ON_FAILURE:-${INPUT_KEEP_RESOURCES:-false}}"
 PRIMARY_SUBSCRIPTION_ID="${PRIMARY_SUBSCRIPTION_ID:-}"
 SECONDARY_SUBSCRIPTION_ID="${SECONDARY_SUBSCRIPTION_ID:-}"
 EVENT_NAME="${EVENT_NAME:-${GITHUB_EVENT_NAME:-}}"
@@ -44,6 +47,12 @@ MANIFEST_PATH="${MANIFEST_PATH:-run-manifest.json}"
 
 # Capture DATE_UTC once and propagate it (stable across midnight, NFR-006).
 export DATE_UTC="${DATE_UTC:-$(date -u +%Y%m%d)}"
+
+for input_name in INPUT_RELEASE INPUT_RUN_FULL_VALIDATION INPUT_KEEP_RESOURCES_ON_FAILURE; do
+  input_value="${!input_name}"
+  [[ "$input_value" == "true" || "$input_value" == "false" ]] \
+    || log::die "${input_name} must be true or false (got '${input_value}')"
+done
 
 # ---- parse + validate validation_topologies (CON-009) -----------------------
 has_ss=false; has_xs=false
@@ -93,20 +102,41 @@ if [[ -z "$INPUT_RELEASE_VERSION" && "$REF_TYPE" == "tag" && "$REF_NAME" == v* ]
 fi
 
 # ---- release gating (CON-009 / FR-008 / FR-012) -----------------------------
-if [[ "$release_requested" == "true" ]]; then
+if [[ "$release_requested" == "true" || "$INPUT_RUN_FULL_VALIDATION" == "true" ]]; then
   has_ss=true
   has_xs=true
   effective_topos=("ss" "xs")
+fi
+if [[ "$release_requested" == "true" ]]; then
   if [[ -z "$INPUT_RELEASE_VERSION" ]]; then
     log::die "release requires a release_version (semver, e.g. v1.2.3)"
   fi
-  [[ "$INPUT_KEEP_RESOURCES" != "true" ]] \
-    || log::die "release forbids keep_resources=true (cleanup is a mandatory release gate)"
+  [[ "$INPUT_KEEP_RESOURCES_ON_FAILURE" != "true" ]] \
+    || log::die "release forbids keep_resources_on_failure=true (cleanup is a mandatory release gate)"
 fi
 if [[ -n "$INPUT_RELEASE_VERSION" ]] \
    && ! [[ "$INPUT_RELEASE_VERSION" =~ ^v?[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]; then
   log::die "invalid release_version '${INPUT_RELEASE_VERSION}' (want semver, e.g. v1.2.3)"
 fi
+
+moving_tags=()
+if [[ -n "$INPUT_MOVING_TAGS" ]]; then
+  [[ "$release_requested" == "true" ]] \
+    || log::die "moving_tags may be set only for a release run"
+  version="${INPUT_RELEASE_VERSION#v}"
+  IFS=. read -r major minor _ <<<"$version"
+  allowed_tags=",latest,v${major},v${major}.${minor},"
+  IFS=',' read -ra raw_moving_tags <<<"$INPUT_MOVING_TAGS"
+  for tag in "${raw_moving_tags[@]}"; do
+    tag="$(printf '%s' "$tag" | tr -d '[:space:]')"
+    [[ -n "$tag" && "$allowed_tags" == *",$tag,"* ]] \
+      || log::die "moving tag '${tag}' is not allowed; choose from latest,v${major},v${major}.${minor}"
+    [[ " ${moving_tags[*]} " != *" ${tag} "* ]] \
+      || log::die "moving_tags contains duplicate '${tag}'"
+    moving_tags+=("$tag")
+  done
+fi
+moving_tags_csv="$(IFS=,; printf '%s' "${moving_tags[*]}")"
 
 # ---- cross-subscription ID checks (FR-025) ----------------------------------
 if $has_xs; then
@@ -138,7 +168,11 @@ manifest::put_json "$MANIFEST_PATH" run.validation_topologies "$topos_json"
 manifest::put_json "$MANIFEST_PATH" run.regions "$regions_json"
 manifest::put_json "$MANIFEST_PATH" release \
   "$(jq -n --argjson req "$release_requested" --arg ver "$INPUT_RELEASE_VERSION" \
-       '{requested: $req, version: $ver}')"
+       --arg tags "$moving_tags_csv" \
+       '{requested: $req, version: $ver,
+         moving_tags: ($tags | split(",") | map(select(length > 0)))}')"
+manifest::put "$MANIFEST_PATH" run.full_validation "$INPUT_RUN_FULL_VALIDATION"
+manifest::put "$MANIFEST_PATH" run.keep_resources_on_failure "$INPUT_KEEP_RESOURCES_ON_FAILURE"
 # Subscription IDs are non-sensitive identifiers (PRD Section 8) recorded as
 # manifest metadata to prove the xs topology uses two distinct subscriptions.
 manifest::put_json "$MANIFEST_PATH" subscriptions \
@@ -160,6 +194,9 @@ gha::output regions "$regions_csv"
 gha::output regions_json "$regions_json"
 gha::output release_requested "$release_requested"
 gha::output release_version "$INPUT_RELEASE_VERSION"
+gha::output run_full_validation "$INPUT_RUN_FULL_VALIDATION"
+gha::output moving_tags "$moving_tags_csv"
+gha::output keep_resources_on_failure "$INPUT_KEEP_RESOURCES_ON_FAILURE"
 gha::output controller_staging_repo "$ctrl_repo"
 gha::output controller_staging_tag "$ctrl_tag"
 gha::output cni_staging_repo "$cni_repo"
@@ -187,6 +224,9 @@ gha::summary "| Validation topologies | ${topos_csv} |"
 gha::summary "| Regions | ${regions_csv} |"
 gha::summary "| Release requested | ${release_requested} |"
 gha::summary "| Release version | ${INPUT_RELEASE_VERSION:-<none>} |"
+gha::summary "| Full validation | ${INPUT_RUN_FULL_VALIDATION} |"
+gha::summary "| Moving tags | ${moving_tags_csv:-<none>} |"
+gha::summary "| Keep resources on upstream failure | ${INPUT_KEEP_RESOURCES_ON_FAILURE} |"
 gha::summary "| Controller candidate | \`${ctrl_repo}:${ctrl_tag}\` |"
 gha::summary "| CNI candidate | \`${cni_repo}:${cni_tag}\` |"
 gha::summary ""

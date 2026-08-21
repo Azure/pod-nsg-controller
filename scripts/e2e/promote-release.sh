@@ -17,6 +17,10 @@ STAGING_ACR="${STAGING_ACR:-}"
 MANIFEST_PATH="${MANIFEST_PATH:-run-manifest.json}"
 CONTROLLER_PUBLIC_REPO="${CONTROLLER_PUBLIC_REPO:-pod-nsg-controller}"
 CNI_PUBLIC_REPO="${CNI_PUBLIC_REPO:-pod-nsg-cni-transparent-tunnel}"
+RELEASE_INDEX_REPO="${RELEASE_INDEX_REPO:-pod-nsg-release-index}"
+RELEASE_INDEX_ARTIFACT_TYPE="${RELEASE_INDEX_ARTIFACT_TYPE:-application/vnd.azure.pod-nsg.release-index.v1+json}"
+RELEASE_INDEX_ATTESTATION_TYPE="${RELEASE_INDEX_ATTESTATION_TYPE:-https://networking.azure.com/attestations/pod-nsg-release-index/v1}"
+RELEASE_INDEX_PATH="${RELEASE_INDEX_PATH:-$(dirname "$MANIFEST_PATH")/release-index.json}"
 CONTROLLER_SBOM_PATH="${CONTROLLER_SBOM_PATH:-sbom/controller.spdx.json}"
 CNI_SBOM_PATH="${CNI_SBOM_PATH:-sbom/cni.spdx.json}"
 MOVING_TAGS="${MOVING_TAGS:-}"
@@ -113,22 +117,52 @@ promote::gate() {
 }
 
 promote::_tag_digest() {
-  local repo="$1" tag="$2"
-  "$AZ_BIN" acr repository show --name "${PUBLIC_ACR%%.*}" \
-    --image "${repo}:${tag}" --query digest -o tsv 2>/dev/null
+  local repo="$1" tag="$2" out rc
+  if out="$("$AZ_BIN" acr repository show --name "${PUBLIC_ACR%%.*}" \
+    --image "${repo}:${tag}" --query digest -o tsv 2>&1)"; then
+    printf '%s\n' "$out"
+    return 0
+  fi
+  rc=$?
+  if grep -Eqi 'manifest.?not.?found|manifest unknown|not found|does not exist' <<<"$out"; then
+    return 1
+  fi
+  log::error "could not verify tag state for ${repo}:${tag}: ${out:-az exited ${rc}}"
+  return 2
 }
 
 promote::_delete_tag() {
-  local repo="$1" tag="$2"
+  local repo="$1" tag="$2" rc
   "$AZ_BIN" acr repository delete --name "${PUBLIC_ACR%%.*}" \
-    --image "${repo}:${tag}" --yes >/dev/null 2>&1 || true
+    --image "${repo}:${tag}" --yes >/dev/null 2>&1 \
+    || log::warn "tag delete returned non-zero for ${repo}:${tag}; verifying absence"
+  if promote::_tag_digest "$repo" "$tag" >/dev/null; then
+    log::error "tag still exists after delete: ${repo}:${tag}"
+    return 1
+  else
+    rc=$?
+  fi
+  (( rc == 1 )) && return 0
+  return "$rc"
 }
 
 promote::_assert_version_absent() {
-  local repo="$1"
+  local repo="$1" rc
   if promote::_tag_digest "$repo" "$RELEASE_VERSION" >/dev/null; then
     log::die "immutable version already exists: ${PUBLIC_ACR}/${repo}:${RELEASE_VERSION}"
+  else
+    rc=$?
   fi
+  (( rc == 1 )) \
+    || log::die "could not prove immutable version absence: ${PUBLIC_ACR}/${repo}:${RELEASE_VERSION}"
+}
+
+promote::_delete_prepared_tags() {
+  local rc=0
+  promote::_delete_tag "$CONTROLLER_PUBLIC_REPO" "$RELEASE_TRANSACTION_TAG" || rc=1
+  promote::_delete_tag "$CNI_PUBLIC_REPO" "$RELEASE_TRANSACTION_TAG" || rc=1
+  promote::_delete_tag "$RELEASE_INDEX_REPO" "$RELEASE_TRANSACTION_TAG" || rc=1
+  return "$rc"
 }
 
 promote::_remote_digest() {
@@ -162,14 +196,24 @@ promote::_login() {
   fi
 }
 
+promote::_prepare_exit() {
+  local rc="$?"
+  if (( rc != 0 )); then
+    log::warn "release preparation failed; removing all transaction tags"
+    promote::_delete_prepared_tags
+  fi
+}
+
 promote::prepare() {
   promote::_require_release_inputs
   promote::gate || log::die "release blocked by validation/cleanup gate"
   promote::_validate_moving_tags
+  trap promote::_prepare_exit EXIT
 
   # Check BOTH immutable tags before the first registry write.
   promote::_assert_version_absent "$CONTROLLER_PUBLIC_REPO"
   promote::_assert_version_absent "$CNI_PUBLIC_REPO"
+  promote::_assert_version_absent "$RELEASE_INDEX_REPO"
   promote::_login
 
   local ctrl_src="${CTRL_REFERENCE:-${STAGING_ACR}/candidate/pod-nsg-controller@${CTRL_DIGEST}}"
@@ -179,6 +223,7 @@ promote::prepare() {
 
   promote::_delete_tag "$CONTROLLER_PUBLIC_REPO" "$RELEASE_TRANSACTION_TAG"
   promote::_delete_tag "$CNI_PUBLIC_REPO" "$RELEASE_TRANSACTION_TAG"
+  promote::_delete_tag "$RELEASE_INDEX_REPO" "$RELEASE_TRANSACTION_TAG"
   lib::retry 3 5 -- "$AZ_BIN" acr import --name "${PUBLIC_ACR%%.*}" \
     --source "$ctrl_src" --image "${CONTROLLER_PUBLIC_REPO}:${RELEASE_TRANSACTION_TAG}" ||
     log::die "controller transaction promotion failed"
@@ -257,8 +302,11 @@ promote::_publish_version() {
 }
 
 promote::_rollback_version() {
-  promote::_delete_tag "$CONTROLLER_PUBLIC_REPO" "$RELEASE_VERSION"
-  promote::_delete_tag "$CNI_PUBLIC_REPO" "$RELEASE_VERSION"
+  local rc=0
+  promote::_delete_tag "$CONTROLLER_PUBLIC_REPO" "$RELEASE_VERSION" || rc=1
+  promote::_delete_tag "$CNI_PUBLIC_REPO" "$RELEASE_VERSION" || rc=1
+  promote::_delete_tag "$RELEASE_INDEX_REPO" "$RELEASE_VERSION" || rc=1
+  return "$rc"
 }
 
 promote::_verify_anonymous_pulls() {
@@ -283,15 +331,25 @@ promote::_post_publish_checks() {
 
 promote::_publish_moving_tags() {
   [[ -z "$MOVING_TAGS" ]] && return 0
-  local tag ctrl_old cni_old i rollback_rc=0
-  local -a touched=() ctrl_previous=() cni_previous=()
+  local tag ctrl_old cni_old rc
+  PROMOTE_MOVING_TOUCHED=()
+  PROMOTE_CTRL_PREVIOUS=()
+  PROMOTE_CNI_PREVIOUS=()
   IFS=, read -ra tags <<<"$MOVING_TAGS"
   for tag in "${tags[@]}"; do
-    ctrl_old="$(promote::_tag_digest "$CONTROLLER_PUBLIC_REPO" "$tag" || true)"
-    cni_old="$(promote::_tag_digest "$CNI_PUBLIC_REPO" "$tag" || true)"
-    touched+=("$tag")
-    ctrl_previous+=("$ctrl_old")
-    cni_previous+=("$cni_old")
+    if ctrl_old="$(promote::_tag_digest "$CONTROLLER_PUBLIC_REPO" "$tag")"; then
+      :
+    else
+      rc=$?; (( rc == 1 )) || return "$rc"; ctrl_old=""
+    fi
+    if cni_old="$(promote::_tag_digest "$CNI_PUBLIC_REPO" "$tag")"; then
+      :
+    else
+      rc=$?; (( rc == 1 )) || return "$rc"; cni_old=""
+    fi
+    PROMOTE_MOVING_TOUCHED+=("$tag")
+    PROMOTE_CTRL_PREVIOUS+=("$ctrl_old")
+    PROMOTE_CNI_PREVIOUS+=("$cni_old")
     if ! "$AZ_BIN" acr import --name "${PUBLIC_ACR%%.*}" \
       --source "${PUBLIC_ACR}/${CONTROLLER_PUBLIC_REPO}@${CTRL_DIGEST}" \
       --image "${CONTROLLER_PUBLIC_REPO}:${tag}" ||
@@ -299,26 +357,106 @@ promote::_publish_moving_tags() {
         "${PUBLIC_ACR}/${CNI_PUBLIC_REPO}:${tag}" ||
       ! promote::_assert_digest "${PUBLIC_ACR}/${CONTROLLER_PUBLIC_REPO}:${tag}" "$CTRL_DIGEST" ||
       ! promote::_assert_digest "${PUBLIC_ACR}/${CNI_PUBLIC_REPO}:${tag}" "$CNI_DIGEST"; then
-      for ((i=${#touched[@]} - 1; i >= 0; i--)); do
-        tag="${touched[i]}"
-        if [[ -n "${ctrl_previous[i]}" ]]; then
-          "$AZ_BIN" acr import --name "${PUBLIC_ACR%%.*}" \
-            --source "${PUBLIC_ACR}/${CONTROLLER_PUBLIC_REPO}@${ctrl_previous[i]}" \
-            --image "${CONTROLLER_PUBLIC_REPO}:${tag}" || rollback_rc=1
-        else
-          promote::_delete_tag "$CONTROLLER_PUBLIC_REPO" "$tag"
-        fi
-        if [[ -n "${cni_previous[i]}" ]]; then
-          "$ORAS_BIN" copy "${PUBLIC_ACR}/${CNI_PUBLIC_REPO}@${cni_previous[i]}" \
-            "${PUBLIC_ACR}/${CNI_PUBLIC_REPO}:${tag}" || rollback_rc=1
-        else
-          promote::_delete_tag "$CNI_PUBLIC_REPO" "$tag"
-        fi
-      done
-      (( rollback_rc == 0 )) || log::error "one or more moving tags could not be restored"
+      promote::_rollback_moving_tags
       return 1
     fi
   done
+}
+
+promote::_rollback_moving_tags() {
+  local i tag rollback_rc=0
+  for ((i=${#PROMOTE_MOVING_TOUCHED[@]} - 1; i >= 0; i--)); do
+    tag="${PROMOTE_MOVING_TOUCHED[i]}"
+    if [[ -n "${PROMOTE_CTRL_PREVIOUS[i]}" ]]; then
+      "$AZ_BIN" acr import --name "${PUBLIC_ACR%%.*}" \
+        --source "${PUBLIC_ACR}/${CONTROLLER_PUBLIC_REPO}@${PROMOTE_CTRL_PREVIOUS[i]}" \
+        --image "${CONTROLLER_PUBLIC_REPO}:${tag}" || rollback_rc=1
+    else
+      promote::_delete_tag "$CONTROLLER_PUBLIC_REPO" "$tag" || rollback_rc=1
+    fi
+    if [[ -n "${PROMOTE_CNI_PREVIOUS[i]}" ]]; then
+      "$ORAS_BIN" copy "${PUBLIC_ACR}/${CNI_PUBLIC_REPO}@${PROMOTE_CNI_PREVIOUS[i]}" \
+        "${PUBLIC_ACR}/${CNI_PUBLIC_REPO}:${tag}" || rollback_rc=1
+    else
+      promote::_delete_tag "$CNI_PUBLIC_REPO" "$tag" || rollback_rc=1
+    fi
+  done
+  PROMOTE_MOVING_TOUCHED=()
+  (( rollback_rc == 0 )) || log::error "one or more moving tags could not be restored"
+  return "$rollback_rc"
+}
+
+promote::_write_release_index() {
+  jq -n \
+    --arg version "$RELEASE_VERSION" \
+    --arg ctrl_repo "${PUBLIC_ACR}/${CONTROLLER_PUBLIC_REPO}" \
+    --arg ctrl_digest "$CTRL_DIGEST" \
+    --arg cni_repo "${PUBLIC_ACR}/${CNI_PUBLIC_REPO}" \
+    --arg cni_digest "$CNI_DIGEST" \
+    '{
+      schemaVersion: 1,
+      version: $version,
+      artifacts: {
+        controller: {repository: $ctrl_repo, digest: $ctrl_digest},
+        cni: {repository: $cni_repo, digest: $cni_digest}
+      }
+    }' >"$RELEASE_INDEX_PATH"
+}
+
+promote::_publish_release_index() {
+  promote::_write_release_index
+  local tx="${PUBLIC_ACR}/${RELEASE_INDEX_REPO}:${RELEASE_TRANSACTION_TAG}"
+  local push_json expected config_dir
+  push_json="$("$ORAS_BIN" push --format json \
+    --artifact-type "$RELEASE_INDEX_ARTIFACT_TYPE" "$tx" \
+    "${RELEASE_INDEX_PATH}:${RELEASE_INDEX_ARTIFACT_TYPE}")" \
+    || log::die "release-index transaction publication failed"
+  expected="$(printf '%s' "$push_json" | jq -r '.manifest.digest // .descriptor.digest // .digest // empty')"
+  [[ "$expected" =~ ^sha256:[0-9a-f]{64}$ ]] \
+    || log::die "release-index push did not return a valid digest"
+  promote::_assert_digest "$tx" "$expected"
+
+  local index_ref="${PUBLIC_ACR}/${RELEASE_INDEX_REPO}@${expected}"
+  "$COSIGN_BIN" sign --yes "$index_ref"
+  "$COSIGN_BIN" attest --yes --predicate "$RELEASE_INDEX_PATH" \
+    --type "$RELEASE_INDEX_ATTESTATION_TYPE" "$index_ref"
+  "$COSIGN_BIN" verify \
+    --certificate-identity-regexp "$COSIGN_CERTIFICATE_IDENTITY_REGEXP" \
+    --certificate-oidc-issuer "$COSIGN_OIDC_ISSUER" "$index_ref" >/dev/null
+  "$COSIGN_BIN" verify-attestation --type "$RELEASE_INDEX_ATTESTATION_TYPE" \
+    --certificate-identity-regexp "$COSIGN_CERTIFICATE_IDENTITY_REGEXP" \
+    --certificate-oidc-issuer "$COSIGN_OIDC_ISSUER" "$index_ref" >/dev/null
+
+  config_dir="${RELEASE_VERIFY_DIR:-$(dirname "$MANIFEST_PATH")/.release-verify-${RELEASE_TRANSACTION_TAG#_}}"
+  mkdir -p "$config_dir"
+  printf '{}\n' >"${config_dir}/oras-config.json"
+  "$ORAS_BIN" manifest fetch --registry-config "${config_dir}/oras-config.json" "$tx" >/dev/null
+
+  "$ORAS_BIN" copy "$index_ref" "${PUBLIC_ACR}/${RELEASE_INDEX_REPO}:${RELEASE_VERSION}"
+  promote::_assert_digest "${PUBLIC_ACR}/${RELEASE_INDEX_REPO}:${RELEASE_VERSION}" "$expected"
+  RELEASE_INDEX_DIGEST="$expected"
+  manifest::put_json "$MANIFEST_PATH" release.index "$(jq -n \
+    --arg d "$expected" --arg v "$RELEASE_VERSION" \
+    --arg r "${PUBLIC_ACR}/${RELEASE_INDEX_REPO}" \
+    --arg cd "$CTRL_DIGEST" --arg cr "${PUBLIC_ACR}/${CONTROLLER_PUBLIC_REPO}" \
+    --arg nd "$CNI_DIGEST" --arg nr "${PUBLIC_ACR}/${CNI_PUBLIC_REPO}" \
+    '{digest:$d,version:$v,repository:$r,
+      controller:{digest:$cd,repository:$cr},
+      cni:{digest:$nd,repository:$nr}}')"
+}
+
+promote::_rollback_precommit() {
+  promote::_rollback_moving_tags || true
+  promote::_rollback_version
+  promote::_delete_prepared_tags
+}
+
+promote::_complete_exit() {
+  local rc="$?"
+  if (( rc != 0 )) && [[ "${PROMOTE_INDEX_COMMITTED:-0}" != "1" ]]; then
+    log::warn "release failed before canonical index commit; removing all prepared tags"
+    promote::_rollback_precommit
+  fi
 }
 
 promote::complete() {
@@ -327,6 +465,12 @@ promote::complete() {
     || log::die "release transaction is not prepared"
   promote::_assert_version_absent "$CONTROLLER_PUBLIC_REPO"
   promote::_assert_version_absent "$CNI_PUBLIC_REPO"
+  promote::_assert_version_absent "$RELEASE_INDEX_REPO"
+  PROMOTE_INDEX_COMMITTED=0
+  PROMOTE_MOVING_TOUCHED=()
+  PROMOTE_CTRL_PREVIOUS=()
+  PROMOTE_CNI_PREVIOUS=()
+  trap promote::_complete_exit EXIT
   promote::_assert_digest "${PUBLIC_ACR}/${CONTROLLER_PUBLIC_REPO}:${RELEASE_TRANSACTION_TAG}" "$CTRL_DIGEST"
   promote::_assert_digest "${PUBLIC_ACR}/${CNI_PUBLIC_REPO}:${RELEASE_TRANSACTION_TAG}" "$CNI_DIGEST"
   promote::_verify_supply_chain
@@ -339,23 +483,26 @@ promote::complete() {
     promote::_rollback_version
     log::die "moving-tag publication failed; both version tags rolled back"
   fi
-  promote::_delete_tag "$CONTROLLER_PUBLIC_REPO" "$RELEASE_TRANSACTION_TAG"
-  promote::_delete_tag "$CNI_PUBLIC_REPO" "$RELEASE_TRANSACTION_TAG"
+  promote::_publish_release_index
+  PROMOTE_INDEX_COMMITTED=1
   manifest::put "$MANIFEST_PATH" release.supply_chain.provenance_verified true
   manifest::put "$MANIFEST_PATH" release.anonymous_pull_verified true
   manifest::put "$MANIFEST_PATH" release.set_atomic true
   manifest::put "$MANIFEST_PATH" release.complete true
   manifest::put_json "$MANIFEST_PATH" release.moving_tags "$(jq -nc \
     --arg tags "$MOVING_TAGS" '$tags | split(",") | map(select(length > 0))')"
+  promote::_delete_prepared_tags
   gha::output release_version "$RELEASE_VERSION"
   gha::output controller_release "${PUBLIC_ACR}/${CONTROLLER_PUBLIC_REPO}:${RELEASE_VERSION}"
   gha::output cni_release "${PUBLIC_ACR}/${CNI_PUBLIC_REPO}:${RELEASE_VERSION}"
+  gha::output release_index "${PUBLIC_ACR}/${RELEASE_INDEX_REPO}:${RELEASE_VERSION}"
+  gha::output release_index_digest "$RELEASE_INDEX_DIGEST"
 }
 
 promote::abort() {
   promote::_require_release_inputs
-  promote::_delete_tag "$CONTROLLER_PUBLIC_REPO" "$RELEASE_TRANSACTION_TAG"
-  promote::_delete_tag "$CNI_PUBLIC_REPO" "$RELEASE_TRANSACTION_TAG"
+  promote::_delete_prepared_tags
+  rm -f "$RELEASE_INDEX_PATH"
 }
 
 promote::names() {
@@ -371,7 +518,7 @@ Usage: promote-release.sh <gate|prepare|secure|complete|abort|names>
   gate      Fail closed unless all configured validation gates and both digests pass.
   prepare   Check immutability, promote both digests to transaction tags, verify bytes.
   secure    Keyless-sign both digests and attach both SBOMs.
-  complete  Verify signatures/SBOM/provenance, publish version/moving tags, verify anonymous pulls.
+  complete  Verify supply chain, prepare version/moving tags, then atomically commit the signed release index.
   abort     Remove transaction tags without touching a completed semantic version.
 USAGE
 }

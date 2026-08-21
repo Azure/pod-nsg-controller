@@ -62,6 +62,16 @@ else
   fail "release should force both topologies (rc=$RC)"
 fi
 
+echo "== run_full_validation forces BOTH topologies without requesting release =="
+run_meta full_xs_only INPUT_TOPOLOGIES="xs" INPUT_RUN_FULL_VALIDATION="true" INPUT_RELEASE="false"
+if (( RC == 0 )) \
+  && [[ "$(jq -c '.run.validation_topologies' "$MANIFEST")" == '["ss","xs"]' ]] \
+  && [[ "$(jq -r '.release.requested' "$MANIFEST")" == "false" ]]; then
+  pass "run_full_validation forces ss,xs and remains non-release"
+else
+  fail "run_full_validation topology forcing is wrong (rc=$RC)"
+fi
+
 echo "== release requires a version (FR-008) =="
 run_meta rel_no_ver INPUT_TOPOLOGIES="ss,xs" INPUT_RELEASE="true"
 if (( RC != 0 )); then pass "release without version fails"; else fail "release w/o version should fail"; fi
@@ -75,6 +85,22 @@ run_meta rel_ok INPUT_TOPOLOGIES="ss,xs" INPUT_RELEASE="true" INPUT_RELEASE_VERS
 if (( RC == 0 )); then pass "release succeeds with full inputs"; else fail "release should succeed (rc=$RC)"; fi
 if [[ "$(jq -r '.release.version' "$MANIFEST" 2>/dev/null)" == "v0.1.0" ]]; then
   pass "manifest records release version"; else fail "release version not recorded"; fi
+
+echo "== moving tags are validated per release version and emitted =="
+run_meta rel_tags INPUT_TOPOLOGIES="ss" INPUT_RELEASE="true" INPUT_RELEASE_VERSION="v1.2.3" \
+  INPUT_MOVING_TAGS="latest,v1,v1.2" PRIMARY_SUBSCRIPTION_ID="aaa" SECONDARY_SUBSCRIPTION_ID="bbb"
+if (( RC == 0 )) && [[ "$(jq -c '.release.moving_tags' "$MANIFEST")" == '["latest","v1","v1.2"]' ]]; then
+  pass "allowed moving tags are recorded"
+else
+  fail "allowed moving tags should succeed (rc=$RC)"
+fi
+if grep -q '^moving_tags=latest,v1,v1.2$' "${WORK}/rel_tags.out"; then
+  pass "moving tags are passed through meta output"; else fail "moving_tags output missing"; fi
+run_meta bad_tag INPUT_RELEASE=true INPUT_RELEASE_VERSION=v1.2.3 INPUT_MOVING_TAGS=stable \
+  PRIMARY_SUBSCRIPTION_ID=aaa SECONDARY_SUBSCRIPTION_ID=bbb
+if (( RC != 0 )); then pass "unsupported moving tag is rejected"; else fail "bad moving tag should fail"; fi
+run_meta tags_without_release INPUT_RELEASE=false INPUT_MOVING_TAGS=latest
+if (( RC != 0 )); then pass "moving tags without release are rejected"; else fail "non-release moving tags should fail"; fi
 
 echo "== xs requires DISTINCT subscription IDs (FR-025) =="
 run_meta xs_equal INPUT_TOPOLOGIES="ss,xs" \
@@ -93,6 +119,8 @@ run_meta bad_topo INPUT_TOPOLOGIES="ss,zz"
 if (( RC != 0 )); then pass "invalid topology token rejected"; else fail "bad topology should fail"; fi
 run_meta bad_ver INPUT_TOPOLOGIES="ss,xs" INPUT_RELEASE="true" INPUT_RELEASE_VERSION="1.2"
 if (( RC != 0 )); then pass "malformed semver rejected"; else fail "bad semver should fail"; fi
+run_meta bad_bool INPUT_RUN_FULL_VALIDATION="yes"
+if (( RC != 0 )); then pass "non-boolean typed input is rejected"; else fail "bad boolean should fail"; fi
 
 echo "== tag push derives release version =="
 run_meta tag_push INPUT_TOPOLOGIES="ss,xs" REF_TYPE="tag" REF_NAME="v1.4.0" \

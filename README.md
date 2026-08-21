@@ -84,28 +84,34 @@ make deploy IMG=<registry>/pod-nsg-controller:<tag>
 ### Pull released artifacts
 
 Operators supply the public registry login server; this repository does not
-hard-code a deployment-specific hostname. A release publishes the controller
-image and transparent-tunnel CNI artifact under the same immutable semantic
-version:
+hard-code a deployment-specific hostname. A completed release has a canonical
+release-index OCI artifact plus the controller image and transparent-tunnel CNI
+artifact under the same immutable semantic version:
 
 ```text
+<public-acr>/pod-nsg-release-index:<semver>
 <public-acr>/pod-nsg-controller:<semver>
 <public-acr>/pod-nsg-cni-transparent-tunnel:<semver>
 ```
 
-Pull the released artifacts anonymously with Docker and ORAS:
+Resolve the release index first, then pull the exact digests it records:
 
 ```bash
 export PUBLIC_ACR="<public-acr>"
 export SEMVER="v1.2.3"
 
+oras pull "${PUBLIC_ACR}/pod-nsg-release-index:${SEMVER}" -o release-index
+jq . release-index/release-index.json
 docker pull "${PUBLIC_ACR}/pod-nsg-controller:${SEMVER}"
 oras pull "${PUBLIC_ACR}/pod-nsg-cni-transparent-tunnel:${SEMVER}"
 ```
 
 The release pipeline promotes validated digests without rebuilding them. Use
-the semantic-version references above for operator consumption and the
-published digest references for immutable deployment pinning.
+the release index as the completion/audit contract: direct semantic tags may be
+prepared during promotion, but the release is complete only when the signed,
+attested index tag exists and records both verified digests. The direct
+controller and CNI repositories remain required operator surfaces; use the
+index's digest references for immutable deployment pinning.
 
 ### Uninstall
 

@@ -239,12 +239,15 @@ Provision two durable registries before enabling the workflow:
 | Registry | Visibility | Repository paths | Required behavior |
 |---|---|---|---|
 | Staging | Private | `candidate/pod-nsg-controller`, `candidate/pod-nsg-cni-transparent-tunnel` | Anonymous pull disabled; candidate tags are temporary; validation consumes digests |
-| Public release | Anonymous pull | `pod-nsg-controller`, `pod-nsg-cni-transparent-tunnel` | Both artifacts share one immutable semantic version; moving tags are optional |
+| Public release | Anonymous pull | `pod-nsg-release-index`, `pod-nsg-controller`, `pod-nsg-cni-transparent-tunnel` | The signed index is the atomic completion marker and records both exact digests/version; direct artifacts share the immutable version |
 
 The release workflow promotes the exact validated controller and CNI digests;
-it never rebuilds either artifact. Public access is enabled only on the public
-registry. Confirm that organizational policy permits anonymous ACR pull before
-enabling releases.
+it never rebuilds either artifact. It prepares and verifies both direct
+semantic tags, handles requested moving tags, then publishes
+`pod-nsg-release-index:<semver>` last. Consumers and audits MUST treat that
+signed, attested index tag—not visibility of either direct tag—as release
+completion. Public access is enabled only on the public registry. Confirm that
+organizational policy permits anonymous ACR pull before enabling releases.
 
 ## 5. Configure GitHub Environments
 
@@ -291,13 +294,25 @@ these variables:
 | `E2E_PRIMARY_SUBSCRIPTION_ID` | Primary subscription ID |
 | `E2E_STAGING_ACR` | Private staging ACR login server |
 | `E2E_PUBLIC_ACR` | Public ACR login server, without scheme |
-| `E2E_RELEASE_MOVING_TAGS` | Optional reviewed list such as `latest,v1,v1.2`; empty publishes only the immutable version |
 
 Set at least one required reviewer who is authorized to publish. Prevent
 self-review when policy requires separation of duties, restrict deployment to
 protected release tags/default branch, and do not add bypass rules for the
 workflow identity. Approval is the final human boundary after all validation
 and verified cleanup gates pass.
+
+Manual releases provide `moving_tags` per dispatch (for example
+`latest,v1,v1.2`); `meta` validates each tag against the requested semantic
+version before any cloud work. `run_full_validation=true` forces both
+topologies without releasing. `keep_resources_on_failure=true` is honored only
+for failed non-release provisioning/validation and is rejected for releases.
+
+The final `artifact_cleanup` job runs after both topology cleanups and every
+release/non-release terminal path. It deletes and verifies both per-run
+candidate tags and all deterministic per-run ACR pull tokens using the explicit
+staging ACR subscription. Its failure fails the workflow without erasing a
+successfully uploaded release manifest. The scheduled reaper also sweeps old
+run-correlated candidate tags and tokens.
 
 ## 6. Validate both subscriptions before the first run
 
@@ -386,6 +401,8 @@ documentation.
   can create run-RG role assignments.
 - Runtime VM grants are `Network Contributor` on the primary run RG only.
 - Staging is private; public ACR anonymous pull is organizationally approved.
+- The public release index repository is writable/signable and anonymously
+  readable alongside both direct artifact repositories.
 - `azure-e2e` and `public-release` have the documented reviewers, branch/tag
   restrictions, secrets, and variables.
 - Provider/API/quota checks pass in both subscriptions without `az account set`.

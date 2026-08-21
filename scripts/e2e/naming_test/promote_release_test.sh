@@ -28,6 +28,7 @@ mkdir -p "$MOCKBIN"
 
 CTRL_SHA="sha256:$(printf ctrl | sha256sum | cut -c1-64)"
 CNI_SHA="sha256:$(printf cni | sha256sum | cut -c1-64)"
+INDEX_SHA="sha256:$(printf index | sha256sum | cut -c1-64)"
 
 cat >"${MOCKBIN}/az" <<'AZ'
 #!/usr/bin/env bash
@@ -37,10 +38,15 @@ case "$1 $2" in
     case "$3" in
       show)
         image=""; while (($#)); do [[ "$1" == "--image" ]] && image="$2"; shift || true; done
+        if [[ -n "${MOCK_TAG_LOOKUP_ERROR:-}" ]]; then
+          printf '%s\n' '(AuthorizationFailed) denied' >&2
+          exit 1
+        fi
         if [[ ",${MOCK_EXISTING_TAGS:-}," == *",${image},"* ]]; then
           printf '%s\n' "${MOCK_EXISTING_DIGEST:-sha256:existing}"
           exit 0
         fi
+        printf '%s\n' '(ManifestNotFound) manifest unknown' >&2
         exit 1
         ;;
       delete) exit 0 ;;
@@ -65,9 +71,14 @@ case "${1:-}" in
     [[ "${MOCK_COPY_FAIL_DEST:-}" && "$*" == *"${MOCK_COPY_FAIL_DEST}"* ]] && exit 1
     exit 0
     ;;
+  push)
+    [[ -n "${MOCK_INDEX_PUSH_FAIL:-}" ]] && exit 1
+    printf '{"manifest":{"digest":"%s"}}\n' "${MOCK_INDEX_REMOTE:-$INDEX_SHA}"
+    ;;
   manifest)
     ref="${*: -1}"
-    if [[ "$ref" == *pod-nsg-controller* ]]; then printf '{"digest":"%s"}\n' "${MOCK_CTRL_REMOTE:-$CTRL_SHA}"
+    if [[ "$ref" == *pod-nsg-release-index* ]]; then printf '{"digest":"%s"}\n' "${MOCK_INDEX_REMOTE:-$INDEX_SHA}"
+    elif [[ "$ref" == *pod-nsg-controller* ]]; then printf '{"digest":"%s"}\n' "${MOCK_CTRL_REMOTE:-$CTRL_SHA}"
     else printf '{"digest":"%s"}\n' "${MOCK_CNI_REMOTE:-$CNI_SHA}"; fi
     ;;
   pull) [[ -n "${MOCK_ORAS_PULL_FAIL:-}" ]] && exit 1; exit 0 ;;
@@ -122,7 +133,7 @@ new_case() {
 
 run_cmd() {
   local cmd="$1"; shift
-  env MOCK_LOG="$LOG" CTRL_SHA="$CTRL_SHA" CNI_SHA="$CNI_SHA" \
+  env MOCK_LOG="$LOG" CTRL_SHA="$CTRL_SHA" CNI_SHA="$CNI_SHA" INDEX_SHA="$INDEX_SHA" \
     AZ_BIN="${MOCKBIN}/az" ORAS_BIN="${MOCKBIN}/oras" COSIGN_BIN="${MOCKBIN}/cosign" DOCKER_BIN="${MOCKBIN}/docker" \
     PUBLIC_ACR=pncpub.azurecr.io STAGING_ACR=pncstg.azurecr.io RELEASE_VERSION=v1.2.3 \
     RELEASE_TRANSACTION_TAG=_release-test CONTROLLER_SBOM_PATH="${CASEDIR}/controller.spdx.json" \
@@ -149,7 +160,8 @@ assert_eq "both SBOMs are attached" 2 "$(grep -c '^attach sbom ' "$LOG")"
 
 run_cmd complete PROVENANCE_AVAILABLE=true MOVING_TAGS=latest,v1,v1.2
 assert_eq "complete succeeds after verification" 0 "$RC"
-assert_eq "both signatures are verified fail-closed" 2 "$(grep -c '^verify --certificate-' "$LOG")"
+assert_eq "both artifact signatures plus the release index are verified fail-closed" 3 \
+  "$(grep -c '^verify --certificate-' "$LOG")"
 assert_eq "both SLSA attestations are verified fail-closed" 2 "$(grep -c '^verify-attestation --type slsaprovenance ' "$LOG")"
 assert_match "controller semantic version published from verified digest" \
   "acr import .*pod-nsg-controller@${CTRL_SHA}.*pod-nsg-controller:v1.2.3" "$(cat "$LOG")"
@@ -158,6 +170,19 @@ assert_match "CNI semantic version published from verified digest" \
 assert_eq "released controller digest equals validated digest" "$CTRL_SHA" "$(manifest::get "$MANIFEST" '.release.controller.digest')"
 assert_eq "released CNI digest equals validated digest" "$CNI_SHA" "$(manifest::get "$MANIFEST" '.release.cni.digest')"
 assert_eq "release is marked complete only after all checks" true "$(manifest::get "$MANIFEST" '.release.complete')"
+assert_match "canonical release-index tag is the final public commit point" \
+  "copy .*pod-nsg-release-index@${INDEX_SHA}.*pod-nsg-release-index:v1.2.3" "$(cat "$LOG")"
+assert_eq "release index records the exact controller digest" "$CTRL_SHA" \
+  "$(manifest::get "$MANIFEST" '.release.index.controller.digest')"
+assert_eq "release index records the exact CNI digest" "$CNI_SHA" \
+  "$(manifest::get "$MANIFEST" '.release.index.cni.digest')"
+assert_eq "release completion records the canonical index digest" "$INDEX_SHA" \
+  "$(manifest::get "$MANIFEST" '.release.index.digest')"
+index_commit_line="$(grep -n 'copy .*pod-nsg-release-index@.*pod-nsg-release-index:v1.2.3' "$LOG" | cut -d: -f1)"
+ctrl_verify_line="$(grep -n "manifest fetch --descriptor .*pod-nsg-controller:v1.2.3" "$LOG" | tail -1 | cut -d: -f1)"
+cni_verify_line="$(grep -n "manifest fetch --descriptor .*pod-nsg-cni-transparent-tunnel:v1.2.3" "$LOG" | tail -1 | cut -d: -f1)"
+assert_eq "index commit occurs only after both immutable artifacts verify" "yes" \
+  "$(if (( index_commit_line > ctrl_verify_line && index_commit_line > cni_verify_line )); then echo yes; else echo no; fi)"
 
 echo "== prior release gates remain mandatory =="
 COMPLETE_GATES=(
@@ -193,12 +218,19 @@ run_cmd prepare MOCK_EXISTING_TAGS='pod-nsg-cni-transparent-tunnel:v1.2.3'
 assert_nonzero "existing CNI version fails" "$RC"
 assert_eq "CNI immutability is checked before writes" 0 "$(grep -c '^acr import' "$LOG")"
 
+new_case immutable_lookup_error
+run_cmd prepare MOCK_TAG_LOOKUP_ERROR=1
+assert_nonzero "ambiguous registry lookup failure is not treated as absence" "$RC"
+assert_eq "registry lookup failure permits no writes" 0 "$(grep -Ec '^(acr import|copy)' "$LOG")"
+
 echo "== NFR-011: partial prepare/finalize is rolled back before complete =="
 new_case prepare_rollback
 run_cmd prepare MOCK_COPY_FAIL_DEST='pod-nsg-cni-transparent-tunnel:_release-test'
 assert_nonzero "CNI staging failure fails prepare" "$RC"
 assert_match "controller transaction tag is rolled back" \
   'acr repository delete .*pod-nsg-controller:_release-test' "$(cat "$LOG")"
+assert_match "possibly partial CNI transaction tag is rolled back" \
+  'acr repository delete .*pod-nsg-cni-transparent-tunnel:_release-test' "$(cat "$LOG")"
 assert_eq "no semantic version is published after prepare failure" 0 \
   "$(grep -Ec '^(acr import|copy).*:v1\.2\.3' "$LOG")"
 
@@ -218,6 +250,20 @@ assert_nonzero "second semantic publication failure fails release" "$RC"
 assert_match "partial controller semantic tag is rolled back" \
   'acr repository delete .*pod-nsg-controller:v1.2.3' "$(cat "$LOG")"
 assert_eq "failed release is never marked complete" "" "$(manifest::get "$MANIFEST" '.release.complete // empty')"
+assert_eq "partial semantic publication never commits a release index" 0 \
+  "$(grep -Ec '^copy .*pod-nsg-release-index@.*pod-nsg-release-index:v1\.2\.3' "$LOG")"
+
+new_case index_push_fail
+run_cmd prepare
+run_cmd secure
+run_cmd complete PROVENANCE_AVAILABLE=true MOCK_INDEX_PUSH_FAIL=1
+assert_nonzero "release-index preparation failure fails release" "$RC"
+assert_match "index preparation failure removes controller semantic tag" \
+  'acr repository delete .*pod-nsg-controller:v1.2.3' "$(cat "$LOG")"
+assert_match "index preparation failure removes CNI semantic tag" \
+  'acr repository delete .*pod-nsg-cni-transparent-tunnel:v1.2.3' "$(cat "$LOG")"
+assert_eq "no completed release exists without the canonical index" "" \
+  "$(manifest::get "$MANIFEST" '.release.complete // empty')"
 
 echo "== ITEM-020: supply-chain verification fails closed =="
 new_case verify_fail
