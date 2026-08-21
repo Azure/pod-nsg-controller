@@ -31,8 +31,8 @@ assert_contains "primary subscription validation checks the primary tenant" \
   'lib::az_subscription_validate az "\$\{PRIMARY_SUBSCRIPTION_ID\}" "\$\{PRIMARY_TENANT_ID\}"'
 assert_contains "secondary subscription validation checks the secondary tenant" \
   'lib::az_subscription_validate az "\$\{SECONDARY_SUBSCRIPTION_ID\}" "\$\{SECONDARY_TENANT_ID\}"'
-assert_contains "xs primary provisioning depends on preflight_xs" \
-  'needs: \[meta, preflight_xs, validate_multicluster\]'
+assert_contains "xs primary provisioning depends on preflight and prior ss cleanup" \
+  'needs: \[meta, preflight_xs, cleanup_ss\]'
 
 echo "== ITEM-037/038: manifest inventory is passed through the xs chain =="
 assert_job_contains "secondary provisioning downloads the primary xs manifest" provision_xs_secondary \

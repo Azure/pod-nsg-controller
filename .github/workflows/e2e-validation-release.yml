@@ -1,9 +1,9 @@
 # =============================================================================
 # E2E Validation & Release pipeline.
 #
-# EPIC-001 foundation: this file currently implements only the deterministic
-# `meta` job (run metadata + topology-aware name maps + run-manifest foundation)
-# and a `naming-tests` job that exercises the naming/lib/meta/build helpers.
+# EPIC-007 completes orchestration and governance: typed triggers/inputs,
+# environment protection, event-specific concurrency, least-privilege job
+# permissions, topology selection, and an always-on final manifest/summary.
 #
 # EPIC-002 adds the `build` job: it builds the candidate controller image once
 # (reusing `make docker-build`), publishes it to the staging ACR BY DIGEST via
@@ -34,7 +34,7 @@
 # diagnostics. The controller+CNI digests form one atomic artifact set gated on
 # validate_tt and released by digest with EPIC-006 supply-chain verification.
 #
-# Traceability: ITEM-001..ITEM-014, FR-001..FR-005, FR-011, FR-012, FR-015,
+# Traceability: ITEM-001..ITEM-025, FR-001..FR-015,
 # FR-016, FR-028, ITEM-028..ITEM-035, FR-018..FR-024, TTS-001..TTS-007,
 # NFR-003, NFR-006, NFR-007, NFR-010, NFR-011, SEC-001, SEC-003, SEC-004,
 # SEC-006, RD-004, RD-013..RD-017, RD-020, CON-003, CON-010, CON-011,
@@ -46,12 +46,18 @@ on:
   workflow_dispatch:
     inputs:
       validation_topologies:
-        description: "Topologies to validate: comma-separated ss and/or xs. A release forces ss,xs."
-        type: string
+        description: "Validation topology (a release always forces ss,xs)."
+        type: choice
+        options:
+          - "ss,xs"
+          - "ss"
+          - "xs"
         default: "ss,xs"
       regions:
-        description: "Canary regions (comma-separated): eastus2euap and/or centraluseuap."
-        type: string
+        description: "Canary regions used by the selected topology."
+        type: choice
+        options:
+          - "eastus2euap,centraluseuap"
         default: "eastus2euap,centraluseuap"
       release:
         description: "Promote the validated artifact set to the public ACR (requires ss,xs)."
@@ -78,9 +84,19 @@ on:
     paths:
       - "scripts/e2e/**"
       - ".github/workflows/e2e-validation-release.yml"
+  schedule:
+    - cron: "0 7 * * *"
+  release:
+    types: [published]
+  push:
+    tags: ["v*"]
 
 permissions:
   contents: read
+
+concurrency:
+  group: ${{ github.event_name == 'pull_request' && format('pnc-e2e-pr-{0}', github.event.pull_request.number) || 'pnc-e2e-cloud' }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   meta:
@@ -118,8 +134,9 @@ jobs:
           INPUT_REGIONS: ${{ inputs.regions || 'eastus2euap,centraluseuap' }}
           INPUT_RELEASE: ${{ inputs.release || false }}
           INPUT_RELEASE_VERSION: ${{ inputs.release_version || '' }}
-          PRIMARY_SUBSCRIPTION_ID: ${{ inputs.primary_subscription_id || '' }}
-          SECONDARY_SUBSCRIPTION_ID: ${{ inputs.secondary_subscription_id || '' }}
+          INPUT_KEEP_RESOURCES: ${{ inputs.keep_resources || false }}
+          PRIMARY_SUBSCRIPTION_ID: ${{ inputs.primary_subscription_id || vars.E2E_PRIMARY_SUBSCRIPTION_ID }}
+          SECONDARY_SUBSCRIPTION_ID: ${{ inputs.secondary_subscription_id || vars.E2E_SECONDARY_SUBSCRIPTION_ID }}
           MANIFEST_PATH: run-manifest.json
         run: bash scripts/e2e/meta.sh
 
@@ -133,12 +150,12 @@ jobs:
   build:
     name: Build & publish candidate (by digest)
     needs: meta
+    if: ${{ github.event_name != 'pull_request' }}
     runs-on: ubuntu-latest
     timeout-minutes: 30
+    environment: azure-e2e
     # Cloud publish uses GitHub OIDC only (no standing secrets, NFR-005/SEC-001).
-    # PRs build to validate the Dockerfile but never authenticate or push
-    # (RD-009). GitHub Environment approval for the cloud path is added in
-    # EPIC-007 (FR-013) together with the trigger matrix and concurrency policy.
+    # PR validation is isolated in build_pr so this job can be environment-bound.
     permissions:
       contents: read
       id-token: write
@@ -165,10 +182,7 @@ jobs:
       - name: Install syft (SBOM)
         uses: anchore/sbom-action/download-syft@v0.17.9
 
-      # OIDC login only for cloud-publishing runs (skipped on PRs). Mirrors the
-      # existing phase9-integration-e2e.yml pattern (SEC-001).
       - name: Azure Login (OIDC)
-        if: ${{ github.event_name != 'pull_request' }}
         uses: azure/login@v2
         with:
           client-id: ${{ secrets.AZURE_CLIENT_ID }}
@@ -217,8 +231,10 @@ jobs:
   build_cni:
     name: Build & publish CNI artifact (by digest)
     needs: meta
+    if: ${{ github.event_name != 'pull_request' }}
     runs-on: ubuntu-latest
     timeout-minutes: 30
+    environment: azure-e2e
     permissions:
       contents: read
       id-token: write
@@ -253,9 +269,7 @@ jobs:
       - name: Install syft (SBOM)
         uses: anchore/sbom-action/download-syft@v0.17.9
 
-      # OIDC login only for cloud-publishing runs (skipped on PRs, SEC-001).
       - name: Azure Login (OIDC)
-        if: ${{ github.event_name != 'pull_request' }}
         uses: azure/login@v2
         with:
           client-id: ${{ secrets.AZURE_CLIENT_ID }}
@@ -296,6 +310,82 @@ jobs:
           path: run-manifest.json
           retention-days: 30
 
+  # PR fast checks build/package both artifacts locally without requesting an
+  # OIDC token, authenticating to Azure, pushing, or entering a cloud
+  # environment (RD-009).
+  build_pr:
+    name: Build candidate (PR, no cloud)
+    needs: meta
+    if: ${{ github.event_name == 'pull_request' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - name: Download run-manifest foundation
+        uses: actions/download-artifact@v4
+        with:
+          name: run-manifest
+          path: .
+      - name: Install syft
+        uses: anchore/sbom-action/download-syft@v0.17.9
+      - name: Build controller candidate locally
+        env:
+          EVENT_NAME: pull_request
+          CONTROLLER_STAGING_REPO: ${{ needs.meta.outputs.controller_staging_repo }}
+          CONTROLLER_STAGING_TAG: ${{ needs.meta.outputs.controller_staging_tag }}
+          MANIFEST_PATH: run-manifest.json
+          SBOM_PATH: sbom/controller.spdx.json
+        run: bash scripts/e2e/build.sh
+      - name: Upload PR controller manifest
+        uses: actions/upload-artifact@v4
+        with:
+          name: run-manifest-build-pr
+          path: run-manifest.json
+          retention-days: 30
+
+  build_cni_pr:
+    name: Build CNI artifact (PR, no cloud)
+    needs: meta
+    if: ${{ github.event_name == 'pull_request' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - name: Download run-manifest foundation
+        uses: actions/download-artifact@v4
+        with:
+          name: run-manifest
+          path: .
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - uses: oras-project/setup-oras@v1
+      - uses: anchore/sbom-action/download-syft@v0.17.9
+      - name: Build CNI candidate locally
+        env:
+          EVENT_NAME: pull_request
+          CNI_STAGING_REPO: ${{ needs.meta.outputs.cni_staging_repo }}
+          CNI_STAGING_TAG: ${{ needs.meta.outputs.cni_staging_tag }}
+          CNI_SOURCE_MODE: ${{ vars.E2E_CNI_SOURCE_MODE }}
+          CNI_SOURCE_REPO: ${{ vars.E2E_CNI_SOURCE_REPO }}
+          CNI_SOURCE_REF: ${{ vars.E2E_CNI_SOURCE_REF }}
+          CNI_BINARY_URL: ${{ vars.E2E_CNI_BINARY_URL }}
+          CNI_CONFLIST_URL: ${{ vars.E2E_CNI_CONFLIST_URL }}
+          CNI_BINARY_SHA256: ${{ vars.E2E_CNI_BINARY_SHA256 }}
+          MANIFEST_PATH: run-manifest.json
+          SBOM_PATH: sbom/cni.spdx.json
+        run: make cni-artifact
+      - name: Upload PR CNI manifest
+        uses: actions/upload-artifact@v4
+        with:
+          name: run-manifest-build-cni-pr
+          path: run-manifest.json
+          retention-days: 30
+
   # ===========================================================================
   # EPIC-003 - Provisioning generalization (ITEM-007/008/010).
   #
@@ -304,14 +394,15 @@ jobs:
   # re-validated (canary-only, CON-001) and a VM-quota preflight GATES
   # provisioning (RISK-003) before any resource is created. Cloud steps are
   # skipped on pull_request (RD-009: no fork OIDC / no per-PR cost). GitHub
-  # Environment approval and the non-cancelable cloud concurrency group are
-  # added in EPIC-007 (FR-013/RD-008); `xs` provisioning is EPIC-010.
+  # The azure-e2e environment and non-cancelable cloud concurrency group enforce
+  # the EPIC-007 approval/serialization boundary (FR-013/RD-008).
   provision:
     name: Provision ss / ${{ matrix.region }}
     needs: meta
-    if: ${{ github.event_name != 'pull_request' }}
+    if: ${{ github.event_name != 'pull_request' && contains(needs.meta.outputs.validation_topologies, 'ss') }}
     runs-on: ubuntu-latest
     timeout-minutes: 120
+    environment: azure-e2e
     permissions:
       contents: read
       id-token: write
@@ -357,6 +448,9 @@ jobs:
       - name: VM quota preflight (gates provisioning)
         run: |
           source scripts/e2e/lib.sh
+          lib::az_subscription_validate az "${PRIMARY_SUBSCRIPTION_ID}"
+          lib::az_provider_preflight az "${PRIMARY_SUBSCRIPTION_ID}" Microsoft.Network applicationSecurityGroups 2025-07-01
+          lib::az_provider_preflight az "${PRIMARY_SUBSCRIPTION_ID}" Microsoft.Compute
           # shellcheck disable=SC2153  # REGION comes from the job env (matrix.region)
           lib::az_vm_quota_preflight az "${PRIMARY_SUBSCRIPTION_ID}" "${REGION}" \
             "${VM_QUOTA_FAMILY}" "${VM_QUOTA_REQUIRED}"
@@ -393,9 +487,10 @@ jobs:
   rbac:
     name: Cross-region RBAC (ss)
     needs: [meta, provision]
-    if: ${{ github.event_name != 'pull_request' }}
+    if: ${{ github.event_name != 'pull_request' && contains(needs.meta.outputs.validation_topologies, 'ss') }}
     runs-on: ubuntu-latest
     timeout-minutes: 30
+    environment: azure-e2e
     permissions:
       contents: read
       id-token: write
@@ -452,9 +547,10 @@ jobs:
   deploy:
     name: Deploy candidate ss / ${{ matrix.region }}
     needs: [meta, build, provision, rbac]
-    if: ${{ github.event_name != 'pull_request' }}
+    if: ${{ github.event_name != 'pull_request' && contains(needs.meta.outputs.validation_topologies, 'ss') }}
     runs-on: ubuntu-latest
     timeout-minutes: 45
+    environment: azure-e2e
     permissions:
       contents: read
       id-token: write
@@ -518,9 +614,10 @@ jobs:
   validate_multicluster:
     name: Validate multicluster (ss Tests 1-4)
     needs: [meta, deploy]
-    if: ${{ github.event_name != 'pull_request' }}
+    if: ${{ github.event_name != 'pull_request' && contains(needs.meta.outputs.validation_topologies, 'ss') }}
     runs-on: ubuntu-latest
     timeout-minutes: 60
+    environment: azure-e2e
     permissions:
       contents: read
       id-token: write
@@ -579,9 +676,10 @@ jobs:
   validate_tt:
     name: Validate transparent-tunnel (TTS-001..007)
     needs: [meta, build_cni, validate_multicluster]
-    if: ${{ github.event_name != 'pull_request' }}
+    if: ${{ github.event_name != 'pull_request' && contains(needs.meta.outputs.validation_topologies, 'ss') }}
     runs-on: ubuntu-latest
     timeout-minutes: 60
+    environment: azure-e2e
     permissions:
       contents: read
       id-token: write
@@ -679,7 +777,7 @@ jobs:
   diagnostics_ss:
     name: Diagnostics (ss, always)
     needs: [meta, provision, deploy, validate_multicluster, validate_tt]
-    if: ${{ always() && github.event_name != 'pull_request' }}
+    if: ${{ always() && github.event_name != 'pull_request' && contains(needs.meta.outputs.validation_topologies, 'ss') }}
     runs-on: ubuntu-latest
     timeout-minutes: 30
     environment: azure-e2e
@@ -726,7 +824,7 @@ jobs:
   cleanup_ss:
     name: Cleanup (ss, always)
     needs: [meta, provision, rbac, deploy, validate_multicluster, validate_tt, diagnostics_ss]
-    if: ${{ always() && github.event_name != 'pull_request' }}
+    if: ${{ always() && github.event_name != 'pull_request' && contains(needs.meta.outputs.validation_topologies, 'ss') }}
     runs-on: ubuntu-latest
     timeout-minutes: 45
     environment: azure-e2e
@@ -829,6 +927,8 @@ jobs:
           lib::az_subscription_validate az "${SECONDARY_SUBSCRIPTION_ID}" "${SECONDARY_TENANT_ID}"
           lib::az_provider_preflight az "${PRIMARY_SUBSCRIPTION_ID}" Microsoft.Network applicationSecurityGroups 2025-07-01
           lib::az_provider_preflight az "${SECONDARY_SUBSCRIPTION_ID}" Microsoft.Network
+          lib::az_provider_preflight az "${PRIMARY_SUBSCRIPTION_ID}" Microsoft.Compute
+          lib::az_provider_preflight az "${SECONDARY_SUBSCRIPTION_ID}" Microsoft.Compute
           lib::az_vm_quota_preflight az "${PRIMARY_SUBSCRIPTION_ID}" eastus2euap "${VM_QUOTA_FAMILY}" "${VM_QUOTA_REQUIRED}"
           lib::az_vm_quota_preflight az "${SECONDARY_SUBSCRIPTION_ID}" centraluseuap "${VM_QUOTA_FAMILY}" "${VM_QUOTA_REQUIRED}"
 
@@ -837,8 +937,8 @@ jobs:
   # (explicit --subscription; ASGs only in the primary region RG).
   provision_xs_primary:
     name: Provision xs / Cluster A + shared ASGs (primary)
-    needs: [meta, preflight_xs, validate_multicluster]
-    if: ${{ github.event_name != 'pull_request' && contains(needs.meta.outputs.validation_topologies, 'xs') }}
+    needs: [meta, preflight_xs, cleanup_ss]
+    if: ${{ always() && github.event_name != 'pull_request' && contains(needs.meta.outputs.validation_topologies, 'xs') && needs.preflight_xs.result == 'success' && (!contains(needs.meta.outputs.validation_topologies, 'ss') || needs.cleanup_ss.result == 'success') }}
     runs-on: ubuntu-latest
     timeout-minutes: 120
     environment: azure-e2e
@@ -1260,6 +1360,7 @@ jobs:
     if: ${{ github.event_name != 'pull_request' && needs.meta.outputs.release_requested == 'true' }}
     runs-on: ubuntu-latest
     timeout-minutes: 10
+    environment: public-release
     permissions:
       contents: read
     steps:
@@ -1290,6 +1391,7 @@ jobs:
     if: ${{ github.event_name != 'pull_request' && needs.meta.outputs.release_requested == 'true' }}
     runs-on: ubuntu-latest
     timeout-minutes: 30
+    environment: public-release
     permissions:
       contents: read
       id-token: write
@@ -1385,11 +1487,22 @@ jobs:
           retention-days: 30
 
   naming-tests:
-    name: Naming & metadata tests
+    name: Lint, unit, integration, and E2E script tests
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 45
+    permissions:
+      contents: read
     steps:
       - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Run Go unit and phase9 integration tests
+        run: |
+          make test
+          make test-phase9-integration
 
       - name: shellcheck e2e scripts
         run: shellcheck scripts/e2e/*.sh scripts/e2e/naming_test/*.sh
@@ -1417,6 +1530,52 @@ jobs:
           bash scripts/e2e/naming_test/workflow_epic010_test.sh
           bash scripts/e2e/naming_test/workflow_epic005_test.sh
           bash scripts/e2e/naming_test/workflow_epic006_test.sh
+          bash scripts/e2e/naming_test/finalize_manifest_test.sh
+          bash scripts/e2e/naming_test/workflow_epic007_test.sh
 
       - name: Verify naming self-check
         run: bash scripts/e2e/naming.sh self-check
+
+  # ITEM-025: merge every available per-job manifest snapshot after all
+  # terminal paths settle. This job deliberately remains successful when an
+  # upstream job failed; missing evidence is explicit in `.audit` and in the
+  # step summary, while the validation/release jobs retain their own failures.
+  summary:
+    name: Finalize auditable run manifest (always)
+    needs: [meta, build, build_cni, build_pr, build_cni_pr, naming-tests, cleanup_ss, cleanup_xs, release]
+    if: ${{ always() }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      actions: read
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download run-manifest foundation
+        if: ${{ needs.meta.result == 'success' }}
+        uses: actions/download-artifact@v4
+        with:
+          name: run-manifest
+          path: manifest-fragments/run-manifest-foundation
+
+      - name: Download all run-manifest fragments
+        continue-on-error: true
+        uses: actions/download-artifact@v4
+        with:
+          pattern: run-manifest-*
+          path: manifest-fragments
+
+      - name: Finalize manifest and job summary
+        env:
+          MANIFEST_FRAGMENTS_DIR: manifest-fragments
+          MANIFEST_PATH: run-manifest.json
+        run: bash scripts/e2e/finalize-manifest.sh
+
+      - name: Upload final run manifest
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: run-manifest-final
+          path: run-manifest.json
+          retention-days: 30

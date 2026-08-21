@@ -11,7 +11,8 @@ fail() { FAIL=$((FAIL + 1)); printf '  FAIL %s\n' "$1" >&2; }
 assert_job_contains() {
   local name="$1" job="$2" pattern="$3"
   if awk -v job="$job" '
-      $0 == "  " job ":" {inside=1; next}
+      $0 == "jobs:" {in_jobs=1; next}
+      in_jobs && $0 == "  " job ":" {inside=1; next}
       inside && /^  [A-Za-z0-9_-]+:$/ {exit}
       inside {print}
     ' "$WORKFLOW" | grep -Eq -- "$pattern"; then pass "$name"; else fail "$name"; fi

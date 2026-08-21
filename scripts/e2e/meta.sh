@@ -11,6 +11,7 @@
 #   REPO RUN_ID RUN_ATTEMPT GIT_SHA GIT_REF                (naming context)
 #   INPUT_TOPOLOGIES  (default "ss,xs")   INPUT_REGIONS (default canary pair)
 #   INPUT_RELEASE (true|false)            INPUT_RELEASE_VERSION
+#   INPUT_KEEP_RESOURCES (true|false)
 #   PRIMARY_SUBSCRIPTION_ID  SECONDARY_SUBSCRIPTION_ID
 #   EVENT_NAME REF_TYPE REF_NAME          (release-trigger detection)
 #   MANIFEST_PATH     (default ./run-manifest.json)
@@ -26,13 +27,14 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "${HERE}/lib.sh"
 NAMING_SH="${HERE}/naming.sh"
 
-lib::require_cmds jq bash sha256sum sed tr date
+lib::require_cmds jq bash sha256sum sed tr date sort wc
 
 # ---- inputs -----------------------------------------------------------------
 INPUT_TOPOLOGIES="${INPUT_TOPOLOGIES:-ss,xs}"
 INPUT_REGIONS="${INPUT_REGIONS:-eastus2euap,centraluseuap}"
 INPUT_RELEASE="${INPUT_RELEASE:-false}"
 INPUT_RELEASE_VERSION="${INPUT_RELEASE_VERSION:-}"
+INPUT_KEEP_RESOURCES="${INPUT_KEEP_RESOURCES:-false}"
 PRIMARY_SUBSCRIPTION_ID="${PRIMARY_SUBSCRIPTION_ID:-}"
 SECONDARY_SUBSCRIPTION_ID="${SECONDARY_SUBSCRIPTION_ID:-}"
 EVENT_NAME="${EVENT_NAME:-${GITHUB_EVENT_NAME:-}}"
@@ -72,6 +74,10 @@ for r in "${_raw_regions[@]}"; do
   esac
 done
 [[ ${#regions[@]} -gt 0 ]] || log::die "regions is empty"
+[[ "$(printf '%s\n' "${regions[@]}" | sort -u | wc -l | tr -d ' ')" == "${#regions[@]}" ]] \
+  || log::die "regions contains duplicate entries"
+[[ " ${regions[*]} " == *" eastus2euap "* && " ${regions[*]} " == *" centraluseuap "* ]] \
+  || log::die "the two-cluster topology requires both canary regions: eastus2euap, centraluseuap"
 
 # ---- determine release intent ----------------------------------------------
 release_requested=false
@@ -88,12 +94,14 @@ fi
 
 # ---- release gating (CON-009 / FR-008 / FR-012) -----------------------------
 if [[ "$release_requested" == "true" ]]; then
-  if ! $has_ss || ! $has_xs; then
-    log::die "release requires validation_topologies to include BOTH ss and xs (got: '${INPUT_TOPOLOGIES}')"
-  fi
+  has_ss=true
+  has_xs=true
+  effective_topos=("ss" "xs")
   if [[ -z "$INPUT_RELEASE_VERSION" ]]; then
     log::die "release requires a release_version (semver, e.g. v1.2.3)"
   fi
+  [[ "$INPUT_KEEP_RESOURCES" != "true" ]] \
+    || log::die "release forbids keep_resources=true (cleanup is a mandatory release gate)"
 fi
 if [[ -n "$INPUT_RELEASE_VERSION" ]] \
    && ! [[ "$INPUT_RELEASE_VERSION" =~ ^v?[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]; then

@@ -53,13 +53,21 @@ if grep -q '^validation_topologies=ss,xs$' "${WORK}/happy.out"; then
 if grep -q '^regions_json=\["eastus2euap","centraluseuap"\]$' "${WORK}/happy.out"; then
   pass "step output regions_json is a JSON array (provision matrix, ITEM-010)"; else fail "missing regions_json matrix output"; fi
 
-echo "== release must include BOTH topologies (CON-009) =="
-run_meta rel_ss_only INPUT_TOPOLOGIES="ss" INPUT_RELEASE="true" INPUT_RELEASE_VERSION="v1.2.3"
-if (( RC != 0 )); then pass "release with only ss fails"; else fail "release+ss-only should fail"; fi
+echo "== release forces BOTH topologies (CON-009) =="
+run_meta rel_ss_only INPUT_TOPOLOGIES="ss" INPUT_RELEASE="true" INPUT_RELEASE_VERSION="v1.2.3" \
+  PRIMARY_SUBSCRIPTION_ID="aaa" SECONDARY_SUBSCRIPTION_ID="bbb"
+if (( RC == 0 )) && [[ "$(jq -c '.run.validation_topologies' "$MANIFEST")" == '["ss","xs"]' ]]; then
+  pass "release overrides ss-only selection to ss,xs"
+else
+  fail "release should force both topologies (rc=$RC)"
+fi
 
 echo "== release requires a version (FR-008) =="
 run_meta rel_no_ver INPUT_TOPOLOGIES="ss,xs" INPUT_RELEASE="true"
 if (( RC != 0 )); then pass "release without version fails"; else fail "release w/o version should fail"; fi
+run_meta rel_keep INPUT_TOPOLOGIES="ss,xs" INPUT_RELEASE="true" INPUT_RELEASE_VERSION="v1.2.3" \
+  INPUT_KEEP_RESOURCES="true" PRIMARY_SUBSCRIPTION_ID="aaa" SECONDARY_SUBSCRIPTION_ID="bbb"
+if (( RC != 0 )); then pass "release with resource retention fails"; else fail "release must force cleanup"; fi
 
 echo "== release happy path (ss,xs + version + distinct IDs) =="
 run_meta rel_ok INPUT_TOPOLOGIES="ss,xs" INPUT_RELEASE="true" INPUT_RELEASE_VERSION="v0.1.0" \
@@ -79,6 +87,8 @@ if (( RC != 0 )); then pass "xs with case-only equal IDs fails"; else fail "xs c
 echo "== invalid inputs fail fast =="
 run_meta bad_region INPUT_REGIONS="westus2"
 if (( RC != 0 )); then pass "non-canary region rejected (CON-001)"; else fail "bad region should fail"; fi
+run_meta missing_region INPUT_REGIONS="eastus2euap"
+if (( RC != 0 )); then pass "incomplete region pair rejected"; else fail "missing second cluster region should fail"; fi
 run_meta bad_topo INPUT_TOPOLOGIES="ss,zz"
 if (( RC != 0 )); then pass "invalid topology token rejected"; else fail "bad topology should fail"; fi
 run_meta bad_ver INPUT_TOPOLOGIES="ss,xs" INPUT_RELEASE="true" INPUT_RELEASE_VERSION="1.2"

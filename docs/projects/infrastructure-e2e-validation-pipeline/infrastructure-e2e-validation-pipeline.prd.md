@@ -630,14 +630,14 @@ Each scenario below is a discrete, independently-reported validation gate derive
 | ITEM-020 | Sign BOTH released digests (controller image + CNI artifact) with cosign keyless (OIDC), attach both SBOMs, and emit SLSA provenance via `actions/attest-build-provenance` for both. Validation: AC-011 — `cosign verify` and attestation checks pass on both. | Done | .github/workflows/e2e-validation-release.yml, scripts/e2e/promote-release.sh |
 | ITEM-021 | Ensure BOTH public ACR release repositories have anonymous pull enabled and verify unauthenticated pulls of the released tag. Validation: `docker logout` then `docker pull <public>/pod-nsg-controller:<semver>` and `oras pull <public>/pod-nsg-cni-transparent-tunnel:<semver>` succeed (FR-010). | Done | scripts/e2e/promote-release.sh, .github/workflows/e2e-validation-release.yml |
 
-- EPIC-007: Workflow orchestration and governance — triggers, inputs, environments, concurrency, summaries.
+- EPIC-007 (Status: Done): Workflow orchestration and governance — triggers, inputs, environments, concurrency, summaries.
 
 | Task | Description | Status | Relevant Files |
 |------|-------------|--------|----------------|
-| ITEM-022 | Define typed inputs and triggers per Section 9.1; validate canary regions, topology selection, distinct subscriptions, quota/provider access, and semver. Release must force `ss,xs`. | Not Started | .github/workflows/e2e-validation-release.yml |
-| ITEM-023 | Bind cloud jobs to the `azure-e2e` environment and release jobs to the `public-release` environment (required reviewers); set `permissions:` per-job (`id-token: write` only where needed; PRs excluded). Validation: AC-014 — approvals enforced; least-privilege permissions. | Not Started | .github/workflows/e2e-validation-release.yml |
-| ITEM-024 | Configure concurrency: non-cancelable `pnc-e2e-cloud` group for provision/validate/release (RD-008) and a cancelable group for PR fast-checks; set `timeout-minutes` and retry/backoff via `lib.sh`. Validation: overlapping runs serialize; PR reruns cancel prior fast-checks. | Not Started | .github/workflows/e2e-validation-release.yml, scripts/e2e/lib.sh |
-| ITEM-025 | Finalize the manifest with topology/subscription-role maps, artifact digests, `ss` and `xs` Tests 1–4, XSUB/TTS results, assignment IDs, and per-subscription cleanup evidence. | Not Started | .github/workflows/e2e-validation-release.yml, scripts/e2e/lib.sh |
+| ITEM-022 | Define typed inputs and triggers per Section 9.1; validate canary regions, topology selection, distinct subscriptions, quota/provider access, and semver. Release must force `ss,xs`. | Done | .github/workflows/e2e-validation-release.yml |
+| ITEM-023 | Bind cloud jobs to the `azure-e2e` environment and release jobs to the `public-release` environment (required reviewers); set `permissions:` per-job (`id-token: write` only where needed; PRs excluded). Validation: AC-014 — approvals enforced; least-privilege permissions. | Done | .github/workflows/e2e-validation-release.yml |
+| ITEM-024 | Configure concurrency: non-cancelable `pnc-e2e-cloud` group for provision/validate/release (RD-008) and a cancelable group for PR fast-checks; set `timeout-minutes` and retry/backoff via `lib.sh`. Validation: overlapping runs serialize; PR reruns cancel prior fast-checks. | Done | .github/workflows/e2e-validation-release.yml, scripts/e2e/lib.sh |
+| ITEM-025 | Finalize the manifest with topology/subscription-role maps, artifact digests, `ss` and `xs` Tests 1–4, XSUB/TTS results, assignment IDs, and per-subscription cleanup evidence. | Done | .github/workflows/e2e-validation-release.yml, scripts/e2e/finalize-manifest.sh, scripts/e2e/lib.sh |
 
 - EPIC-008: Bootstrap and documentation — one-time durable prerequisites and operator guide.
 
