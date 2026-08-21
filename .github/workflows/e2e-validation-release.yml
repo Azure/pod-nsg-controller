@@ -61,6 +61,10 @@ on:
         description: "Semantic version to release, e.g. v1.2.3 (required when release=true)."
         type: string
         default: ""
+      keep_resources:
+        description: "Retain resources for non-release debugging. Forbidden when release=true."
+        type: boolean
+        default: false
       primary_subscription_id:
         description: "Primary subscription (Cluster A + shared ASGs). Non-sensitive identifier."
         type: string
@@ -671,6 +675,104 @@ jobs:
           retention-days: 30
 
   # ===========================================================================
+  # EPIC-005 - Always-on same-subscription diagnostics and verified cleanup.
+  diagnostics_ss:
+    name: Diagnostics (ss, always)
+    needs: [meta, provision, deploy, validate_multicluster, validate_tt]
+    if: ${{ always() && github.event_name != 'pull_request' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    environment: azure-e2e
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      TOPOLOGY: ss
+      PRIMARY_SUBSCRIPTION_ID: ${{ inputs.primary_subscription_id || vars.E2E_PRIMARY_SUBSCRIPTION_ID }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download run-manifest foundation
+        uses: actions/download-artifact@v4
+        with:
+          name: run-manifest
+          path: .
+
+      - name: Azure Login (OIDC)
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ env.PRIMARY_SUBSCRIPTION_ID }}
+
+      - name: Collect controller, mapping, pod, ASG, node, and CNI diagnostics
+        env:
+          REPO: ${{ github.repository }}
+          RUN_ID: ${{ github.run_id }}
+          RUN_ATTEMPT: ${{ github.run_attempt }}
+          DATE_UTC: ${{ needs.meta.outputs.date_utc }}
+          MANIFEST_PATH: run-manifest.json
+          DIAG_DIR: diagnostics-ss
+        run: bash scripts/e2e/collect-diagnostics.sh all
+
+      - name: Upload same-subscription diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: diagnostics-ss
+          path: diagnostics-ss/
+          retention-days: 30
+
+  cleanup_ss:
+    name: Cleanup (ss, always)
+    needs: [meta, provision, rbac, deploy, validate_multicluster, validate_tt, diagnostics_ss]
+    if: ${{ always() && github.event_name != 'pull_request' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    environment: azure-e2e
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      TOPOLOGY: ss
+      PRIMARY_SUBSCRIPTION_ID: ${{ inputs.primary_subscription_id || vars.E2E_PRIMARY_SUBSCRIPTION_ID }}
+      RELEASE_REQUESTED: ${{ needs.meta.outputs.release_requested }}
+      KEEP_RESOURCES: ${{ inputs.keep_resources || false }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download RBAC assignment inventory for verified cleanup
+        continue-on-error: true
+        uses: actions/download-artifact@v4
+        with:
+          name: run-manifest-rbac-ss
+          path: .
+
+      - name: Azure Login (OIDC)
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ env.PRIMARY_SUBSCRIPTION_ID }}
+
+      - name: Remove assignments + delete both run RGs and verify not-found
+        env:
+          REPO: ${{ github.repository }}
+          RUN_ID: ${{ github.run_id }}
+          RUN_ATTEMPT: ${{ github.run_attempt }}
+          DATE_UTC: ${{ needs.meta.outputs.date_utc }}
+          MANIFEST_PATH: run-manifest.json
+        run: bash scripts/e2e/teardown.sh cleanup
+
+      - name: Upload cleanup manifest (ss)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: run-manifest-cleanup-ss
+          path: run-manifest.json
+          retention-days: 30
+
+  # ===========================================================================
   # EPIC-010 - Cross-subscription topology (ITEM-036/037/038/039/040).
   #
   # Runs the `xs` topology AFTER the `ss` multicluster validation (PAT-003/RD-019:
@@ -1108,6 +1210,7 @@ jobs:
       PRIMARY_SUBSCRIPTION_ID: ${{ inputs.primary_subscription_id || vars.E2E_PRIMARY_SUBSCRIPTION_ID }}
       SECONDARY_SUBSCRIPTION_ID: ${{ inputs.secondary_subscription_id || vars.E2E_SECONDARY_SUBSCRIPTION_ID }}
       RELEASE_REQUESTED: ${{ needs.meta.outputs.release_requested }}
+      KEEP_RESOURCES: ${{ inputs.keep_resources || false }}
     steps:
       - uses: actions/checkout@v4
 
@@ -1149,14 +1252,11 @@ jobs:
           path: run-manifest.json
           retention-days: 30
 
-  # ITEM-040: release-gate integration SEAM. Requiring validate_cross_subscription
-  # AND cleanup_xs as `needs:` (without always()) means this job - and any future
-  # EPIC-006 release job that needs it - runs ONLY when both succeeded, alongside
-  # ss validation. The explicit `promote-release.sh gate` call logs the composed
-  # decision (validate_tt + validate_cross_subscription + cleanup_xs + atomic set).
+  # ITEM-018: complete release gate. Without always(), any failed required job
+  # skips this job; promote-release.sh also evaluates every result fail-closed.
   release_gate:
     name: Release gate (ss + tt + xs validation & cleanup)
-    needs: [meta, build, build_cni, validate_multicluster, validate_tt, validate_cross_subscription, cleanup_xs]
+    needs: [meta, build, build_cni, naming-tests, validate_multicluster, validate_tt, cleanup_ss, validate_cross_subscription, cleanup_xs]
     if: ${{ github.event_name != 'pull_request' && needs.meta.outputs.release_requested == 'true' }}
     runs-on: ubuntu-latest
     timeout-minutes: 10
@@ -1165,11 +1265,14 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Evaluate the composed release gate (validate_tt + xs + cleanup_xs + atomic set)
+      - name: Evaluate every required validation and cleanup gate
         env:
           CTRL_DIGEST: ${{ needs.build.outputs.image_digest }}
           CNI_DIGEST: ${{ needs.build_cni.outputs.cni_digest }}
+          LINT_STATUS: ${{ needs['naming-tests'].result }}
+          VALIDATE_SS_STATUS: ${{ needs.validate_multicluster.result }}
           VALIDATE_TT_STATUS: ${{ needs.validate_tt.result }}
+          CLEANUP_SS_STATUS: ${{ needs.cleanup_ss.result }}
           VALIDATE_XS_STATUS: ${{ needs.validate_cross_subscription.result }}
           CLEANUP_XS_STATUS: ${{ needs.cleanup_xs.result }}
         run: |
@@ -1177,7 +1280,7 @@ jobs:
           manifest::init run-manifest.json
           manifest::put_json run-manifest.json artifacts.controller "$(jq -n --arg d "${CTRL_DIGEST}" '{digest:$d}')"
           manifest::put_json run-manifest.json artifacts.cni "$(jq -n --arg d "${CNI_DIGEST}" '{digest:$d}')"
-          REQUIRE_XS=1 MANIFEST_PATH=run-manifest.json bash scripts/e2e/promote-release.sh gate
+          REQUIRE_COMPLETE=1 REQUIRE_XS=1 MANIFEST_PATH=run-manifest.json bash scripts/e2e/promote-release.sh gate
 
   naming-tests:
     name: Naming & metadata tests
@@ -1210,6 +1313,7 @@ jobs:
           bash scripts/e2e/naming_test/teardown_test.sh
           bash scripts/e2e/naming_test/collect_diagnostics_test.sh
           bash scripts/e2e/naming_test/workflow_epic010_test.sh
+          bash scripts/e2e/naming_test/workflow_epic005_test.sh
 
       - name: Verify naming self-check
         run: bash scripts/e2e/naming.sh self-check

@@ -8,10 +8,9 @@
 # max_age_days). Live runs are left untouched. Deleting an RG cascades its
 # RG-scoped role assignments, containing runtime grants (XSUB-003).
 #
-# The reap logic lives in scripts/e2e/teardown.sh (reap), so it is unit-tested
-# and reused by cleanup_xs. The broader same-subscription reaper hardening
-# (dangling-assignment sweep, dry-run report) is EPIC-005 (ITEM-017); this file
-# provides the dual-subscription reaper seam EPIC-010 wires cleanup into.
+# The reap logic lives in scripts/e2e/teardown.sh (reap), so it is unit-tested.
+# It also removes dangling pnc-e2e assignments after verifying their scoped RG
+# no longer exists, while preserving assignments for live runs (ITEM-017).
 #
 # Traceability: ITEM-040, FR-017, RD-020, XSUB-003, AC-008, AC-015.
 # =============================================================================
@@ -63,5 +62,5 @@ jobs:
           tenant-id: ${{ secrets.AZURE_SECONDARY_TENANT_ID }}
           subscription-id: ${{ env.SECONDARY_SUBSCRIPTION_ID }}
 
-      - name: Reap expired run-tagged resource groups in both subscriptions
+      - name: Reap expired RGs and dangling run assignments in both subscriptions
         run: bash scripts/e2e/teardown.sh reap

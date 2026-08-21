@@ -64,9 +64,42 @@ for a in "$@"; do
   prev="$a"
 done
 guid_of(){ printf '%s|%s' "$1" "$2" | sha256sum | cut -c1-32; }
+if [[ "$1 $2 $3" == "role assignment delete" ]]; then
+  if [[ -n "$ids" ]]; then g="$(basename "$ids")"; touch "$S/deleted/ra-$g"; fi
+  exit 0
+fi
+if [[ "$1 $2 $3" == "role assignment list" ]]; then
+  if [[ -n "${MOCK_REAPER_ASSIGNMENTS:-}" && -z "$scope" ]]; then
+    jq -n --arg sub "$sub" '[
+      {id:("/subscriptions/"+$sub+"/providers/Microsoft.Authorization/roleAssignments/dangling-assignment"),
+       scope:("/subscriptions/"+$sub+"/resourceGroups/pnc-e2e-xs-20200101-dead001-eastus2euap"),
+       roleDefinitionName:"Network Contributor"},
+      {id:("/subscriptions/"+$sub+"/providers/Microsoft.Authorization/roleAssignments/live-assignment"),
+       scope:("/subscriptions/"+$sub+"/resourceGroups/pnc-e2e-ss-20260820-live001-eastus2euap"),
+       roleDefinitionName:"Network Contributor"}
+    ]'
+  elif [[ -n "$scope" ]]; then
+    g="$(guid_of "$assignee" "$scope")"
+    if compgen -G "$S/deleted/ra-*" >/dev/null || [[ -f "$S/deleted/ra-$g" ]]; then echo '[]'; else
+      jq -n --arg s "$scope" --arg pid "$assignee" \
+        '[{scope:$s,roleDefinitionName:"Network Contributor",principalId:$pid}]'
+    fi
+  else
+    echo '[]'
+  fi
+  exit 0
+fi
 case "$1 $2" in
   "group delete") touch "$S/deleted/${name}"; exit 0 ;;
   "group exists")
+    if [[ -n "${MOCK_REAPER_ASSIGNMENTS:-}" ]]; then
+      case "$name" in
+        pnc-e2e-ss-20260820-live001-eastus2euap) echo "true" ;;
+        pnc-e2e-xs-20200101-dead001-eastus2euap) echo "false" ;;
+        *) echo "false" ;;
+      esac
+      exit 0
+    fi
     if [[ -f "$S/deleted/${name}" && "$name" != "${MOCK_GROUP_LINGERS:-__none__}" ]]; then echo "false"; else echo "true"; fi
     exit 0 ;;
   "group list")
@@ -77,16 +110,6 @@ case "$1 $2" in
       [ {name:$exp,  tags:{"validation-purpose":"pnc-e2e","managed-by":"github-actions","validation-date-utc":"20200101"}},
         {name:$live, tags:{"validation-purpose":"pnc-e2e","managed-by":"github-actions","validation-date-utc":$today}},
         {name:"unrelated-rg", tags:{"owner":"someone-else"}} ]'
-    exit 0 ;;
-  "role assignment delete")
-    if [[ -n "$ids" ]]; then g="$(basename "$ids")"; touch "$S/deleted/ra-$g"; fi; exit 0 ;;
-  "role assignment list")
-    if [[ -n "$scope" ]]; then
-      g="$(guid_of "$assignee" "$scope")"
-      if [[ -f "$S/deleted/ra-$g" ]]; then echo '[]'; else
-        jq -n --arg s "$scope" --arg pid "$assignee" '[{scope:$s,roleDefinitionName:"Network Contributor",principalId:$pid}]'
-      fi
-    else echo '[]'; fi
     exit 0 ;;
   "account set") exit 0 ;;
   *) exit 0 ;;
@@ -170,6 +193,28 @@ assert_eq "each recorded assignment is deleted by id" "2" "$(grep -c 'role assig
 assert_eq "manifest records the assignment cleanup verified (AC-027)" "true" \
   "$(manifest::get "$seed_manifest" '.cleanup.xs.rbac.verified')"
 
+echo "== ITEM-016: same-subscription cleanup deletes both RGs + recorded assignments =="
+ss_dir="${WORK}/ss"; ss_manifest="${ss_dir}/run-manifest.json"; ss_state="${ss_dir}/state"; ss_az="${ss_dir}/az.log"
+mkdir -p "$ss_dir" "$ss_state"; : > "$ss_az"
+manifest::init "$ss_manifest"
+SS_A_RG="pnc-e2e-ss-20260820-vahdkc-eastus2euap"
+manifest::put_json "$ss_manifest" rbac.ss "$(jq -n \
+  --arg s "/subscriptions/${PRIM}/resourceGroups/${SS_A_RG}" \
+  '{role:"Network Contributor",scope:$s,subscription:"'"$PRIM"'",
+    assignments:[{principal_id:"p1",assignment_id:($s+"/providers/Microsoft.Authorization/roleAssignments/cccc"),scope:$s},
+                 {principal_id:"p2",assignment_id:($s+"/providers/Microsoft.Authorization/roleAssignments/dddd"),scope:$s}]}')"
+env MOCK_AZ_LOG="$ss_az" MOCK_STATE="$ss_state" AZ_BIN="${MOCKBIN}/az" MOCK_TODAY="$TODAY" \
+  REPO="Azure/pod-nsg-controller" RUN_ID="10293847561" RUN_ATTEMPT="1" DATE_UTC="20260820" \
+  GIT_SHA="8504b2e1c3a9" GIT_REF="refs/heads/test" MANIFEST_PATH="$ss_manifest" TOPOLOGY=ss \
+  DELETE_ATTEMPTS="2" DELETE_DELAY="0" VERIFY_ATTEMPTS="2" VERIFY_DELAY="0" REMOVE_ATTEMPTS="2" REMOVE_DELAY="0" \
+  PRIMARY_SUBSCRIPTION_ID="$PRIM" bash "$TEARDOWN_SH" cleanup >"${ss_dir}/log" 2>&1
+rc_ss=$?
+assert_eq "ss cleanup succeeds" "0" "$rc_ss"
+assert_eq "ss cleanup deletes both regional RGs" "2" "$(grep -c 'group delete.*pnc-e2e-ss-' "$ss_az")"
+assert_eq "ss cleanup deletes every recorded assignment by ID" "2" "$(grep -c 'role assignment delete' "$ss_az")"
+assert_eq "ss cleanup verifies assignment removal" "true" "$(manifest::get "$ss_manifest" '.cleanup.ss.rbac.verified')"
+assert_eq "ss cleanup status passes" "pass" "$(manifest::get "$ss_manifest" '.cleanup.ss.status')"
+
 echo "== debug retention is FORBIDDEN for release runs (RD-007) =="
 run_td keep_rel cleanup PRIMARY_SUBSCRIPTION_ID="$PRIM" SECONDARY_SUBSCRIPTION_ID="$SEC" KEEP_RESOURCES=true RELEASE_REQUESTED=true
 assert_eq "release + KEEP_RESOURCES is rejected" "1" "$([[ $RC -ne 0 ]] && echo 1 || echo 0)"
@@ -191,6 +236,12 @@ assert_eq "reaper does NOT delete the live (recent) run RG" "0" \
   "$(grep -c 'group delete.*pnc-e2e-xs-live-run' "$AZLOG")"
 assert_eq "reaper never touches an unrelated RG" "0" "$(grep -c 'group delete.*unrelated-rg' "$AZLOG")"
 assert_eq "reaper uses no 'az account set' (RD-020)" "0" "$(az_account_set)"
+
+echo "== ITEM-017: reaper removes dangling run assignments but preserves live-run assignments =="
+run_td dangling reap PRIMARY_SUBSCRIPTION_ID="$PRIM" SECONDARY_SUBSCRIPTION_ID="$SEC" MOCK_REAPER_ASSIGNMENTS=true
+assert_eq "dangling-assignment sweep succeeds" "0" "$RC"
+assert_eq "one dangling run assignment per subscription is deleted" "2" "$(grep -c 'role assignment delete.*dangling-assignment' "$AZLOG")"
+assert_eq "live-run assignment is preserved" "0" "$(grep -c 'role assignment delete.*live-assignment' "$AZLOG")"
 
 echo
 printf 'teardown_test: %s passed, %s failed\n' "$PASS" "$FAIL"

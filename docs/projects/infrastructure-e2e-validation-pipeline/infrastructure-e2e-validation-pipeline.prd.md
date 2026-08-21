@@ -613,14 +613,14 @@ Each scenario below is a discrete, independently-reported validation gate derive
 | ITEM-013 | Implement `run-validation.sh` `test1`..`test4` exactly per `docs/multi-cluster-test-setup.md` pass criteria, using `kubectl` scale/status and `az rest` prefix-set verification, with bounded reconciliation polling. Validation: TEST-004..TEST-007 assertions pass; zero `412 PreconditionFailed` in logs for Tests 2 & 4. | Done | scripts/e2e/run-validation.sh, docs/multi-cluster-test-setup.md |
 | ITEM-014 | Add the `validate_multicluster` job invoking the four tests (and optionally `test/e2e/e2e_test.go` overlapping assertions); publish machine-readable per-test results into `run-manifest.json`. Validation: job fails if any pass criterion is unmet; results recorded. | Done | .github/workflows/e2e-validation-release.yml, test/e2e/e2e_test.go |
 
-- EPIC-005: Diagnostics, cleanup, and reaper — always-on capture and verified teardown with release gating.
+- EPIC-005 (Status: Done): Diagnostics, cleanup, and reaper — always-on capture and verified teardown with release gating.
 
 | Task | Description | Status | Relevant Files |
 |------|-------------|--------|----------------|
-| ITEM-015 | Implement `collect-diagnostics.sh` (controller logs, `PodASGMapping` status, pod IPs, ASG prefix sets via `az rest`, node status) and a `diagnostics` job with `if: always()` uploading artifacts (retention 30 days); it MUST also invoke `collect-cni-diagnostics.sh` (EPIC-009) so CNI/network evidence is always captured. Validation: artifacts present on both pass and forced-fail runs (AC-007). | Not Started | scripts/e2e/collect-diagnostics.sh, scripts/e2e/collect-cni-diagnostics.sh, .github/workflows/e2e-validation-release.yml |
-| ITEM-016 | Implement topology-aware teardown using explicit subscriptions; delete/verify all RGs and recorded assignment IDs in both subscriptions. Debug retention is forbidden for release runs. | Not Started | scripts/e2e/teardown.sh, scripts/poc/teardown-poc.sh |
-| ITEM-017 | Implement a dual-subscription reaper for expired tagged RGs and dangling run assignments. Validation: stale fixtures in each subscription are removed while live runs remain. | Not Started | .github/workflows/e2e-reaper.yml, scripts/e2e/naming.sh |
-| ITEM-018 | Gate release on lint, `ss` Tests 1–4, TTS, `ss` cleanup, XSUB-001..003 plus `xs` Tests 1–4, and `xs` cleanup. Validation: every individual forced failure skips release. | Not Started | .github/workflows/e2e-validation-release.yml |
+| ITEM-015 | Implement `collect-diagnostics.sh` (controller logs, `PodASGMapping` status, pod IPs, ASG prefix sets via `az rest`, node status) and a `diagnostics` job with `if: always()` uploading artifacts (retention 30 days); it MUST also invoke `collect-cni-diagnostics.sh` (EPIC-009) so CNI/network evidence is always captured. Validation: artifacts present on both pass and forced-fail runs (AC-007). | Done | scripts/e2e/collect-diagnostics.sh, scripts/e2e/collect-cni-diagnostics.sh, .github/workflows/e2e-validation-release.yml |
+| ITEM-016 | Implement topology-aware teardown using explicit subscriptions; delete/verify all RGs and recorded assignment IDs in both subscriptions. Debug retention is forbidden for release runs. | Done | scripts/e2e/teardown.sh, scripts/poc/teardown-poc.sh |
+| ITEM-017 | Implement a dual-subscription reaper for expired tagged RGs and dangling run assignments. Validation: stale fixtures in each subscription are removed while live runs remain. | Done | .github/workflows/e2e-reaper.yml, scripts/e2e/naming.sh |
+| ITEM-018 | Gate release on lint, `ss` Tests 1–4, TTS, `ss` cleanup, XSUB-001..003 plus `xs` Tests 1–4, and `xs` cleanup. Validation: every individual forced failure skips release. | Done | .github/workflows/e2e-validation-release.yml |
 
 - EPIC-006: Release promotion — digest-preserving public publish with signing/provenance.
 

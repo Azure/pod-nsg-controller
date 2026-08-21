@@ -193,6 +193,28 @@ assert_nonzero "explicit validate_cross_subscription=failure blocks release" "$R
 run_xs_promote xs_env_clean pass pass RELEASE_VERSION=v1.2.3 CLEANUP_XS_STATUS=failure
 assert_nonzero "explicit cleanup_xs=failure blocks release" "$RC"
 
+echo "== ITEM-018: complete release gate fails closed for every required result =="
+COMPLETE_ENV=(
+  REQUIRE_COMPLETE=1
+  LINT_STATUS=success
+  VALIDATE_SS_STATUS=success
+  VALIDATE_TT_STATUS=success
+  CLEANUP_SS_STATUS=success
+  VALIDATE_XS_STATUS=success
+  CLEANUP_XS_STATUS=success
+)
+run_xs_promote complete_ok pass pass RELEASE_VERSION=v1.2.3 "${COMPLETE_ENV[@]}"
+assert_eq "complete gate opens only when every required result passes" "0" "$RC"
+for failed_gate in LINT_STATUS VALIDATE_SS_STATUS VALIDATE_TT_STATUS CLEANUP_SS_STATUS VALIDATE_XS_STATUS CLEANUP_XS_STATUS; do
+  failure_env=("${COMPLETE_ENV[@]}")
+  for i in "${!failure_env[@]}"; do
+    [[ "${failure_env[i]}" == "${failed_gate}="* ]] && failure_env[i]="${failed_gate}=failure"
+  done
+  run_xs_promote "complete_${failed_gate}" pass pass RELEASE_VERSION=v1.2.3 "${failure_env[@]}"
+  assert_nonzero "forced ${failed_gate} failure blocks release" "$RC"
+  assert_eq "forced ${failed_gate} failure promotes neither artifact" "0" "$(grep -c 'acr import' "$AZLOG")"
+done
+
 echo
 printf 'promote_release_test: %s passed, %s failed\n' "$PASS" "$FAIL"
 (( FAIL == 0 ))

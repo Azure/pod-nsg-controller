@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # =============================================================================
-# collect-diagnostics.sh - BEST-EFFORT cross-subscription (xs) diagnostics
-# collector for the always() diagnostics_xs job (EPIC-010 / ITEM-040 / FILE-020).
+# collect-diagnostics.sh - BEST-EFFORT topology-aware diagnostics collector for
+# the always() diagnostics_ss / diagnostics_xs jobs (ITEM-015 / ITEM-040).
 #
 # Captures, on every run (pass or fail), the evidence needed to debug a
 # cross-subscription reconciliation failure into an uploadable directory, from
@@ -18,16 +18,12 @@
 # so no credential is ever written to an artifact (NFR-012). Every Azure call
 # carries an explicit --subscription; there is NO `az account set` (RD-020).
 #
-# SCOPE (EPIC-010): the cross-subscription collector + diagnostics_xs wiring.
-# The general same-subscription diagnostics job (ITEM-015) is EPIC-005; this
-# file provides the xs collector it and diagnostics_xs share.
-#
 # Usage: collect-diagnostics.sh <all|clusters|membership|names|help>
 # Inputs (env): TOPOLOGY (default xs), PRIMARY_SUBSCRIPTION_ID [req],
 #   SECONDARY_SUBSCRIPTION_ID, DIAG_DIR (default ./diagnostics), MANIFEST_PATH,
 #   AZ_BIN, KUBECONFIG_ON_NODE, CONTROLLER_NAMESPACE, CONTROLLER_LOG_SELECTOR.
 #
-# Traceability: ITEM-040, FR-006, FR-007, AC-007, NFR-012, RD-020, CON-001, CON-003.
+# Traceability: ITEM-015, ITEM-040, FR-006, AC-007, NFR-012, RD-020, CON-001, CON-003.
 # =============================================================================
 set -uo pipefail
 export LC_ALL=C
@@ -127,11 +123,19 @@ diag::all() {
   diag::cluster CA A
   diag::cluster CB B
   diag::membership
+  # ITEM-015: the general diagnostics artifact always includes the
+  # transparent-tunnel CNI/network evidence collected by EPIC-009. Keep this
+  # best-effort so an unavailable node never suppresses the core captures.
+  TOPOLOGY="$TCODE" PRIMARY_SUBSCRIPTION_ID="$PRIMARY_SUBSCRIPTION_ID" \
+    SECONDARY_SUBSCRIPTION_ID="$SECONDARY_SUBSCRIPTION_ID" AZ_BIN="$AZ_BIN" \
+    MANIFEST_PATH="$MANIFEST_PATH" CNI_DIAG_DIR="${DIAG_DIR}/cni" \
+    bash "${HERE}/collect-cni-diagnostics.sh" all \
+    || log::warn "CNI/network diagnostics collection failed (best-effort)"
   [[ -f "$MANIFEST_PATH" ]] || manifest::init "$MANIFEST_PATH"
-  manifest::put_json "$MANIFEST_PATH" diagnostics.xs \
+  manifest::put_json "$MANIFEST_PATH" "diagnostics.${TCODE}" \
     "$(jq -n --arg d "$DIAG_DIR" '{dir:$d, clusters:["A","B"]}')" || true
   gha::output diag_dir "$DIAG_DIR"
-  log::info "cross-subscription diagnostics collected under ${DIAG_DIR} (best-effort)"
+  log::info "${TCODE} diagnostics collected under ${DIAG_DIR} (best-effort)"
 }
 
 diag::names() {
@@ -145,7 +149,7 @@ diag::usage() {
   cat <<'USAGE'
 Usage: collect-diagnostics.sh <command>
 
-BEST-EFFORT cross-subscription (xs) diagnostics collector for diagnostics_xs.
+BEST-EFFORT topology-aware diagnostics collector for diagnostics_ss/diagnostics_xs.
 kubectl runs ON each control-plane node via `az vm run-command`; ASG membership
 is read from the runner with `az rest`. Captured evidence is sanitized (tokens
 redacted). Always exits 0.

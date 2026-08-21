@@ -120,6 +120,16 @@ assert_eq "collection still exits 0 when Cluster A is unreachable" "0" "$RC"
 assert_eq "Cluster B evidence is still captured despite Cluster A failing" "1" \
   "$([[ -s "${WORK}/partial/diagnostics/clusterB-nodes.txt" ]] && echo 1 || echo 0)"
 
+echo "== ITEM-015: same-subscription diagnostics include CNI/network evidence =="
+run_diag ss all TOPOLOGY=ss PRIMARY_SUBSCRIPTION_ID="$PRIM"
+assert_eq "same-subscription collection exits 0" "0" "$RC"
+assert_match "both ss clusters are read with the explicit primary subscription" \
+  "run-command invoke .*--subscription ${PRIM}\b" "$(grep 'run-command' "$AZLOG" | tr '\n' '|')"
+assert_eq "same-subscription manifest entry is recorded" "1" \
+  "$([[ -n "$(manifest::get "$MANIFEST" '.diagnostics.ss.dir // empty')" ]] && echo 1 || echo 0)"
+assert_eq "collect-cni-diagnostics.sh is invoked into the diagnostics artifact" "1" \
+  "$([[ -s "${WORK}/ss/diagnostics/cni/controller-logs.txt" ]] && echo 1 || echo 0)"
+
 echo
 printf 'collect_diagnostics_test: %s passed, %s failed\n' "$PASS" "$FAIL"
 (( FAIL == 0 ))

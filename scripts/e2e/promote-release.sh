@@ -17,9 +17,8 @@
 #   * cosign keyless signing, SBOM attach, SLSA provenance      -> ITEM-020
 #   * anonymous-pull enable + unauthenticated pull verification -> ITEM-021
 #   * immutability assertion (NFR-009) + moving tags            -> ITEM-019
-#   * the broader release gate (ss/xs Tests 1-4, cleanups)      -> ITEM-018
-# The gate here is composable: it enforces the ITEM-035 additions (validate_tt +
-# atomic set); ITEM-018 ANDs the remaining conditions onto it.
+# The gate is composable: ITEM-018 enables REQUIRE_COMPLETE to add lint,
+# same-subscription validation/cleanup, and the EPIC-010 xs gates.
 #
 # Inputs (environment):
 #   RELEASE_VERSION            semantic version tag, e.g. v1.2.3           [req]
@@ -32,12 +31,16 @@
 #                              (success|failure|...); when unset, read from manifest
 #   VALIDATE_XS_STATUS         optional override: validate_cross_subscription result
 #   CLEANUP_XS_STATUS          optional override: cleanup_xs result
+#   LINT_STATUS                naming-tests/lint job result
+#   VALIDATE_SS_STATUS         validate_multicluster job result
+#   CLEANUP_SS_STATUS          cleanup_ss job result
 #   REQUIRE_XS                 force the xs gate conditions (1) even if not in scope
+#   REQUIRE_COMPLETE           force all ITEM-018 conditions (1)
 #   AZ_BIN ORAS_BIN            tool seams (default az/oras)
 #
 # Commands: release(default) | gate | names | help
 #
-# Traceability: ITEM-035, ITEM-040, FR-024, FR-025, FR-007, NFR-011, AC-023,
+# Traceability: ITEM-018, ITEM-035, ITEM-040, FR-008, FR-024, FR-025, FR-007, NFR-011, AC-023,
 # AC-009, AC-008, TEST-009, RD-013/RD-014, RD-007, CON-007, PRD Section 3.6.
 # =============================================================================
 set -euo pipefail
@@ -58,7 +61,11 @@ CNI_PUBLIC_REPO="${CNI_PUBLIC_REPO:-pod-nsg-cni-transparent-tunnel}"
 VALIDATE_TT_STATUS="${VALIDATE_TT_STATUS:-}"
 VALIDATE_XS_STATUS="${VALIDATE_XS_STATUS:-}"
 CLEANUP_XS_STATUS="${CLEANUP_XS_STATUS:-}"
+LINT_STATUS="${LINT_STATUS:-}"
+VALIDATE_SS_STATUS="${VALIDATE_SS_STATUS:-}"
+CLEANUP_SS_STATUS="${CLEANUP_SS_STATUS:-}"
 REQUIRE_XS="${REQUIRE_XS:-0}"
+REQUIRE_COMPLETE="${REQUIRE_COMPLETE:-0}"
 AZ_BIN="${AZ_BIN:-az}"
 ORAS_BIN="${ORAS_BIN:-oras}"
 
@@ -86,6 +93,22 @@ promote::_derive() {
 promote::gate() {
   promote::_derive
   local rc=0
+
+  if [[ "$REQUIRE_COMPLETE" == "1" ]]; then
+    local label status
+    for label in lint validate_ss cleanup_ss; do
+      case "$label" in
+        lint) status="$LINT_STATUS" ;;
+        validate_ss) status="$VALIDATE_SS_STATUS" ;;
+        cleanup_ss) status="$CLEANUP_SS_STATUS" ;;
+      esac
+      case "$status" in
+        pass|success|Success) : ;;
+        "") log::error "release gate: ${label} result is ABSENT (fail closed; ITEM-018)"; rc=1 ;;
+        *) log::error "release gate: ${label} did NOT pass (status='${status}') - blocking release (ITEM-018)"; rc=1 ;;
+      esac
+    done
+  fi
 
   # validate_tt gate: an explicit job-result override wins; else the manifest.
   local tt="$VALIDATE_TT_STATUS"
@@ -220,7 +243,7 @@ Usage: promote-release.sh <command>
 Commands:
   release   Gate on validate_tt + atomic set, then promote BOTH artifacts by
             digest under one \${SEMVER} (no rebuild). Default.
-  gate      Evaluate the release gate only (validate_tt + both digests present).
+  gate      Evaluate the configured validation/cleanup gates + both digests.
   names     Print resolved release coordinates.
   help      Show this help.
 
