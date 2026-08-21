@@ -30,12 +30,15 @@
 #   CNI_PUBLIC_REPO            default pod-nsg-cni-transparent-tunnel
 #   VALIDATE_TT_STATUS         optional override from the job's needs result
 #                              (success|failure|...); when unset, read from manifest
+#   VALIDATE_XS_STATUS         optional override: validate_cross_subscription result
+#   CLEANUP_XS_STATUS          optional override: cleanup_xs result
+#   REQUIRE_XS                 force the xs gate conditions (1) even if not in scope
 #   AZ_BIN ORAS_BIN            tool seams (default az/oras)
 #
 # Commands: release(default) | gate | names | help
 #
-# Traceability: ITEM-035, FR-024, NFR-011, AC-023, AC-009, TEST-009,
-# RD-013/RD-014, CON-007, PRD Section 3.6.
+# Traceability: ITEM-035, ITEM-040, FR-024, FR-025, FR-007, NFR-011, AC-023,
+# AC-009, AC-008, TEST-009, RD-013/RD-014, RD-007, CON-007, PRD Section 3.6.
 # =============================================================================
 set -euo pipefail
 export LC_ALL=C
@@ -53,6 +56,9 @@ MANIFEST_PATH="${MANIFEST_PATH:-run-manifest.json}"
 CONTROLLER_PUBLIC_REPO="${CONTROLLER_PUBLIC_REPO:-pod-nsg-controller}"
 CNI_PUBLIC_REPO="${CNI_PUBLIC_REPO:-pod-nsg-cni-transparent-tunnel}"
 VALIDATE_TT_STATUS="${VALIDATE_TT_STATUS:-}"
+VALIDATE_XS_STATUS="${VALIDATE_XS_STATUS:-}"
+CLEANUP_XS_STATUS="${CLEANUP_XS_STATUS:-}"
+REQUIRE_XS="${REQUIRE_XS:-0}"
 AZ_BIN="${AZ_BIN:-az}"
 ORAS_BIN="${ORAS_BIN:-oras}"
 
@@ -65,6 +71,12 @@ promote::_derive() {
   CNI_DIGEST="$(manifest::get "$MANIFEST_PATH" '.artifacts.cni.digest // empty')"
   CNI_REFERENCE="$(manifest::get "$MANIFEST_PATH" '.artifacts.cni.reference // empty')"
   TT_STATUS_MANIFEST="$(manifest::get "$MANIFEST_PATH" '.validate.tt.status // empty')"
+  # EPIC-010: cross-subscription validation + cleanup results, and whether the
+  # xs topology is in scope for this run (release forces ss,xs).
+  XS_STATUS_MANIFEST="$(manifest::get "$MANIFEST_PATH" '.validate.xs.cross_subscription // empty')"
+  CLEANUP_XS_STATUS_MANIFEST="$(manifest::get "$MANIFEST_PATH" '.cleanup.xs.status // empty')"
+  XS_IN_SCOPE_MANIFEST="$(manifest::get "$MANIFEST_PATH" '[.run.validation_topologies[]? | select(. == "xs")] | length')"
+  XS_IN_SCOPE_MANIFEST="${XS_IN_SCOPE_MANIFEST//[^0-9]/}"; XS_IN_SCOPE_MANIFEST="${XS_IN_SCOPE_MANIFEST:-0}"
   PROMOTE_DERIVED=1
 }
 
@@ -88,7 +100,36 @@ promote::gate() {
   [[ "$CTRL_DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]] || { log::error "release gate: controller digest missing/invalid (got '${CTRL_DIGEST:-<none>}')"; rc=1; }
   [[ "$CNI_DIGEST"  =~ ^sha256:[0-9a-f]{64}$ ]] || { log::error "release gate: CNI digest missing/invalid (NFR-011 atomic set; got '${CNI_DIGEST:-<none>}')"; rc=1; }
 
-  if (( rc == 0 )); then log::info "release gate OPEN: validate_tt=${tt}, controller+CNI digests present (atomic set)"; fi
+  # EPIC-010 / ITEM-040: AND validate_cross_subscription and cleanup_xs onto the
+  # gate WHEN the xs topology is in scope (release forces ss,xs). When xs is not
+  # in scope (e.g. the ITEM-035 ss-only seam tests) these conditions are skipped,
+  # keeping the composable gate backward compatible.
+  local xs_required=0
+  [[ -n "$VALIDATE_XS_STATUS" || -n "$CLEANUP_XS_STATUS" ]] && xs_required=1
+  (( XS_IN_SCOPE_MANIFEST > 0 )) && xs_required=1
+  [[ "$REQUIRE_XS" == "1" ]] && xs_required=1
+  if (( xs_required == 1 )); then
+    local xs="$VALIDATE_XS_STATUS"; [[ -n "$xs" ]] || xs="$XS_STATUS_MANIFEST"
+    case "$xs" in
+      pass|success|Success) : ;;
+      "") log::error "release gate: validate_cross_subscription result is ABSENT (fail closed; AC-009/FR-025)"; rc=1 ;;
+      *)  log::error "release gate: validate_cross_subscription did NOT pass (status='${xs}') - blocking release (TEST-009/AC-009)"; rc=1 ;;
+    esac
+    local cx="$CLEANUP_XS_STATUS"; [[ -n "$cx" ]] || cx="$CLEANUP_XS_STATUS_MANIFEST"
+    case "$cx" in
+      pass|success|Success) : ;;
+      "") log::error "release gate: cleanup_xs result is ABSENT (fail closed; FR-007/AC-008)"; rc=1 ;;
+      *)  log::error "release gate: cleanup_xs did NOT pass (status='${cx}') - blocking release (RD-007/AC-008)"; rc=1 ;;
+    esac
+  fi
+
+  if (( rc == 0 )); then
+    if (( xs_required == 1 )); then
+      log::info "release gate OPEN: validate_tt=${tt}, validate_cross_subscription + cleanup_xs pass, controller+CNI digests present (atomic set)"
+    else
+      log::info "release gate OPEN: validate_tt=${tt}, controller+CNI digests present (atomic set)"
+    fi
+  fi
   return "$rc"
 }
 
@@ -168,6 +209,8 @@ promote::names() {
   promote::_derive
   printf 'release_version=%s\ncontroller_digest=%s\ncni_digest=%s\nvalidate_tt=%s\npublic_acr=%s\n' \
     "$RELEASE_VERSION" "$CTRL_DIGEST" "$CNI_DIGEST" "${VALIDATE_TT_STATUS:-$TT_STATUS_MANIFEST}" "$PUBLIC_ACR"
+  printf 'validate_cross_subscription=%s\ncleanup_xs=%s\nxs_in_scope=%s\n' \
+    "${VALIDATE_XS_STATUS:-$XS_STATUS_MANIFEST}" "${CLEANUP_XS_STATUS:-$CLEANUP_XS_STATUS_MANIFEST}" "$XS_IN_SCOPE_MANIFEST"
 }
 
 promote::usage() {

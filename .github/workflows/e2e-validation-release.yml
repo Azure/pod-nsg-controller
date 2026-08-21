@@ -670,6 +670,515 @@ jobs:
           path: run-manifest.json
           retention-days: 30
 
+  # ===========================================================================
+  # EPIC-010 - Cross-subscription topology (ITEM-036/037/038/039/040).
+  #
+  # Runs the `xs` topology AFTER the `ss` multicluster validation (PAT-003/RD-019:
+  # ss then xs, sequential, to cap EUAP quota) with Cluster A + shared ASGs in the
+  # PRIMARY subscription and Cluster B in the SECONDARY. Two SEPARATE OIDC
+  # identities authenticate to each subscription and EVERY Azure call carries an
+  # explicit --subscription (RD-020). All jobs are gated on the xs topology being
+  # in scope (release forces ss,xs) and skipped on pull_request (RD-009).
+  # ---------------------------------------------------------------------------
+
+  # ITEM-036: fail BEFORE provisioning unless the two subscriptions are
+  # distinct/valid, Microsoft.Network + the addressPrefixSets EUAP api are
+  # available, and both subscriptions have EUAP VM quota (FR-025/AC-024).
+  preflight_xs:
+    name: Cross-subscription preflight (xs)
+    needs: meta
+    if: ${{ github.event_name != 'pull_request' && contains(needs.meta.outputs.validation_topologies, 'xs') }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    environment: azure-e2e
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      PRIMARY_SUBSCRIPTION_ID: ${{ inputs.primary_subscription_id || vars.E2E_PRIMARY_SUBSCRIPTION_ID }}
+      SECONDARY_SUBSCRIPTION_ID: ${{ inputs.secondary_subscription_id || vars.E2E_SECONDARY_SUBSCRIPTION_ID }}
+      PRIMARY_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
+      SECONDARY_TENANT_ID: ${{ secrets.AZURE_SECONDARY_TENANT_ID }}
+      VM_QUOTA_FAMILY: standardDSv5Family
+      VM_QUOTA_REQUIRED: "16"
+    steps:
+      - uses: actions/checkout@v4
+
+      # Separate OIDC identities per subscription (RD-020/SEC-002).
+      - name: Azure Login (primary OIDC)
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ env.PRIMARY_SUBSCRIPTION_ID }}
+
+      - name: Azure Login (secondary OIDC)
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_SECONDARY_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_SECONDARY_TENANT_ID }}
+          subscription-id: ${{ env.SECONDARY_SUBSCRIPTION_ID }}
+
+      - name: Validate identities, providers, and EUAP quota (both subscriptions)
+        run: |
+          source scripts/e2e/lib.sh
+          lib::assert_distinct_subscriptions "${PRIMARY_SUBSCRIPTION_ID}" "${SECONDARY_SUBSCRIPTION_ID}"
+          lib::az_subscription_validate az "${PRIMARY_SUBSCRIPTION_ID}" "${PRIMARY_TENANT_ID}"
+          lib::az_subscription_validate az "${SECONDARY_SUBSCRIPTION_ID}" "${SECONDARY_TENANT_ID}"
+          lib::az_provider_preflight az "${PRIMARY_SUBSCRIPTION_ID}" Microsoft.Network applicationSecurityGroups 2025-07-01
+          lib::az_provider_preflight az "${SECONDARY_SUBSCRIPTION_ID}" Microsoft.Network
+          lib::az_vm_quota_preflight az "${PRIMARY_SUBSCRIPTION_ID}" eastus2euap "${VM_QUOTA_FAMILY}" "${VM_QUOTA_REQUIRED}"
+          lib::az_vm_quota_preflight az "${SECONDARY_SUBSCRIPTION_ID}" centraluseuap "${VM_QUOTA_FAMILY}" "${VM_QUOTA_REQUIRED}"
+
+  # ITEM-037: sequential provisioning - Cluster A + shared ASGs in PRIMARY first,
+  # then Cluster B in SECONDARY. Reuses the parameterized provision-cluster.sh
+  # (explicit --subscription; ASGs only in the primary region RG).
+  provision_xs_primary:
+    name: Provision xs / Cluster A + shared ASGs (primary)
+    needs: [meta, preflight_xs, validate_multicluster]
+    if: ${{ github.event_name != 'pull_request' && contains(needs.meta.outputs.validation_topologies, 'xs') }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    environment: azure-e2e
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      TOPOLOGY: xs
+      REGION: eastus2euap
+      PRIMARY_SUBSCRIPTION_ID: ${{ inputs.primary_subscription_id || vars.E2E_PRIMARY_SUBSCRIPTION_ID }}
+      VM_QUOTA_FAMILY: standardDSv5Family
+      VM_QUOTA_REQUIRED: "16"
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download run-manifest foundation
+        uses: actions/download-artifact@v4
+        with:
+          name: run-manifest
+          path: .
+
+      - name: Azure Login (primary OIDC)
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ env.PRIMARY_SUBSCRIPTION_ID }}
+
+      - name: VM quota preflight (gates provisioning)
+        run: |
+          source scripts/e2e/lib.sh
+          # shellcheck disable=SC2153  # REGION comes from the job env (constant)
+          lib::az_vm_quota_preflight az "${PRIMARY_SUBSCRIPTION_ID}" "${REGION}" \
+            "${VM_QUOTA_FAMILY}" "${VM_QUOTA_REQUIRED}"
+
+      - name: Provision Cluster A + shared ASGs (explicit subscription)
+        env:
+          SUBSCRIPTION_ID: ${{ env.PRIMARY_SUBSCRIPTION_ID }}
+          REPO: ${{ github.repository }}
+          RUN_ID: ${{ github.run_id }}
+          RUN_ATTEMPT: ${{ github.run_attempt }}
+          DATE_UTC: ${{ needs.meta.outputs.date_utc }}
+          GIT_SHA: ${{ github.sha }}
+          GIT_REF: ${{ github.ref }}
+          MANIFEST_PATH: run-manifest.json
+        run: bash scripts/e2e/provision-cluster.sh all
+
+      - name: Upload provisioning manifest (xs primary)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: run-manifest-provision-xs-eastus2euap
+          path: run-manifest.json
+          retention-days: 30
+
+  provision_xs_secondary:
+    name: Provision xs / Cluster B (secondary)
+    needs: [meta, provision_xs_primary]
+    if: ${{ github.event_name != 'pull_request' && contains(needs.meta.outputs.validation_topologies, 'xs') }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    environment: azure-e2e
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      TOPOLOGY: xs
+      REGION: centraluseuap
+      SECONDARY_SUBSCRIPTION_ID: ${{ inputs.secondary_subscription_id || vars.E2E_SECONDARY_SUBSCRIPTION_ID }}
+      VM_QUOTA_FAMILY: standardDSv5Family
+      VM_QUOTA_REQUIRED: "16"
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download xs primary provisioning manifest
+        uses: actions/download-artifact@v4
+        with:
+          name: run-manifest-provision-xs-eastus2euap
+          path: .
+
+      - name: Azure Login (secondary OIDC)
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_SECONDARY_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_SECONDARY_TENANT_ID }}
+          subscription-id: ${{ env.SECONDARY_SUBSCRIPTION_ID }}
+
+      - name: VM quota preflight (gates provisioning)
+        run: |
+          source scripts/e2e/lib.sh
+          # shellcheck disable=SC2153  # REGION comes from the job env (constant)
+          lib::az_vm_quota_preflight az "${SECONDARY_SUBSCRIPTION_ID}" "${REGION}" \
+            "${VM_QUOTA_FAMILY}" "${VM_QUOTA_REQUIRED}"
+
+      - name: Provision Cluster B (explicit secondary subscription)
+        env:
+          SUBSCRIPTION_ID: ${{ env.SECONDARY_SUBSCRIPTION_ID }}
+          REPO: ${{ github.repository }}
+          RUN_ID: ${{ github.run_id }}
+          RUN_ATTEMPT: ${{ github.run_attempt }}
+          DATE_UTC: ${{ needs.meta.outputs.date_utc }}
+          GIT_SHA: ${{ github.sha }}
+          GIT_REF: ${{ github.ref }}
+          MANIFEST_PATH: run-manifest.json
+        run: bash scripts/e2e/provision-cluster.sh all
+
+      - name: Upload provisioning manifest (xs secondary)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: run-manifest-provision-xs-centraluseuap
+          path: run-manifest.json
+          retention-days: 30
+
+  # ITEM-038: run-RG-scoped Network Contributor for BOTH clusters' node
+  # identities on the PRIMARY run RG (Cluster B crosses the subscription
+  # boundary). Needs both identities (read B principals in secondary, grant in
+  # primary).
+  rbac_xs:
+    name: Cross-subscription RBAC (xs)
+    needs: [meta, provision_xs_primary, provision_xs_secondary]
+    if: ${{ github.event_name != 'pull_request' && contains(needs.meta.outputs.validation_topologies, 'xs') }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    environment: azure-e2e
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      TOPOLOGY: xs
+      PRIMARY_SUBSCRIPTION_ID: ${{ inputs.primary_subscription_id || vars.E2E_PRIMARY_SUBSCRIPTION_ID }}
+      SECONDARY_SUBSCRIPTION_ID: ${{ inputs.secondary_subscription_id || vars.E2E_SECONDARY_SUBSCRIPTION_ID }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download combined xs provisioning manifest
+        uses: actions/download-artifact@v4
+        with:
+          name: run-manifest-provision-xs-centraluseuap
+          path: .
+
+      - name: Azure Login (primary OIDC)
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ env.PRIMARY_SUBSCRIPTION_ID }}
+
+      - name: Azure Login (secondary OIDC)
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_SECONDARY_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_SECONDARY_TENANT_ID }}
+          subscription-id: ${{ env.SECONDARY_SUBSCRIPTION_ID }}
+
+      - name: Grant run-RG-scoped cross-subscription RBAC (record IDs, bounded wait)
+        env:
+          REPO: ${{ github.repository }}
+          RUN_ID: ${{ github.run_id }}
+          RUN_ATTEMPT: ${{ github.run_attempt }}
+          DATE_UTC: ${{ needs.meta.outputs.date_utc }}
+          MANIFEST_PATH: run-manifest.json
+        run: bash scripts/e2e/setup-cross-sub-rbac.sh setup
+
+      - name: Upload RBAC manifest (xs)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: run-manifest-rbac-xs
+          path: run-manifest.json
+          retention-days: 30
+
+  # ITEM-037: deploy the SAME candidate digest to BOTH clusters, both controllers
+  # targeting the PRIMARY ASG RG (deploy-controller.sh sets AZURE_SUBSCRIPTION_ID
+  # / AZURE_RESOURCE_GROUP to the primary ASG target, FR-028).
+  deploy_xs:
+    name: Deploy candidate xs (both clusters -> primary ASG RG)
+    needs: [meta, build, provision_xs_primary, provision_xs_secondary, rbac_xs]
+    if: ${{ github.event_name != 'pull_request' && contains(needs.meta.outputs.validation_topologies, 'xs') }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    environment: azure-e2e
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      TOPOLOGY: xs
+      PRIMARY_SUBSCRIPTION_ID: ${{ inputs.primary_subscription_id || vars.E2E_PRIMARY_SUBSCRIPTION_ID }}
+      SECONDARY_SUBSCRIPTION_ID: ${{ inputs.secondary_subscription_id || vars.E2E_SECONDARY_SUBSCRIPTION_ID }}
+      IMAGE_REFERENCE: ${{ needs.build.outputs.image_reference }}
+      STAGING_ACR: ${{ vars.E2E_STAGING_ACR }}
+      REPO: ${{ github.repository }}
+      RUN_ID: ${{ github.run_id }}
+      RUN_ATTEMPT: ${{ github.run_attempt }}
+      DATE_UTC: ${{ needs.meta.outputs.date_utc }}
+      GIT_SHA: ${{ github.sha }}
+      GIT_REF: ${{ github.ref }}
+      MANIFEST_PATH: run-manifest.json
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download xs RBAC manifest
+        uses: actions/download-artifact@v4
+        with:
+          name: run-manifest-rbac-xs
+          path: .
+
+      - name: Azure Login (primary OIDC)
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ env.PRIMARY_SUBSCRIPTION_ID }}
+
+      - name: Azure Login (secondary OIDC)
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_SECONDARY_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_SECONDARY_TENANT_ID }}
+          subscription-id: ${{ env.SECONDARY_SUBSCRIPTION_ID }}
+
+      - name: Deploy candidate to Cluster A (primary)
+        env:
+          REGION: eastus2euap
+        run: bash scripts/e2e/deploy-controller.sh all
+
+      - name: Deploy candidate to Cluster B (secondary; targets primary ASG RG)
+        env:
+          REGION: centraluseuap
+        run: bash scripts/e2e/deploy-controller.sh all
+
+      - name: Upload deploy manifest (xs)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: run-manifest-deploy-xs
+          path: run-manifest.json
+          retention-days: 30
+
+  # ITEM-039: XSUB-001..003 + topology-keyed Tests 1-4 (reuses run-validation.sh).
+  validate_cross_subscription:
+    name: Validate cross-subscription (XSUB-001..003 + xs Tests 1-4)
+    needs: [meta, deploy_xs]
+    if: ${{ github.event_name != 'pull_request' && contains(needs.meta.outputs.validation_topologies, 'xs') }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    environment: azure-e2e
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      TOPOLOGY: xs
+      PRIMARY_SUBSCRIPTION_ID: ${{ inputs.primary_subscription_id || vars.E2E_PRIMARY_SUBSCRIPTION_ID }}
+      SECONDARY_SUBSCRIPTION_ID: ${{ inputs.secondary_subscription_id || vars.E2E_SECONDARY_SUBSCRIPTION_ID }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download xs deploy manifest
+        uses: actions/download-artifact@v4
+        with:
+          name: run-manifest-deploy-xs
+          path: .
+
+      - name: Azure Login (primary OIDC)
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ env.PRIMARY_SUBSCRIPTION_ID }}
+
+      - name: Azure Login (secondary OIDC)
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_SECONDARY_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_SECONDARY_TENANT_ID }}
+          subscription-id: ${{ env.SECONDARY_SUBSCRIPTION_ID }}
+
+      - name: Run XSUB-001..003 + xs Tests 1-4 (IMDS/ARM on nodes; az rest checks)
+        id: validate_xs
+        env:
+          REPO: ${{ github.repository }}
+          RUN_ID: ${{ github.run_id }}
+          RUN_ATTEMPT: ${{ github.run_attempt }}
+          DATE_UTC: ${{ needs.meta.outputs.date_utc }}
+          GIT_SHA: ${{ github.sha }}
+          GIT_REF: ${{ github.ref }}
+          MANIFEST_PATH: run-manifest.json
+        run: bash scripts/e2e/run-cross-sub-validation.sh all
+
+      - name: Upload cross-subscription validation manifest
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: run-manifest-validate-xs
+          path: run-manifest.json
+          retention-days: 30
+
+  # ITEM-040: always() cross-subscription diagnostics from BOTH clusters (AC-007).
+  diagnostics_xs:
+    name: Diagnostics (xs, always)
+    needs: [meta, provision_xs_primary, provision_xs_secondary, deploy_xs, validate_cross_subscription]
+    if: ${{ always() && github.event_name != 'pull_request' && contains(needs.meta.outputs.validation_topologies, 'xs') }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    environment: azure-e2e
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      TOPOLOGY: xs
+      PRIMARY_SUBSCRIPTION_ID: ${{ inputs.primary_subscription_id || vars.E2E_PRIMARY_SUBSCRIPTION_ID }}
+      SECONDARY_SUBSCRIPTION_ID: ${{ inputs.secondary_subscription_id || vars.E2E_SECONDARY_SUBSCRIPTION_ID }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download run-manifest foundation
+        uses: actions/download-artifact@v4
+        with:
+          name: run-manifest
+          path: .
+
+      - name: Azure Login (primary OIDC)
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ env.PRIMARY_SUBSCRIPTION_ID }}
+
+      - name: Azure Login (secondary OIDC)
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_SECONDARY_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_SECONDARY_TENANT_ID }}
+          subscription-id: ${{ env.SECONDARY_SUBSCRIPTION_ID }}
+
+      - name: Collect cross-subscription diagnostics (best-effort, sanitized)
+        env:
+          REPO: ${{ github.repository }}
+          RUN_ID: ${{ github.run_id }}
+          RUN_ATTEMPT: ${{ github.run_attempt }}
+          DATE_UTC: ${{ needs.meta.outputs.date_utc }}
+          MANIFEST_PATH: run-manifest.json
+          DIAG_DIR: diagnostics-xs
+        run: bash scripts/e2e/collect-diagnostics.sh all
+
+      - name: Upload cross-subscription diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: diagnostics-xs
+          path: diagnostics-xs/
+          retention-days: 30
+
+  # ITEM-040: always() cross-subscription cleanup - remove recorded run
+  # assignments + delete BOTH run RGs in their owning subscription and verify
+  # not-found. Debug retention is forbidden for release runs (RD-007).
+  cleanup_xs:
+    name: Cleanup (xs, always)
+    needs: [meta, provision_xs_primary, provision_xs_secondary, rbac_xs, deploy_xs, validate_cross_subscription, diagnostics_xs]
+    if: ${{ always() && github.event_name != 'pull_request' && contains(needs.meta.outputs.validation_topologies, 'xs') }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    environment: azure-e2e
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      TOPOLOGY: xs
+      PRIMARY_SUBSCRIPTION_ID: ${{ inputs.primary_subscription_id || vars.E2E_PRIMARY_SUBSCRIPTION_ID }}
+      SECONDARY_SUBSCRIPTION_ID: ${{ inputs.secondary_subscription_id || vars.E2E_SECONDARY_SUBSCRIPTION_ID }}
+      RELEASE_REQUESTED: ${{ needs.meta.outputs.release_requested }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download RBAC assignment inventory for verified cleanup
+        continue-on-error: true
+        uses: actions/download-artifact@v4
+        with:
+          name: run-manifest-rbac-xs
+          path: .
+
+      - name: Azure Login (primary OIDC)
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ env.PRIMARY_SUBSCRIPTION_ID }}
+
+      - name: Azure Login (secondary OIDC)
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_SECONDARY_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_SECONDARY_TENANT_ID }}
+          subscription-id: ${{ env.SECONDARY_SUBSCRIPTION_ID }}
+
+      - name: Remove assignments + delete BOTH run RGs and verify not-found
+        env:
+          REPO: ${{ github.repository }}
+          RUN_ID: ${{ github.run_id }}
+          RUN_ATTEMPT: ${{ github.run_attempt }}
+          DATE_UTC: ${{ needs.meta.outputs.date_utc }}
+          MANIFEST_PATH: run-manifest.json
+        run: bash scripts/e2e/teardown.sh cleanup
+
+      - name: Upload cleanup manifest (xs)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: run-manifest-cleanup-xs
+          path: run-manifest.json
+          retention-days: 30
+
+  # ITEM-040: release-gate integration SEAM. Requiring validate_cross_subscription
+  # AND cleanup_xs as `needs:` (without always()) means this job - and any future
+  # EPIC-006 release job that needs it - runs ONLY when both succeeded, alongside
+  # ss validation. The explicit `promote-release.sh gate` call logs the composed
+  # decision (validate_tt + validate_cross_subscription + cleanup_xs + atomic set).
+  release_gate:
+    name: Release gate (ss + tt + xs validation & cleanup)
+    needs: [meta, build, build_cni, validate_multicluster, validate_tt, validate_cross_subscription, cleanup_xs]
+    if: ${{ github.event_name != 'pull_request' && needs.meta.outputs.release_requested == 'true' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Evaluate the composed release gate (validate_tt + xs + cleanup_xs + atomic set)
+        env:
+          CTRL_DIGEST: ${{ needs.build.outputs.image_digest }}
+          CNI_DIGEST: ${{ needs.build_cni.outputs.cni_digest }}
+          VALIDATE_TT_STATUS: ${{ needs.validate_tt.result }}
+          VALIDATE_XS_STATUS: ${{ needs.validate_cross_subscription.result }}
+          CLEANUP_XS_STATUS: ${{ needs.cleanup_xs.result }}
+        run: |
+          source scripts/e2e/lib.sh
+          manifest::init run-manifest.json
+          manifest::put_json run-manifest.json artifacts.controller "$(jq -n --arg d "${CTRL_DIGEST}" '{digest:$d}')"
+          manifest::put_json run-manifest.json artifacts.cni "$(jq -n --arg d "${CNI_DIGEST}" '{digest:$d}')"
+          REQUIRE_XS=1 MANIFEST_PATH=run-manifest.json bash scripts/e2e/promote-release.sh gate
+
   naming-tests:
     name: Naming & metadata tests
     runs-on: ubuntu-latest
@@ -696,6 +1205,11 @@ jobs:
           bash scripts/e2e/naming_test/run_tt_validation_test.sh
           bash scripts/e2e/naming_test/collect_cni_diagnostics_test.sh
           bash scripts/e2e/naming_test/promote_release_test.sh
+          bash scripts/e2e/naming_test/setup_cross_sub_rbac_test.sh
+          bash scripts/e2e/naming_test/run_cross_sub_validation_test.sh
+          bash scripts/e2e/naming_test/teardown_test.sh
+          bash scripts/e2e/naming_test/collect_diagnostics_test.sh
+          bash scripts/e2e/naming_test/workflow_epic010_test.sh
 
       - name: Verify naming self-check
         run: bash scripts/e2e/naming.sh self-check

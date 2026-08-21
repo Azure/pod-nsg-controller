@@ -392,4 +392,11 @@ val::main() {
   esac
 }
 
-val::main "$@"
+# Auto-run ONLY when executed directly. When sourced (EPIC-010's
+# run-cross-sub-validation.sh reuses val::_derive + val::test1..4 for the
+# topology-keyed Tests 1-4 and the in-cluster IMDS/ARM probes), the caller drives
+# val::* explicitly and this guard prevents val::main from running the full
+# suite on source. Behaviour when run as a script is unchanged.
+if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
+  val::main "$@"
+fi

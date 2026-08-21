@@ -72,6 +72,9 @@ echo "== xs requires DISTINCT subscription IDs (FR-025) =="
 run_meta xs_equal INPUT_TOPOLOGIES="ss,xs" \
   PRIMARY_SUBSCRIPTION_ID="dup-id" SECONDARY_SUBSCRIPTION_ID="dup-id"
 if (( RC != 0 )); then pass "xs with equal IDs fails"; else fail "xs equal IDs should fail"; fi
+run_meta xs_equal_case INPUT_TOPOLOGIES="ss,xs" \
+  PRIMARY_SUBSCRIPTION_ID="DUP-ID" SECONDARY_SUBSCRIPTION_ID="dup-id"
+if (( RC != 0 )); then pass "xs with case-only equal IDs fails"; else fail "xs case-only equal IDs should fail"; fi
 
 echo "== invalid inputs fail fast =="
 run_meta bad_region INPUT_REGIONS="westus2"

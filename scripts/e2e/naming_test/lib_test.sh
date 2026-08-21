@@ -235,6 +235,92 @@ else pass "azrun transport failure is bounded-retried then fails closed"; fi
 assert_eq "azrun retried the bounded number of transport attempts" "2" \
   "$(grep -c -- 'run-command invoke' "$AAZLOG")"
 
+echo "== lib::assert_distinct_subscriptions (EPIC-010 / ITEM-036 / FR-025) =="
+if lib::assert_distinct_subscriptions sub-a sub-b >/dev/null 2>&1; then
+  pass "two distinct subscriptions pass"; else fail "distinct subscriptions should pass"; fi
+if lib::assert_distinct_subscriptions sub-a sub-a >/dev/null 2>&1; then
+  fail "equal subscriptions must fail"; else pass "equal primary==secondary fails (FR-025)"; fi
+if lib::assert_distinct_subscriptions ABCD-EF abcd-ef >/dev/null 2>&1; then
+  fail "subscription IDs differing only by case must fail"; else pass "subscription equality is case-insensitive"; fi
+if lib::assert_distinct_subscriptions "" sub-b >/dev/null 2>&1; then
+  fail "empty primary must fail"; else pass "empty primary fails closed"; fi
+if lib::assert_distinct_subscriptions sub-a "" >/dev/null 2>&1; then
+  fail "empty secondary must fail"; else pass "empty secondary fails closed"; fi
+
+echo "== lib::az_subscription_validate + lib::az_provider_preflight (ITEM-036 / AC-024) =="
+PWORK="${WORK}/preflight"; PBIN="${PWORK}/bin"; mkdir -p "$PBIN"
+PAZLOG="${PWORK}/az.log"
+cat > "${PBIN}/az" <<'AZ'
+#!/usr/bin/env bash
+echo "$*" >> "${MOCK_AZ_LOG}"
+sub=""; ns=""; prev=""
+for a in "$@"; do case "$prev" in --subscription) sub="$a" ;; --namespace|-n) ns="$a" ;; esac; prev="$a"; done
+case "$1 $2" in
+  "account show")
+    state="${MOCK_SUB_STATE:-Enabled}"; tenant="${MOCK_SUB_TENANT:-11111111-2222-3333-4444-555555555555}"
+    [[ "${MOCK_SUB_FAIL:-0}" == "1" ]] && exit 1
+    jq -n --arg id "${MOCK_SUB_ID:-$sub}" --arg s "$state" --arg t "$tenant" '{id:$id,state:$s,tenantId:$t}' ;;
+  "provider show")
+    [[ "${MOCK_PROVIDER_FAIL:-0}" == "1" ]] && exit 1
+    state="${MOCK_PROVIDER_STATE:-Registered}"
+    apis="${MOCK_PROVIDER_APIS:-\"2025-07-01\",\"2024-05-01\"}"
+    jq -n --arg ns "$ns" --arg s "$state" --argjson apis "[$apis]" \
+      '{namespace:$ns,registrationState:$s,resourceTypes:[{resourceType:"applicationSecurityGroups",apiVersions:$apis}]}' ;;
+  *) exit 0 ;;
+esac
+exit 0
+AZ
+chmod +x "${PBIN}/az"
+export MOCK_AZ_LOG="$PAZLOG"
+export MOCK_SUB_STATE=Enabled MOCK_SUB_TENANT="11111111-2222-3333-4444-555555555555" MOCK_SUB_FAIL=0
+export MOCK_PROVIDER_STATE=Registered MOCK_PROVIDER_FAIL=0 MOCK_PROVIDER_APIS='"2025-07-01","2024-05-01"'
+
+: > "$PAZLOG"
+if lib::az_subscription_validate "${PBIN}/az" sub-primary >/dev/null 2>&1; then
+  pass "an accessible, Enabled subscription validates"; else fail "enabled subscription should validate"; fi
+assert_eq "subscription validate carries an explicit --subscription (RD-020)" "1" \
+  "$(grep -c -- '--subscription sub-primary' "$PAZLOG")"
+if lib::az_subscription_validate "${PBIN}/az" sub-primary 11111111-2222-3333-4444-555555555555 >/dev/null 2>&1; then
+  pass "a matching expected tenant validates"; else fail "matching tenant should validate"; fi
+if MOCK_SUB_ID=SUB-PRIMARY MOCK_SUB_TENANT=AAAAAAAA-BBBB-CCCC-DDDD-EEEEEEEEEEEE \
+  lib::az_subscription_validate "${PBIN}/az" sub-primary aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee >/dev/null 2>&1; then
+  pass "subscription and tenant GUID comparisons are case-insensitive"
+else
+  fail "case-only GUID differences should validate"
+fi
+if lib::az_subscription_validate "${PBIN}/az" sub-primary deadbeef-0000-0000-0000-000000000000 >/dev/null 2>&1; then
+  fail "a tenant mismatch must fail"; else pass "tenant mismatch fails (explicit tenant validation)"; fi
+export MOCK_SUB_ID=sub-unexpected
+if lib::az_subscription_validate "${PBIN}/az" sub-primary >/dev/null 2>&1; then
+  fail "a resolved subscription ID mismatch must fail"; else pass "subscription ID mismatch fails closed"; fi
+unset MOCK_SUB_ID
+MOCK_SUB_STATE=Disabled
+if lib::az_subscription_validate "${PBIN}/az" sub-primary >/dev/null 2>&1; then
+  fail "a Disabled subscription must fail"; else pass "a Disabled subscription fails closed"; fi
+MOCK_SUB_STATE=Enabled
+MOCK_SUB_FAIL=1
+if SUB_VALIDATE_ATTEMPTS=2 SUB_VALIDATE_DELAY=0 lib::az_subscription_validate "${PBIN}/az" sub-x >/dev/null 2>&1; then
+  fail "an inaccessible subscription must fail"; else pass "an inaccessible subscription fails closed (bounded)"; fi
+MOCK_SUB_FAIL=0
+
+: > "$PAZLOG"
+if lib::az_provider_preflight "${PBIN}/az" sub-primary Microsoft.Network applicationSecurityGroups 2025-07-01 >/dev/null 2>&1; then
+  pass "Registered provider with the required EUAP api-version passes (CON-001)"; else fail "provider preflight should pass"; fi
+assert_eq "provider preflight carries an explicit --subscription (RD-020)" "1" \
+  "$(grep -c -- '--subscription sub-primary' "$PAZLOG")"
+MOCK_PROVIDER_STATE=NotRegistered
+if lib::az_provider_preflight "${PBIN}/az" sub-primary Microsoft.Network >/dev/null 2>&1; then
+  fail "an unregistered provider must fail"; else pass "an unregistered provider fails (gates provisioning)"; fi
+MOCK_PROVIDER_STATE=Registered
+MOCK_PROVIDER_APIS='"2024-05-01"'
+if lib::az_provider_preflight "${PBIN}/az" sub-primary Microsoft.Network applicationSecurityGroups 2025-07-01 >/dev/null 2>&1; then
+  fail "a missing EUAP api-version must fail"; else pass "missing addressPrefixSets api-version fails (CON-001)"; fi
+MOCK_PROVIDER_APIS='"2025-07-01","2024-05-01"'
+MOCK_PROVIDER_FAIL=1
+if PROVIDER_PREFLIGHT_ATTEMPTS=2 PROVIDER_PREFLIGHT_DELAY=0 lib::az_provider_preflight "${PBIN}/az" sub-x Microsoft.Network >/dev/null 2>&1; then
+  fail "a provider query failure must fail closed"; else pass "provider query failure fails closed (bounded)"; fi
+MOCK_PROVIDER_FAIL=0
+
 echo
 printf 'lib_test: %s passed, %s failed\n' "$PASS" "$FAIL"
 (( FAIL == 0 ))

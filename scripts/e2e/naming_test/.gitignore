@@ -10,3 +10,7 @@
 .run_tt_validation_test_work/
 .collect_cni_diagnostics_test_work/
 .promote_release_test_work/
+.setup_cross_sub_rbac_test_work/
+.run_cross_sub_validation_test_work/
+.teardown_test_work/
+.collect_diagnostics_test_work/

@@ -146,7 +146,7 @@ rbac::print_principals() {
 rbac::grant() {
   rbac::discover
   [[ -f "$MANIFEST_PATH" ]] || manifest::init "$MANIFEST_PATH"
-  local i pid vm region csub out aid aname assignments='[]'
+  local i pid vm region csub out aid aname rec assignments='[]'
   for i in "${!PRINCIPALS[@]}"; do
     pid="${PRINCIPALS[$i]}"; vm="${P_VMS[$i]}"; region="${P_REGIONS[$i]}"; csub="${P_SUBS[$i]}"
     log::info "granting '${ROLE}' to ${vm} identity on ${TARGET_SCOPE}"
@@ -176,11 +176,13 @@ rbac::grant() {
       --arg aid "$aid" --arg aname "$aname" --arg scope "$TARGET_SCOPE" \
       '$a + [{principal_id:$pid, vm:$vm, region:$region, cluster_subscription:$csub,
               assignment_id:$aid, assignment_name:$aname, scope:$scope}]')"
+    # Persist after EACH successful grant. If a later create fails, the
+    # always() cleanup job still has every earlier assignment ID to remove
+    # (EPIC-010 / ITEM-040 / XSUB-003).
+    rec="$(jq -n --arg role "$ROLE" --arg scope "$TARGET_SCOPE" --arg sub "$PRIMARY_SUBSCRIPTION_ID" \
+      --argjson a "$assignments" '{role:$role, scope:$scope, subscription:$sub, assignments:$a}')"
+    manifest::put_json "$MANIFEST_PATH" "rbac.${TCODE}" "$rec"
   done
-  local rec
-  rec="$(jq -n --arg role "$ROLE" --arg scope "$TARGET_SCOPE" --arg sub "$PRIMARY_SUBSCRIPTION_ID" \
-    --argjson a "$assignments" '{role:$role, scope:$scope, subscription:$sub, assignments:$a}')"
-  manifest::put_json "$MANIFEST_PATH" "rbac.${TCODE}" "$rec"
   gha::output rbac_assignment_count "${#PRINCIPALS[@]}"
   log::info "recorded ${#PRINCIPALS[@]} run-scoped assignment(s) -> ${MANIFEST_PATH}"
 }
@@ -280,4 +282,11 @@ rbac::main() {
   esac
 }
 
-rbac::main "$@"
+# Auto-run ONLY when executed directly. When sourced (EPIC-010's
+# setup-cross-sub-rbac.sh reuses this file's discover/grant/wait/assert core, as
+# promised in the header), the caller drives rbac::* explicitly and this guard
+# prevents rbac::main from consuming the caller's arguments. Behaviour when run
+# as a script is unchanged (BASH_SOURCE[0] == $0).
+if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
+  rbac::main "$@"
+fi

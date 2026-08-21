@@ -138,6 +138,61 @@ SEED_TT=pass run_promote envfail RELEASE_VERSION=v1.2.3 VALIDATE_TT_STATUS=failu
 assert_nonzero "explicit validate_tt=failure blocks release even if manifest says pass" "$RC"
 assert_eq "no promotion under an env gate failure" "0" "$(grep -c 'acr import' "$AZLOG")"
 
+# ---------------------------------------------------------------------------
+# EPIC-010 / ITEM-040: the release gate ALSO requires validate_cross_subscription
+# and cleanup_xs WHEN the xs topology is in scope (release forces ss,xs). The
+# ss-only seam above is unchanged because those manifests never include xs.
+# ---------------------------------------------------------------------------
+# seed_xs_manifest <validate_xs> <cleanup_xs>  ('-' omits a key)
+seed_xs_manifest() {
+  local vx="$1" cx="$2"
+  manifest::init "$MANIFEST"
+  manifest::record_controller_artifact "$MANIFEST" pncstg.azurecr.io candidate/pod-nsg-controller run-x "$CTRL_SHA" true
+  manifest::record_cni_artifact "$MANIFEST" pncstg.azurecr.io candidate/pod-nsg-cni-transparent-tunnel run-x "$CNI_SHA" true
+  manifest::put "$MANIFEST" validate.tt.status pass
+  manifest::put_json "$MANIFEST" run.validation_topologies '["ss","xs"]'
+  [[ "$vx" != "-" ]] && manifest::put "$MANIFEST" validate.xs.cross_subscription "$vx"
+  [[ "$cx" != "-" ]] && manifest::put "$MANIFEST" cleanup.xs.status "$cx"
+  return 0
+}
+run_xs_promote() {
+  local name="$1"; shift
+  local casedir="${WORK}/${name}"
+  AZLOG="${casedir}/az.log"; ORASLOG="${casedir}/oras.log"; MANIFEST="${casedir}/run-manifest.json"; LOG="${casedir}/log"
+  mkdir -p "$casedir"; : > "$AZLOG"; : > "$ORASLOG"
+  seed_xs_manifest "$1" "$2"; shift 2
+  env MOCK_AZ_LOG="$AZLOG" MOCK_ORAS_LOG="$ORASLOG" AZ_BIN="${MOCKBIN}/az" ORAS_BIN="${MOCKBIN}/oras" \
+    PUBLIC_ACR="pncpub.azurecr.io" STAGING_ACR="pncstg.azurecr.io" MANIFEST_PATH="$MANIFEST" \
+    "$@" bash "$PROMOTE_SH" release >"$LOG" 2>"${LOG}.err"
+  RC=$?
+}
+
+echo "== xs gate: release requires validate_cross_subscription AND cleanup_xs (ITEM-040) =="
+run_xs_promote xs_ok pass pass RELEASE_VERSION=v1.2.3
+assert_eq "release succeeds when xs validation + cleanup both pass" "0" "$RC"
+assert_match "controller still promoted by digest" \
+  "acr import .*candidate/pod-nsg-controller@${CTRL_SHA}" "$(tr '\n' '|' < "$AZLOG")"
+
+run_xs_promote xs_valfail fail pass RELEASE_VERSION=v1.2.3
+assert_nonzero "a failed validate_cross_subscription blocks release (AC-009/FR-025)" "$RC"
+assert_eq "no controller promotion when xs validation failed" "0" "$(grep -c 'acr import' "$AZLOG")"
+assert_eq "no CNI promotion when xs validation failed" "0" "$(grep -c 'copy' "$ORASLOG")"
+
+run_xs_promote xs_cleanfail pass fail RELEASE_VERSION=v1.2.3
+assert_nonzero "a failed cleanup_xs blocks release (RD-007/AC-008)" "$RC"
+assert_eq "no promotion when cleanup_xs failed" "0" "$(grep -c 'acr import' "$AZLOG")"
+
+run_xs_promote xs_valabsent - pass RELEASE_VERSION=v1.2.3
+assert_nonzero "an ABSENT validate_cross_subscription fails closed" "$RC"
+run_xs_promote xs_cleanabsent pass - RELEASE_VERSION=v1.2.3
+assert_nonzero "an ABSENT cleanup_xs fails closed" "$RC"
+
+echo "== xs gate: env overrides gate even when the manifest says pass =="
+run_xs_promote xs_env_val pass pass RELEASE_VERSION=v1.2.3 VALIDATE_XS_STATUS=failure
+assert_nonzero "explicit validate_cross_subscription=failure blocks release" "$RC"
+run_xs_promote xs_env_clean pass pass RELEASE_VERSION=v1.2.3 CLEANUP_XS_STATUS=failure
+assert_nonzero "explicit cleanup_xs=failure blocks release" "$RC"
+
 echo
 printf 'promote_release_test: %s passed, %s failed\n' "$PASS" "$FAIL"
 (( FAIL == 0 ))

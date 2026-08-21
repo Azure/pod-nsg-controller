@@ -231,6 +231,101 @@ lib::az_vm_quota_preflight() {
   return "$rc"
 }
 
+# ---- cross-subscription identity/prerequisite preflight (EPIC-010 / ITEM-036) --
+# Fail-before-provisioning gates for the `xs` topology (FR-025/AC-024). Each Azure
+# call carries an explicit --subscription (RD-020); helpers are side-effect-free
+# reads that fail CLOSED. The `xs` workflow composes these with the VM-quota
+# preflight above for BOTH subscriptions before any resource is created.
+
+# lib::assert_distinct_subscriptions <primary> <secondary>
+# The `xs` topology REQUIRES two distinct, non-empty subscription IDs (FR-025).
+lib::assert_distinct_subscriptions() {
+  local primary="$1" secondary="$2"
+  [[ -n "$primary" ]]   || { log::error "primary subscription id is empty"; return 1; }
+  [[ -n "$secondary" ]] || { log::error "secondary subscription id is empty (xs requires a distinct secondary, CON-002)"; return 1; }
+  [[ "${primary,,}" != "${secondary,,}" ]] \
+    || { log::error "cross-subscription (xs) requires two DISTINCT subscription IDs; primary equals secondary (FR-025)"; return 1; }
+  log::info "subscription ids are distinct (primary != secondary)"
+}
+
+# lib::az_subscription_validate <az_bin> <subscription> [expected_tenant]
+# Assert the subscription is accessible and Enabled (and, when given, belongs to
+# the expected tenant) via `az account show --subscription`. Bounded retries
+# (NFR-003); fails CLOSED on an inaccessible/disabled subscription or tenant
+# mismatch (SEC/AC-024).
+lib::az_subscription_validate() {
+  local az_bin="$1" sub="$2" expected_tenant="${3:-}"
+  [[ -n "$az_bin" && -n "$sub" ]] || { log::error "az_subscription_validate: usage <az_bin> <subscription> [expected_tenant]"; return 2; }
+  local json attempt=1 max="${SUB_VALIDATE_ATTEMPTS:-3}" delay="${SUB_VALIDATE_DELAY:-5}"
+  while true; do
+    if json="$("$az_bin" account show --subscription "$sub" -o json 2>/dev/null)" \
+       && printf '%s' "$json" | jq -e '.id // empty' >/dev/null 2>&1; then
+      break
+    fi
+    if (( attempt >= max )); then
+      log::error "subscription ${sub} is not accessible ('az account show' failed after ${attempt} attempt(s))"; return 1
+    fi
+    log::warn "subscription validate attempt ${attempt}/${max} failed for ${sub}; retrying in ${delay}s"
+    sleep "$delay"; attempt=$(( attempt + 1 )); delay=$(( delay * 2 ))
+  done
+  local id state tenant
+  id="$(printf '%s' "$json" | jq -r '.id // ""')"
+  state="$(printf '%s' "$json" | jq -r '.state // ""')"
+  tenant="$(printf '%s' "$json" | jq -r '.tenantId // ""')"
+  if [[ "${id,,}" != "${sub,,}" ]]; then
+    log::error "subscription id mismatch: requested ${sub}, resolved ${id:-<empty>}"; return 1
+  fi
+  if [[ -n "$state" && "$state" != "Enabled" ]]; then
+    log::error "subscription ${sub} is not Enabled (state=${state})"; return 1
+  fi
+  if [[ -n "$expected_tenant" && "${tenant,,}" != "${expected_tenant,,}" ]]; then
+    log::error "subscription ${sub} belongs to tenant ${tenant:-<unknown>}, expected ${expected_tenant}"; return 1
+  fi
+  log::info "subscription ${sub} validated (state=${state:-unknown}${expected_tenant:+, tenant=${tenant}})"
+}
+
+# lib::az_provider_preflight <az_bin> <subscription> <namespace> [resource_type] [api_version]
+# Assert the resource provider (e.g. Microsoft.Network) is Registered in the
+# subscription and, when a resource type + api version are given, that the type
+# advertises that api version - the EUAP/canary availability gate for the
+# addressPrefixSets API (CON-001). Bounded retries; fails CLOSED.
+lib::az_provider_preflight() {
+  local az_bin="$1" sub="$2" ns="$3" rtype="${4:-}" api="${5:-}"
+  [[ -n "$az_bin" && -n "$sub" && -n "$ns" ]] \
+    || { log::error "az_provider_preflight: usage <az_bin> <subscription> <namespace> [resource_type] [api_version]"; return 2; }
+  local json attempt=1 max="${PROVIDER_PREFLIGHT_ATTEMPTS:-3}" delay="${PROVIDER_PREFLIGHT_DELAY:-5}"
+  while true; do
+    if json="$("$az_bin" provider show --namespace "$ns" --subscription "$sub" -o json 2>/dev/null)" \
+       && printf '%s' "$json" | jq -e '.registrationState // empty' >/dev/null 2>&1; then
+      break
+    fi
+    if (( attempt >= max )); then
+      log::error "provider preflight: 'az provider show ${ns}' failed for subscription ${sub} after ${attempt} attempt(s)"; return 1
+    fi
+    log::warn "provider preflight attempt ${attempt}/${max} failed for ${ns}/${sub}; retrying in ${delay}s"
+    sleep "$delay"; attempt=$(( attempt + 1 )); delay=$(( delay * 2 ))
+  done
+  local state
+  state="$(printf '%s' "$json" | jq -r '.registrationState // ""')"
+  if [[ "$state" != "Registered" ]]; then
+    log::error "provider ${ns} is not Registered in subscription ${sub} (state=${state:-unknown})"; return 1
+  fi
+  if [[ -n "$rtype" ]]; then
+    local ok
+    # shellcheck disable=SC2016  # $rt/$api are jq variables, not shell expansions
+    ok="$(printf '%s' "$json" | jq -r --arg rt "$rtype" --arg api "$api" '
+      [ .resourceTypes[]?
+        | select((.resourceType // "" | ascii_downcase) == ($rt | ascii_downcase))
+        | if ($api | length) > 0 then ((.apiVersions // []) | index($api)) != null else true end ]
+      | any')"
+    if [[ "$ok" != "true" ]]; then
+      log::error "provider ${ns}: resource type '${rtype}'${api:+ api-version ${api}} is NOT available in subscription ${sub} (EUAP/canary requirement, CON-001)"
+      return 1
+    fi
+  fi
+  log::info "provider ${ns} Registered in ${sub}${rtype:+ (${rtype}${api:+@${api}} available)}"
+}
+
 # ---- run-manifest helpers (jq-based JSON, FILE-023) -------------------------
 # The manifest is a plain JSON file updated via atomic sibling-temp writes (no
 # /tmp, no mktemp) so it works in restricted CI sandboxes.

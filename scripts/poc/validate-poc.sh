@@ -2,6 +2,15 @@
 # =============================================================================
 # POC Validation Script
 # Validates both clusters are healthy and cross-subscription access works.
+#
+# NOTE (EPIC-010 / ITEM-039): this hand-run POC is the SOURCE that
+# scripts/e2e/run-cross-sub-validation.sh generalizes for the automated
+# pipeline. The pipeline variant (XSUB-001..003 + Tests 1-4) is parameterized,
+# runs the IMDS/ARM probe ON the control-plane node via `az vm run-command`
+# (no runner->API path), treats a skipped IMDS/token/ARM check as a FAILURE
+# rather than a warning (FR-027), and NEVER surfaces the acquired token
+# (sanitized evidence, NFR-012). Prefer the e2e script in CI; keep this POC for
+# interactive bring-up.
 # =============================================================================
 set -euo pipefail
 

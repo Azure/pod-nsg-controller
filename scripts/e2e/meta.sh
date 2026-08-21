@@ -103,7 +103,7 @@ fi
 # ---- cross-subscription ID checks (FR-025) ----------------------------------
 if $has_xs; then
   if [[ -n "$PRIMARY_SUBSCRIPTION_ID" && -n "$SECONDARY_SUBSCRIPTION_ID" \
-        && "$PRIMARY_SUBSCRIPTION_ID" == "$SECONDARY_SUBSCRIPTION_ID" ]]; then
+        && "${PRIMARY_SUBSCRIPTION_ID,,}" == "${SECONDARY_SUBSCRIPTION_ID,,}" ]]; then
     log::die "cross-subscription (xs) requires two DISTINCT subscription IDs; primary equals secondary"
   fi
   if [[ "$release_requested" == "true" && -z "$SECONDARY_SUBSCRIPTION_ID" ]]; then

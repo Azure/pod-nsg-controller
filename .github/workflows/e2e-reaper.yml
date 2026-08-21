@@ -1,0 +1,67 @@
+# =============================================================================
+# e2e-reaper.yml - scheduled DUAL-SUBSCRIPTION reaper (EPIC-010 / ITEM-040 seam).
+#
+# Backstop for the always() inline cleanup_xs (teardown.sh cleanup): on a cron
+# schedule it authenticates INDEPENDENTLY to BOTH configured subscriptions with
+# their separate OIDC identities and deletes EXPIRED run-tagged resource groups
+# in each (validation-purpose=pnc-e2e, managed-by=github-actions, older than
+# max_age_days). Live runs are left untouched. Deleting an RG cascades its
+# RG-scoped role assignments, containing runtime grants (XSUB-003).
+#
+# The reap logic lives in scripts/e2e/teardown.sh (reap), so it is unit-tested
+# and reused by cleanup_xs. The broader same-subscription reaper hardening
+# (dangling-assignment sweep, dry-run report) is EPIC-005 (ITEM-017); this file
+# provides the dual-subscription reaper seam EPIC-010 wires cleanup into.
+#
+# Traceability: ITEM-040, FR-017, RD-020, XSUB-003, AC-008, AC-015.
+# =============================================================================
+name: E2E Reaper (dual-subscription)
+
+on:
+  schedule:
+    # Every 6 hours; backstops inline cleanup for orphaned run resources.
+    - cron: "0 */6 * * *"
+  workflow_dispatch:
+    inputs:
+      max_age_days:
+        description: "Delete run-tagged resource groups older than N days."
+        type: string
+        default: "1"
+
+permissions:
+  contents: read
+
+jobs:
+  reap:
+    name: Reap expired run resource groups (both subscriptions)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    environment: azure-e2e
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      PRIMARY_SUBSCRIPTION_ID: ${{ vars.E2E_PRIMARY_SUBSCRIPTION_ID }}
+      SECONDARY_SUBSCRIPTION_ID: ${{ vars.E2E_SECONDARY_SUBSCRIPTION_ID }}
+      REAP_MAX_AGE_DAYS: ${{ inputs.max_age_days || '1' }}
+    steps:
+      - uses: actions/checkout@v4
+
+      # Separate OIDC identities per subscription (RD-020); every teardown.sh
+      # call passes an explicit --subscription so the right token is selected.
+      - name: Azure Login (primary OIDC)
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ env.PRIMARY_SUBSCRIPTION_ID }}
+
+      - name: Azure Login (secondary OIDC)
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_SECONDARY_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_SECONDARY_TENANT_ID }}
+          subscription-id: ${{ env.SECONDARY_SUBSCRIPTION_ID }}
+
+      - name: Reap expired run-tagged resource groups in both subscriptions
+        run: bash scripts/e2e/teardown.sh reap
