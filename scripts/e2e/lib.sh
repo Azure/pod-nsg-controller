@@ -58,6 +58,85 @@ lib::retry() {
   done
 }
 
+# ---- node execution via `az vm run-command` (EPIC-004 / ITEM-011) ----------
+# The GitHub runner has NO network path to the self-managed cluster API server:
+# the provisioning NSG admits 6443 from `VirtualNetwork` only (see
+# provision-cluster.sh), and the retrieved kubeconfig points at the
+# control-plane PUBLIC IP which that same NSG does not expose to the runner.
+# The simplest secure resolution (no new ingress, reusing the ONLY node-access
+# path already proven in provisioning) is to execute `kubectl` ON the
+# control-plane node through `az vm run-command invoke`. These helpers
+# generalize that seam for deploy-controller.sh and run-validation.sh. Every
+# call carries an explicit --subscription so nothing depends on mutable
+# `az account` context (RD-020); the az binary is passed explicitly (default
+# `az`) so the seam is hermetically mockable.
+#
+# Traceability: FR-004, FR-005, REQ-001, RD-012, RD-020, NFR-003, CON-003,
+# PRD Sections 3.3 (runner has no API path) / 3.5.
+
+# azrun::_extract_stdout <message> : print the [stdout] section of an
+# `az vm run-command` message envelope (the POC message format), or the whole
+# message unchanged when no [stdout]/[stderr] framing is present.
+azrun::_extract_stdout() {
+  if printf '%s' "$1" | grep -q '^\[stdout\]'; then
+    printf '%s\n' "$1" | sed -n '/^\[stdout\]/,/^\[stderr\]/p' | sed '1d;$d'
+  else
+    printf '%s' "$1"
+  fi
+}
+
+# azrun::message <az_bin> <subscription> <rg> <vm> <script> : invoke a shell
+# script on <vm> and print the raw run-command message. Bounded retries with
+# exponential backoff cover the flaky transport (NFR-003). Returns non-zero
+# ONLY on transport failure; the extension itself exits 0 regardless of the
+# script's own exit code (which azrun::exec detects via a sentinel).
+azrun::message() {
+  local az_bin="$1" sub="$2" rg="$3" vm="$4" script="$5"
+  local attempt=1 max="${AZRUN_ATTEMPTS:-3}" delay="${AZRUN_DELAY:-10}" out
+  while true; do
+    if out="$("$az_bin" vm run-command invoke -g "$rg" -n "$vm" \
+                --command-id RunShellScript --scripts "$script" \
+                --query "value[0].message" -o tsv --subscription "$sub" 2>/dev/null)"; then
+      printf '%s' "$out"; return 0
+    fi
+    if (( attempt >= max )); then
+      log::error "az vm run-command transport failed on ${vm} (subscription ${sub}) after ${attempt} attempt(s)"
+      return 1
+    fi
+    log::warn "az vm run-command attempt ${attempt}/${max} failed on ${vm}; retrying in ${delay}s"
+    sleep "$delay"; attempt=$(( attempt + 1 )); delay=$(( delay * 2 ))
+  done
+}
+
+# azrun::capture <az_bin> <subscription> <rg> <vm> <script> : run a (read-only)
+# script on the node and print its stdout. Fails only on transport error;
+# callers gate on the content of the returned stdout.
+azrun::capture() {
+  local msg
+  msg="$(azrun::message "$@")" || return 1
+  azrun::_extract_stdout "$msg"
+}
+
+# azrun::exec <az_bin> <subscription> <rg> <vm> <script> : run a MUTATING script
+# on the node and DETECT node-side failure. Because `az vm run-command` exits 0
+# for the extension regardless of the script's exit code, the script is wrapped
+# under `set -e`, its output captured to a node-local log, and a
+# truncation-resistant sentinel emitted; a missing __AZRUN_OK__ means the node
+# script failed. On failure the node output is surfaced and non-zero returned.
+azrun::exec() {
+  local az_bin="$1" sub="$2" rg="$3" vm="$4" script="$5" wrapped msg out
+  # shellcheck disable=SC2016  # $? / $__rc are evaluated on the NODE, not here
+  wrapped="$(printf '( set -e\n%s\n) >/tmp/pnc-azrun.log 2>&1; __rc=$?; if [ "$__rc" -eq 0 ]; then echo __AZRUN_OK__; else echo "__AZRUN_FAIL__ rc=$__rc"; tail -c 3000 /tmp/pnc-azrun.log; fi' "$script")"
+  msg="$(azrun::message "$az_bin" "$sub" "$rg" "$vm" "$wrapped")" || return 1
+  out="$(azrun::_extract_stdout "$msg")"
+  if [[ "$out" != *__AZRUN_OK__* ]]; then
+    log::error "node script failed on ${vm} (subscription ${sub}):"
+    printf '%s\n' "$out" >&2
+    return 1
+  fi
+  return 0
+}
+
 # ---- provisioning preflight helpers (EPIC-003 / ITEM-010) -------------------
 # Side-effect-free helpers shared by the `provision` job, provision-cluster.sh,
 # and cross-region-rbac.sh. Every Azure call takes an explicit subscription so

@@ -13,8 +13,22 @@
 # policy, and the provision / deploy / validate / diagnostics / cleanup /
 # release jobs are added by later epics (see docs/projects/...).
 #
-# Traceability: ITEM-001..ITEM-006, FR-001, FR-002, FR-011, FR-012, FR-015,
-# FR-016, NFR-006, NFR-007, SEC-001, SEC-003, PRD 3.1/3.4/3.5/9.1.
+# EPIC-003 adds the per-region `provision` job (self-managed clusters, shared
+# ASGs, explicit-subscription) and the same-subscription `rbac` job.
+#
+# EPIC-004 adds the `deploy` (per-region) and `validate_multicluster` jobs:
+# `deploy` applies CRD + RBAC + manager@digest with a short-lived, repo-scoped
+# ACR imagePullSecret plus the documented PodASGMappings/workloads and baseline;
+# `validate_multicluster` runs Tests 1-4 from docs/multi-cluster-test-setup.md
+# and publishes machine-readable per-test results into the run manifest. Because
+# the runner has NO path to the self-managed API server, all kubectl runs ON the
+# control-plane node via `az vm run-command` (scripts/e2e/lib.sh azrun::*); ASG
+# membership is verified from the runner with `az rest`. The remaining
+# diagnostics / cleanup / release jobs are added by later epics.
+#
+# Traceability: ITEM-001..ITEM-014, FR-001..FR-005, FR-011, FR-012, FR-015,
+# FR-016, FR-028, NFR-003, NFR-006, NFR-007, SEC-001, SEC-003, SEC-004, RD-004,
+# RD-020, CON-003, PRD 3.1/3.3/3.4/3.5/9.1.
 # =============================================================================
 name: E2E Validation & Release
 
@@ -313,6 +327,132 @@ jobs:
           path: run-manifest.json
           retention-days: 30
 
+  # ===========================================================================
+  # EPIC-004 - Candidate deploy (ITEM-011 / ITEM-012).
+  #
+  # Per-region matrix that deploys the SAME candidate digest to each cluster.
+  # kubectl runs ON the control-plane node via `az vm run-command` (the runner
+  # has no path to the self-managed API server; the provisioning NSG admits 6443
+  # from VirtualNetwork only). Each deploy mints a short-lived, repository-scoped
+  # ACR token as the imagePullSecret (SEC-004/RD-004), applies CRD + RBAC +
+  # manager@digest with CLUSTER_NAME set to the cluster RG (ownership-key match),
+  # applies the documented PodASGMappings + Cluster-A/Cluster-B workloads
+  # (CON-003), and establishes the baseline (A=4, B=0). Cloud steps are skipped
+  # on pull_request (RD-009). `xs` deploy is EPIC-010.
+  deploy:
+    name: Deploy candidate ss / ${{ matrix.region }}
+    needs: [meta, build, provision, rbac]
+    if: ${{ github.event_name != 'pull_request' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    permissions:
+      contents: read
+      id-token: write
+    strategy:
+      fail-fast: false
+      matrix:
+        region: ${{ fromJSON(needs.meta.outputs.regions_json) }}
+    env:
+      TOPOLOGY: ss
+      REGION: ${{ matrix.region }}
+      PRIMARY_SUBSCRIPTION_ID: ${{ inputs.primary_subscription_id || vars.E2E_PRIMARY_SUBSCRIPTION_ID }}
+      IMAGE_REFERENCE: ${{ needs.build.outputs.image_reference }}
+      STAGING_ACR: ${{ vars.E2E_STAGING_ACR }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download run-manifest foundation
+        uses: actions/download-artifact@v4
+        with:
+          name: run-manifest
+          path: .
+
+      - name: Azure Login (OIDC)
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ env.PRIMARY_SUBSCRIPTION_ID }}
+
+      - name: Deploy candidate + mappings + baseline (kubectl via run-command)
+        id: deploy
+        env:
+          REPO: ${{ github.repository }}
+          RUN_ID: ${{ github.run_id }}
+          RUN_ATTEMPT: ${{ github.run_attempt }}
+          DATE_UTC: ${{ needs.meta.outputs.date_utc }}
+          GIT_SHA: ${{ github.sha }}
+          GIT_REF: ${{ github.ref }}
+          MANIFEST_PATH: run-manifest.json
+        run: bash scripts/e2e/deploy-controller.sh all
+
+      - name: Upload deploy manifest
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: run-manifest-deploy-ss-${{ matrix.region }}
+          path: run-manifest.json
+          retention-days: 30
+
+  # ===========================================================================
+  # EPIC-004 - Multi-cluster validation (ITEM-013 / ITEM-014).
+  #
+  # A SINGLE job (both clusters at once) that runs Tests 1-4 from
+  # docs/multi-cluster-test-setup.md exactly per the documented pass criteria:
+  # kubectl scale/status/log reads run ON each control-plane node via
+  # `az vm run-command`, and ASG address-prefix-set membership is verified from
+  # the runner with `az rest` (api 2025-07-01, CON-001), with bounded
+  # reconciliation polling. Machine-readable per-test results are published into
+  # run-manifest.json (AC-003..006). Diagnostics/cleanup and the release gate are
+  # added by later epics.
+  validate_multicluster:
+    name: Validate multicluster (ss Tests 1-4)
+    needs: [meta, deploy]
+    if: ${{ github.event_name != 'pull_request' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      TOPOLOGY: ss
+      PRIMARY_SUBSCRIPTION_ID: ${{ inputs.primary_subscription_id || vars.E2E_PRIMARY_SUBSCRIPTION_ID }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download run-manifest foundation
+        uses: actions/download-artifact@v4
+        with:
+          name: run-manifest
+          path: .
+
+      - name: Azure Login (OIDC)
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ env.PRIMARY_SUBSCRIPTION_ID }}
+
+      - name: Run Tests 1-4 (kubectl via run-command; az rest prefix-set checks)
+        id: validate
+        env:
+          REPO: ${{ github.repository }}
+          RUN_ID: ${{ github.run_id }}
+          RUN_ATTEMPT: ${{ github.run_attempt }}
+          DATE_UTC: ${{ needs.meta.outputs.date_utc }}
+          GIT_SHA: ${{ github.sha }}
+          GIT_REF: ${{ github.ref }}
+          MANIFEST_PATH: run-manifest.json
+        run: bash scripts/e2e/run-validation.sh all
+
+      - name: Upload validation manifest (per-test results)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: run-manifest-validate-ss
+          path: run-manifest.json
+          retention-days: 30
+
   naming-tests:
     name: Naming & metadata tests
     runs-on: ubuntu-latest
@@ -323,7 +463,7 @@ jobs:
       - name: shellcheck e2e scripts
         run: shellcheck scripts/e2e/*.sh scripts/e2e/naming_test/*.sh
 
-      - name: Run naming, lib, meta, build, provision, and rbac test suites
+      - name: Run naming, lib, meta, build, provision, rbac, deploy, and validation test suites
         run: |
           bash scripts/e2e/naming_test/naming_test.sh
           bash scripts/e2e/naming_test/lib_test.sh
@@ -331,6 +471,8 @@ jobs:
           bash scripts/e2e/naming_test/build_test.sh
           bash scripts/e2e/naming_test/provision_cluster_test.sh
           bash scripts/e2e/naming_test/cross_region_rbac_test.sh
+          bash scripts/e2e/naming_test/deploy_controller_test.sh
+          bash scripts/e2e/naming_test/run_validation_test.sh
 
       - name: Verify naming self-check
         run: bash scripts/e2e/naming.sh self-check

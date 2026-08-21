@@ -170,6 +170,71 @@ MOCK_QUOTA_OMIT_FAMILY=0
 if lib::az_vm_quota_preflight "${QBIN}/az" sub eastus2euap standardDSv5Family notanumber >/dev/null 2>&1; then
   fail "non-integer required vCPUs should be rejected"; else pass "rejects non-integer required vCPUs"; fi
 
+echo "== azrun node-exec via 'az vm run-command' (EPIC-004 / ITEM-011) =="
+# The runner has no path to the cluster API server, so kubectl runs ON the
+# control-plane node through az vm run-command. This mock reproduces the POC
+# message envelope ([stdout]..[stderr]) and the extension's "always exit 0"
+# behaviour, so azrun::exec's sentinel-based failure detection is exercised.
+AWORK="${WORK}/azrun"; ABIN="${AWORK}/bin"; mkdir -p "$ABIN"
+AAZLOG="${AWORK}/az.log"
+cat > "${ABIN}/az" <<'AZ'
+#!/usr/bin/env bash
+{ printf '%s' "$*" | tr '\n\t' '  '; printf '\n'; } >> "${MOCK_AZ_LOG}"
+[[ "${MOCK_TRANSPORT_FAIL:-0}" == "1" ]] && exit 7
+scripts=""; query=""; prev=""
+for a in "$@"; do
+  case "$prev" in --scripts) scripts="$a" ;; --query) query="$a" ;; esac
+  prev="$a"
+done
+[[ "$1 $2" == "vm run-command" && "$query" == "value[0].message" ]] || exit 0
+if [[ "$scripts" == *__AZRUN_OK__* ]]; then
+  if [[ -n "${MOCK_NODE_FAIL_MATCH:-}" && "$scripts" == *"${MOCK_NODE_FAIL_MATCH}"* ]]; then
+    printf '[stdout]\n__AZRUN_FAIL__ rc=1\nsimulated node failure\n[stderr]\n'
+  else
+    printf '[stdout]\n__AZRUN_OK__\n[stderr]\n'
+  fi
+else
+  printf '[stdout]\nREADBACK:%s\n[stderr]\n' "${MOCK_READBACK:-hello}"
+fi
+exit 0
+AZ
+chmod +x "${ABIN}/az"
+export MOCK_AZ_LOG="$AAZLOG"; : > "$AAZLOG"
+
+assert_eq "azrun::_extract_stdout parses the [stdout] envelope" "line1
+line2" "$(azrun::_extract_stdout "$(printf '[stdout]\nline1\nline2\n[stderr]\n')")"
+assert_eq "azrun::_extract_stdout passes unframed text through" "raw" \
+  "$(azrun::_extract_stdout "raw")"
+
+out="$(MOCK_READBACK=four-ready azrun::capture "${ABIN}/az" sub-cp rg-a vm-cp 'kubectl get nodes')"
+assert_eq "azrun::capture returns the node stdout" "READBACK:four-ready" "$out"
+assert_eq "azrun::capture carries an explicit --subscription" "1" \
+  "$(grep -c -- '--subscription sub-cp' "$AAZLOG")"
+assert_eq "azrun::capture targets the control-plane vm/rg" "1" \
+  "$(grep -c -- 'run-command invoke -g rg-a -n vm-cp' "$AAZLOG")"
+
+: > "$AAZLOG"
+if azrun::exec "${ABIN}/az" sub-cp rg-a vm-cp 'kubectl apply -f -' >/dev/null 2>&1; then
+  pass "azrun::exec returns 0 when the node sentinel reports success"
+else fail "azrun::exec should succeed on node success"; fi
+assert_eq "azrun::exec wraps the script and carries --subscription" "1" \
+  "$(grep -c -- '--subscription sub-cp' "$AAZLOG")"
+
+# MOCK_NODE_FAIL_MATCH is read from the environment by the mock, forcing the
+# node script's sentinel to report failure even though `az` still exits 0.
+: > "$AAZLOG"
+if MOCK_NODE_FAIL_MATCH=broken azrun::exec "${ABIN}/az" sub-cp rg-a vm-cp 'kubectl apply -f broken' >/dev/null 2>&1; then
+  fail "azrun::exec must detect node failure despite az exit 0"
+else pass "azrun::exec fails closed when the node script fails"; fi
+
+: > "$AAZLOG"
+if MOCK_TRANSPORT_FAIL=1 AZRUN_ATTEMPTS=2 AZRUN_DELAY=0 \
+     azrun::capture "${ABIN}/az" sub-cp rg-a vm-cp 'kubectl get nodes' >/dev/null 2>&1; then
+  fail "azrun::capture should fail on transport error"
+else pass "azrun transport failure is bounded-retried then fails closed"; fi
+assert_eq "azrun retried the bounded number of transport attempts" "2" \
+  "$(grep -c -- 'run-command invoke' "$AAZLOG")"
+
 echo
 printf 'lib_test: %s passed, %s failed\n' "$PASS" "$FAIL"
 (( FAIL == 0 ))
