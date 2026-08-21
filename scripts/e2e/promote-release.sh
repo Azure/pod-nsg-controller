@@ -1,53 +1,12 @@
 #!/usr/bin/env bash
-# =============================================================================
-# promote-release.sh - artifact-set atomicity + validate_tt release-GATE SEAM.
-#
-# SCOPE (EPIC-009 / ITEM-035): this file establishes the promotion/release
-# integration SEAM that EPIC-006 (ITEM-019/020/021) fleshes out. It guarantees
-# the two things ITEM-035 requires:
-#   1. The controller image AND the transparent-tunnel CNI artifact are promoted
-#      as ONE atomic set - by digest, under a SINGLE ${SEMVER}, with NO rebuild -
-#      or NEITHER is promoted (both-or-neither, NFR-011/FR-024). The released
-#      digests are recorded and MUST equal the validated candidate digests
-#      (AC-023).
-#   2. validate_tt success GATES the release: any TTS failure blocks BOTH
-#      promotions (TEST-009/AC-009).
-#
-# INTENTIONALLY DEFERRED to EPIC-006 (NOT implemented here, by design):
-#   * cosign keyless signing, SBOM attach, SLSA provenance      -> ITEM-020
-#   * anonymous-pull enable + unauthenticated pull verification -> ITEM-021
-#   * immutability assertion (NFR-009) + moving tags            -> ITEM-019
-# The gate is composable: ITEM-018 enables REQUIRE_COMPLETE to add lint,
-# same-subscription validation/cleanup, and the EPIC-010 xs gates.
-#
-# Inputs (environment):
-#   RELEASE_VERSION            semantic version tag, e.g. v1.2.3           [req]
-#   PUBLIC_ACR                 public ACR login server (bootstrap, CON-007) [req]
-#   STAGING_ACR                staging ACR login server
-#   MANIFEST_PATH              run manifest with artifacts.controller/.cni + validate.tt.status
-#   CONTROLLER_PUBLIC_REPO     default pod-nsg-controller
-#   CNI_PUBLIC_REPO            default pod-nsg-cni-transparent-tunnel
-#   VALIDATE_TT_STATUS         optional override from the job's needs result
-#                              (success|failure|...); when unset, read from manifest
-#   VALIDATE_XS_STATUS         optional override: validate_cross_subscription result
-#   CLEANUP_XS_STATUS          optional override: cleanup_xs result
-#   LINT_STATUS                naming-tests/lint job result
-#   VALIDATE_SS_STATUS         validate_multicluster job result
-#   CLEANUP_SS_STATUS          cleanup_ss job result
-#   REQUIRE_XS                 force the xs gate conditions (1) even if not in scope
-#   REQUIRE_COMPLETE           force all ITEM-018 conditions (1)
-#   AZ_BIN ORAS_BIN            tool seams (default az/oras)
-#
-# Commands: release(default) | gate | names | help
-#
-# Traceability: ITEM-018, ITEM-035, ITEM-040, FR-008, FR-024, FR-025, FR-007, NFR-011, AC-023,
-# AC-009, AC-008, TEST-009, RD-013/RD-014, RD-007, CON-007, PRD Section 3.6.
-# =============================================================================
+# Promote, secure, and verify the controller+CNI release as one digest-pinned set.
+# Traceability: ITEM-019..021, FR-008..010/016/024, NFR-009/NFR-011,
+# AC-010/011/013/023, RD-013/RD-014.
 set -euo pipefail
 export LC_ALL=C
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-# shellcheck source=scripts/e2e/lib.sh
+# shellcheck source=/dev/null
 source "${HERE}/lib.sh"
 
 lib::require_cmds jq
@@ -58,6 +17,13 @@ STAGING_ACR="${STAGING_ACR:-}"
 MANIFEST_PATH="${MANIFEST_PATH:-run-manifest.json}"
 CONTROLLER_PUBLIC_REPO="${CONTROLLER_PUBLIC_REPO:-pod-nsg-controller}"
 CNI_PUBLIC_REPO="${CNI_PUBLIC_REPO:-pod-nsg-cni-transparent-tunnel}"
+CONTROLLER_SBOM_PATH="${CONTROLLER_SBOM_PATH:-sbom/controller.spdx.json}"
+CNI_SBOM_PATH="${CNI_SBOM_PATH:-sbom/cni.spdx.json}"
+MOVING_TAGS="${MOVING_TAGS:-}"
+RELEASE_TRANSACTION_TAG="${RELEASE_TRANSACTION_TAG:-_release-${GITHUB_RUN_ID:-local}-${GITHUB_RUN_ATTEMPT:-1}}"
+PROVENANCE_AVAILABLE="${PROVENANCE_AVAILABLE:-false}"
+COSIGN_CERTIFICATE_IDENTITY_REGEXP="${COSIGN_CERTIFICATE_IDENTITY_REGEXP:-^https://github.com/${GITHUB_REPOSITORY:-Azure/pod-nsg-controller}/}"
+COSIGN_OIDC_ISSUER="${COSIGN_OIDC_ISSUER:-https://token.actions.githubusercontent.com}"
 VALIDATE_TT_STATUS="${VALIDATE_TT_STATUS:-}"
 VALIDATE_XS_STATUS="${VALIDATE_XS_STATUS:-}"
 CLEANUP_XS_STATUS="${CLEANUP_XS_STATUS:-}"
@@ -68,34 +34,38 @@ REQUIRE_XS="${REQUIRE_XS:-0}"
 REQUIRE_COMPLETE="${REQUIRE_COMPLETE:-0}"
 AZ_BIN="${AZ_BIN:-az}"
 ORAS_BIN="${ORAS_BIN:-oras}"
+COSIGN_BIN="${COSIGN_BIN:-cosign}"
+DOCKER_BIN="${DOCKER_BIN:-docker}"
 
-# ---- resolve the validated artifact set from the manifest -------------------
 promote::_derive() {
   [[ "${PROMOTE_DERIVED:-0}" == "1" ]] && return 0
-  [[ -f "$MANIFEST_PATH" ]] || log::die "manifest not found at ${MANIFEST_PATH} (nothing to promote)"
+  [[ -f "$MANIFEST_PATH" ]] || log::die "manifest not found at ${MANIFEST_PATH}"
   CTRL_DIGEST="$(manifest::get "$MANIFEST_PATH" '.artifacts.controller.digest // empty')"
   CTRL_REFERENCE="$(manifest::get "$MANIFEST_PATH" '.artifacts.controller.reference // empty')"
   CNI_DIGEST="$(manifest::get "$MANIFEST_PATH" '.artifacts.cni.digest // empty')"
   CNI_REFERENCE="$(manifest::get "$MANIFEST_PATH" '.artifacts.cni.reference // empty')"
   TT_STATUS_MANIFEST="$(manifest::get "$MANIFEST_PATH" '.validate.tt.status // empty')"
-  # EPIC-010: cross-subscription validation + cleanup results, and whether the
-  # xs topology is in scope for this run (release forces ss,xs).
   XS_STATUS_MANIFEST="$(manifest::get "$MANIFEST_PATH" '.validate.xs.cross_subscription // empty')"
   CLEANUP_XS_STATUS_MANIFEST="$(manifest::get "$MANIFEST_PATH" '.cleanup.xs.status // empty')"
   XS_IN_SCOPE_MANIFEST="$(manifest::get "$MANIFEST_PATH" '[.run.validation_topologies[]? | select(. == "xs")] | length')"
-  XS_IN_SCOPE_MANIFEST="${XS_IN_SCOPE_MANIFEST//[^0-9]/}"; XS_IN_SCOPE_MANIFEST="${XS_IN_SCOPE_MANIFEST:-0}"
+  XS_IN_SCOPE_MANIFEST="${XS_IN_SCOPE_MANIFEST//[^0-9]/}"
+  XS_IN_SCOPE_MANIFEST="${XS_IN_SCOPE_MANIFEST:-0}"
   PROMOTE_DERIVED=1
 }
 
-# ---- release GATE (validate_tt + atomic set) --------------------------------
-# Fails CLOSED unless validate_tt passed AND both validated digests exist. This
-# is the ITEM-035 contract; ITEM-018 ANDs the ss/xs test + cleanup conditions.
+promote::_require_release_inputs() {
+  promote::_derive
+  [[ "$RELEASE_VERSION" =~ ^v?[0-9]+\.[0-9]+\.[0-9]+([-.][0-9A-Za-z.-]+)?$ ]] \
+    || log::die "RELEASE_VERSION '${RELEASE_VERSION}' is not a valid semantic version"
+  [[ -n "$PUBLIC_ACR" ]] || log::die "PUBLIC_ACR is required"
+  [[ "$RELEASE_TRANSACTION_TAG" =~ ^_[A-Za-z0-9_.-]+$ ]] \
+    || log::die "invalid RELEASE_TRANSACTION_TAG '${RELEASE_TRANSACTION_TAG}'"
+}
+
 promote::gate() {
   promote::_derive
-  local rc=0
-
+  local rc=0 label status
   if [[ "$REQUIRE_COMPLETE" == "1" ]]; then
-    local label status
     for label in lint validate_ss cleanup_ss; do
       case "$label" in
         lint) status="$LINT_STATUS" ;;
@@ -103,163 +73,319 @@ promote::gate() {
         cleanup_ss) status="$CLEANUP_SS_STATUS" ;;
       esac
       case "$status" in
-        pass|success|Success) : ;;
-        "") log::error "release gate: ${label} result is ABSENT (fail closed; ITEM-018)"; rc=1 ;;
-        *) log::error "release gate: ${label} did NOT pass (status='${status}') - blocking release (ITEM-018)"; rc=1 ;;
+        pass|success|Success) ;;
+        "") log::error "release gate: ${label} result is absent"; rc=1 ;;
+        *) log::error "release gate: ${label} did not pass (${status})"; rc=1 ;;
       esac
     done
   fi
 
-  # validate_tt gate: an explicit job-result override wins; else the manifest.
-  local tt="$VALIDATE_TT_STATUS"
-  [[ -n "$tt" ]] || tt="$TT_STATUS_MANIFEST"
+  local tt="${VALIDATE_TT_STATUS:-$TT_STATUS_MANIFEST}"
   case "$tt" in
-    pass|success|Success) : ;;
-    "") log::error "release gate: validate_tt result is ABSENT (fail closed; AC-009)"; rc=1 ;;
-    *)  log::error "release gate: validate_tt did NOT pass (status='${tt}') - blocking release (TEST-009/AC-009)"; rc=1 ;;
+    pass|success|Success) ;;
+    "") log::error "release gate: validate_tt result is absent"; rc=1 ;;
+    *) log::error "release gate: validate_tt did not pass (${tt})"; rc=1 ;;
   esac
+  [[ "$CTRL_DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]] \
+    || { log::error "release gate: controller digest missing/invalid"; rc=1; }
+  [[ "$CNI_DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]] \
+    || { log::error "release gate: CNI digest missing/invalid"; rc=1; }
 
-  # Artifact-set atomicity: BOTH digests MUST be present and pinned by @sha256.
-  [[ "$CTRL_DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]] || { log::error "release gate: controller digest missing/invalid (got '${CTRL_DIGEST:-<none>}')"; rc=1; }
-  [[ "$CNI_DIGEST"  =~ ^sha256:[0-9a-f]{64}$ ]] || { log::error "release gate: CNI digest missing/invalid (NFR-011 atomic set; got '${CNI_DIGEST:-<none>}')"; rc=1; }
-
-  # EPIC-010 / ITEM-040: AND validate_cross_subscription and cleanup_xs onto the
-  # gate WHEN the xs topology is in scope (release forces ss,xs). When xs is not
-  # in scope (e.g. the ITEM-035 ss-only seam tests) these conditions are skipped,
-  # keeping the composable gate backward compatible.
-  local xs_required=0
+  local xs_required=0 xs cx
   [[ -n "$VALIDATE_XS_STATUS" || -n "$CLEANUP_XS_STATUS" ]] && xs_required=1
   (( XS_IN_SCOPE_MANIFEST > 0 )) && xs_required=1
   [[ "$REQUIRE_XS" == "1" ]] && xs_required=1
   if (( xs_required == 1 )); then
-    local xs="$VALIDATE_XS_STATUS"; [[ -n "$xs" ]] || xs="$XS_STATUS_MANIFEST"
+    xs="${VALIDATE_XS_STATUS:-$XS_STATUS_MANIFEST}"
+    cx="${CLEANUP_XS_STATUS:-$CLEANUP_XS_STATUS_MANIFEST}"
     case "$xs" in
-      pass|success|Success) : ;;
-      "") log::error "release gate: validate_cross_subscription result is ABSENT (fail closed; AC-009/FR-025)"; rc=1 ;;
-      *)  log::error "release gate: validate_cross_subscription did NOT pass (status='${xs}') - blocking release (TEST-009/AC-009)"; rc=1 ;;
+      pass|success|Success) ;;
+      "") log::error "release gate: cross-subscription validation result is absent"; rc=1 ;;
+      *) log::error "release gate: cross-subscription validation did not pass (${xs})"; rc=1 ;;
     esac
-    local cx="$CLEANUP_XS_STATUS"; [[ -n "$cx" ]] || cx="$CLEANUP_XS_STATUS_MANIFEST"
     case "$cx" in
-      pass|success|Success) : ;;
-      "") log::error "release gate: cleanup_xs result is ABSENT (fail closed; FR-007/AC-008)"; rc=1 ;;
-      *)  log::error "release gate: cleanup_xs did NOT pass (status='${cx}') - blocking release (RD-007/AC-008)"; rc=1 ;;
+      pass|success|Success) ;;
+      "") log::error "release gate: cross-subscription cleanup result is absent"; rc=1 ;;
+      *) log::error "release gate: cross-subscription cleanup did not pass (${cx})"; rc=1 ;;
     esac
-  fi
-
-  if (( rc == 0 )); then
-    if (( xs_required == 1 )); then
-      log::info "release gate OPEN: validate_tt=${tt}, validate_cross_subscription + cleanup_xs pass, controller+CNI digests present (atomic set)"
-    else
-      log::info "release gate OPEN: validate_tt=${tt}, controller+CNI digests present (atomic set)"
-    fi
   fi
   return "$rc"
 }
 
-# ---- promote the atomic set by digest (no rebuild) --------------------------
-promote::release() {
-  promote::_derive
-  [[ -n "$RELEASE_VERSION" ]] || log::die "RELEASE_VERSION (semantic version) is required"
-  [[ "$RELEASE_VERSION" =~ ^v?[0-9]+\.[0-9]+\.[0-9]+([-.][0-9A-Za-z.-]+)?$ ]] \
-    || log::die "RELEASE_VERSION '${RELEASE_VERSION}' is not a valid semantic version"
-  [[ -n "$PUBLIC_ACR" ]] || log::die "PUBLIC_ACR is required (pre-provisioned public ACR, CON-007)"
+promote::_tag_digest() {
+  local repo="$1" tag="$2"
+  "$AZ_BIN" acr repository show --name "${PUBLIC_ACR%%.*}" \
+    --image "${repo}:${tag}" --query digest -o tsv 2>/dev/null
+}
 
-  # HARD GATE FIRST: validate everything before touching either registry so the
-  # set is promoted atomically (both-or-neither); a failed gate promotes NEITHER.
-  promote::gate || log::die "release blocked by the gate; NEITHER artifact promoted (atomic set preserved)"
+promote::_delete_tag() {
+  local repo="$1" tag="$2"
+  "$AZ_BIN" acr repository delete --name "${PUBLIC_ACR%%.*}" \
+    --image "${repo}:${tag}" --yes >/dev/null 2>&1 || true
+}
 
-  local pub_name="${PUBLIC_ACR%%.*}"
-  local ctrl_src ctrl_repo cni_src cni_dest
-  # Source references by digest (the validated candidates; no rebuild, RD-001/014).
-  ctrl_src="${CTRL_REFERENCE:-${STAGING_ACR:+${STAGING_ACR}/}candidate/pod-nsg-controller@${CTRL_DIGEST}}"
-  cni_src="${CNI_REFERENCE:-${STAGING_ACR:+${STAGING_ACR}/}candidate/pod-nsg-cni-transparent-tunnel@${CNI_DIGEST}}"
-  ctrl_repo="${CONTROLLER_PUBLIC_REPO}:${RELEASE_VERSION}"
-  cni_dest="${PUBLIC_ACR}/${CNI_PUBLIC_REPO}:${RELEASE_VERSION}"
+promote::_assert_version_absent() {
+  local repo="$1"
+  if promote::_tag_digest "$repo" "$RELEASE_VERSION" >/dev/null; then
+    log::die "immutable version already exists: ${PUBLIC_ACR}/${repo}:${RELEASE_VERSION}"
+  fi
+}
 
+promote::_remote_digest() {
+  "$ORAS_BIN" manifest fetch --descriptor "$1" | jq -r '.digest // empty'
+}
+
+promote::_assert_digest() {
+  local reference="$1" expected="$2" actual
+  actual="$(promote::_remote_digest "$reference")"
+  [[ "$actual" == "$expected" ]] \
+    || log::die "digest mismatch for ${reference}: expected ${expected}, got ${actual:-<empty>}"
+}
+
+promote::_validate_moving_tags() {
+  local version="${RELEASE_VERSION#v}" major minor allowed tag
+  IFS=. read -r major minor _ <<<"$version"
+  allowed="latest,v${major},v${major}.${minor}"
+  [[ -z "$MOVING_TAGS" ]] && return 0
+  IFS=, read -ra tags <<<"$MOVING_TAGS"
+  for tag in "${tags[@]}"; do
+    [[ -n "$tag" && ",$allowed," == *",$tag,"* ]] \
+      || log::die "moving tag '${tag}' is not allowed; choose from ${allowed}"
+  done
+}
+
+promote::_login() {
   lib::require_cmds "$AZ_BIN" "$ORAS_BIN"
-
-  # Authenticate both registries via OIDC: `az acr import` uses the ARM context,
-  # but `oras copy` needs registry credentials in the cred store (AcrPull on the
-  # staging source, AcrPush on the public destination). No standing secret (SEC-001).
-  log::info "authenticating to registries via OIDC for by-digest promotion"
-  lib::retry 3 5 -- "$AZ_BIN" acr login --name "$pub_name" \
-    || log::die "az acr login failed for public ACR ${pub_name}"
+  lib::retry 3 5 -- "$AZ_BIN" acr login --name "${PUBLIC_ACR%%.*}"
   if [[ -n "$STAGING_ACR" ]]; then
-    lib::retry 3 5 -- "$AZ_BIN" acr login --name "${STAGING_ACR%%.*}" \
-      || log::die "az acr login failed for staging ACR ${STAGING_ACR%%.*}"
+    lib::retry 3 5 -- "$AZ_BIN" acr login --name "${STAGING_ACR%%.*}"
+  fi
+}
+
+promote::prepare() {
+  promote::_require_release_inputs
+  promote::gate || log::die "release blocked by validation/cleanup gate"
+  promote::_validate_moving_tags
+
+  # Check BOTH immutable tags before the first registry write.
+  promote::_assert_version_absent "$CONTROLLER_PUBLIC_REPO"
+  promote::_assert_version_absent "$CNI_PUBLIC_REPO"
+  promote::_login
+
+  local ctrl_src="${CTRL_REFERENCE:-${STAGING_ACR}/candidate/pod-nsg-controller@${CTRL_DIGEST}}"
+  local cni_src="${CNI_REFERENCE:-${STAGING_ACR}/candidate/pod-nsg-cni-transparent-tunnel@${CNI_DIGEST}}"
+  local ctrl_tx="${PUBLIC_ACR}/${CONTROLLER_PUBLIC_REPO}:${RELEASE_TRANSACTION_TAG}"
+  local cni_tx="${PUBLIC_ACR}/${CNI_PUBLIC_REPO}:${RELEASE_TRANSACTION_TAG}"
+
+  promote::_delete_tag "$CONTROLLER_PUBLIC_REPO" "$RELEASE_TRANSACTION_TAG"
+  promote::_delete_tag "$CNI_PUBLIC_REPO" "$RELEASE_TRANSACTION_TAG"
+  lib::retry 3 5 -- "$AZ_BIN" acr import --name "${PUBLIC_ACR%%.*}" \
+    --source "$ctrl_src" --image "${CONTROLLER_PUBLIC_REPO}:${RELEASE_TRANSACTION_TAG}" ||
+    log::die "controller transaction promotion failed"
+  if ! lib::retry 3 5 -- "$ORAS_BIN" copy "$cni_src" "$cni_tx"; then
+    promote::_delete_tag "$CONTROLLER_PUBLIC_REPO" "$RELEASE_TRANSACTION_TAG"
+    log::die "CNI transaction promotion failed; controller transaction tag rolled back"
+  fi
+  if ! promote::_assert_digest "$ctrl_tx" "$CTRL_DIGEST" ||
+    ! promote::_assert_digest "$cni_tx" "$CNI_DIGEST"; then
+    promote::_delete_tag "$CONTROLLER_PUBLIC_REPO" "$RELEASE_TRANSACTION_TAG"
+    promote::_delete_tag "$CNI_PUBLIC_REPO" "$RELEASE_TRANSACTION_TAG"
+    log::die "transaction digest verification failed; both transaction tags rolled back"
   fi
 
-  # 1) Controller image: server-side copy by digest into the public ACR (RD-002).
-  log::info "promoting controller ${ctrl_src} -> ${PUBLIC_ACR}/${ctrl_repo} (by digest, no rebuild)"
-  lib::retry 3 5 -- "$AZ_BIN" acr import --name "$pub_name" \
-    --source "$ctrl_src" --image "$ctrl_repo" \
-    || log::die "controller promotion failed; release aborted (NEITHER artifact fully promoted)"
-
-  # 2) CNI OCI artifact: copy by digest under the SAME semver (set atomicity).
-  log::info "promoting CNI ${cni_src} -> ${cni_dest} (by digest, same semver ${RELEASE_VERSION})"
-  lib::retry 3 5 -- "$ORAS_BIN" copy "$cni_src" "$cni_dest" \
-    || log::die "CNI promotion failed AFTER controller import; the set is INCOMPLETE (EPIC-006 ITEM-019 advances moving tags for rollback; this version tag MUST NOT be referenced)"
-
-  # Record the released set; released digests == validated candidate digests (AC-023).
   manifest::put "$MANIFEST_PATH" release.version "$RELEASE_VERSION"
+  manifest::put "$MANIFEST_PATH" release.transaction_tag "$RELEASE_TRANSACTION_TAG"
+  manifest::put "$MANIFEST_PATH" release.prepared true
   manifest::put_json "$MANIFEST_PATH" release.controller "$(jq -n \
-    --arg d "$CTRL_DIGEST" --arg r "${PUBLIC_ACR}/${ctrl_repo}" --arg s "$ctrl_src" \
-    '{digest:$d, reference:$r, source:$s}')"
+    --arg d "$CTRL_DIGEST" --arg r "${PUBLIC_ACR}/${CONTROLLER_PUBLIC_REPO}" --arg s "$ctrl_src" \
+    '{digest:$d, repository:$r, source:$s}')"
   manifest::put_json "$MANIFEST_PATH" release.cni "$(jq -n \
-    --arg d "$CNI_DIGEST" --arg r "$cni_dest" --arg s "$cni_src" \
-    '{digest:$d, reference:$r, source:$s}')"
-  manifest::put "$MANIFEST_PATH" release.set_atomic true
-  # Explicit deferral markers so EPIC-006 knows what remains for this version.
-  manifest::put_json "$MANIFEST_PATH" release.pending "$(jq -n \
-    '{signing:"ITEM-020", provenance:"ITEM-020", anonymous_pull:"ITEM-021", immutability:"ITEM-019", moving_tags:"ITEM-019"}')"
+    --arg d "$CNI_DIGEST" --arg r "${PUBLIC_ACR}/${CNI_PUBLIC_REPO}" --arg s "$cni_src" \
+    '{digest:$d, repository:$r, source:$s}')"
+  gha::output controller_subject "${PUBLIC_ACR}/${CONTROLLER_PUBLIC_REPO}"
+  gha::output cni_subject "${PUBLIC_ACR}/${CNI_PUBLIC_REPO}"
+  gha::output controller_digest "$CTRL_DIGEST"
+  gha::output cni_digest "$CNI_DIGEST"
+}
 
+promote::secure() {
+  promote::_require_release_inputs
+  [[ "$(manifest::get "$MANIFEST_PATH" '.release.prepared // false')" == "true" ]] \
+    || log::die "release transaction is not prepared"
+  [[ -s "$CONTROLLER_SBOM_PATH" ]] || log::die "controller SBOM missing at ${CONTROLLER_SBOM_PATH}"
+  [[ -s "$CNI_SBOM_PATH" ]] || log::die "CNI SBOM missing at ${CNI_SBOM_PATH}"
+  lib::require_cmds "$COSIGN_BIN"
+
+  local ctrl="${PUBLIC_ACR}/${CONTROLLER_PUBLIC_REPO}@${CTRL_DIGEST}"
+  local cni="${PUBLIC_ACR}/${CNI_PUBLIC_REPO}@${CNI_DIGEST}"
+  "$COSIGN_BIN" sign --yes "$ctrl"
+  "$COSIGN_BIN" sign --yes "$cni"
+  "$COSIGN_BIN" attach sbom --sbom "$CONTROLLER_SBOM_PATH" "$ctrl"
+  "$COSIGN_BIN" attach sbom --sbom "$CNI_SBOM_PATH" "$cni"
+  manifest::put "$MANIFEST_PATH" release.supply_chain.signed true
+  manifest::put "$MANIFEST_PATH" release.supply_chain.sboms_attached true
+}
+
+promote::_verify_supply_chain() {
+  [[ "$PROVENANCE_AVAILABLE" == "true" ]] \
+    || log::die "SLSA provenance has not been emitted for both subjects"
+  local ref
+  for ref in \
+    "${PUBLIC_ACR}/${CONTROLLER_PUBLIC_REPO}@${CTRL_DIGEST}" \
+    "${PUBLIC_ACR}/${CNI_PUBLIC_REPO}@${CNI_DIGEST}"; do
+    "$COSIGN_BIN" verify \
+      --certificate-identity-regexp "$COSIGN_CERTIFICATE_IDENTITY_REGEXP" \
+      --certificate-oidc-issuer "$COSIGN_OIDC_ISSUER" "$ref" >/dev/null
+    "$COSIGN_BIN" tree "$ref" | grep -qi 'sbom' \
+      || log::die "SBOM attachment missing for ${ref}"
+    "$COSIGN_BIN" verify-attestation --type slsaprovenance \
+      --certificate-identity-regexp "$COSIGN_CERTIFICATE_IDENTITY_REGEXP" \
+      --certificate-oidc-issuer "$COSIGN_OIDC_ISSUER" "$ref" >/dev/null
+  done
+}
+
+promote::_publish_version() {
+  local ctrl_digest_ref="${PUBLIC_ACR}/${CONTROLLER_PUBLIC_REPO}@${CTRL_DIGEST}"
+  local cni_digest_ref="${PUBLIC_ACR}/${CNI_PUBLIC_REPO}@${CNI_DIGEST}"
+  "$AZ_BIN" acr import --name "${PUBLIC_ACR%%.*}" --source "$ctrl_digest_ref" \
+    --image "${CONTROLLER_PUBLIC_REPO}:${RELEASE_VERSION}"
+  if ! "$ORAS_BIN" copy "$cni_digest_ref" \
+    "${PUBLIC_ACR}/${CNI_PUBLIC_REPO}:${RELEASE_VERSION}"; then
+    promote::_delete_tag "$CONTROLLER_PUBLIC_REPO" "$RELEASE_VERSION"
+    log::die "CNI version publication failed; partial controller version rolled back"
+  fi
+}
+
+promote::_rollback_version() {
+  promote::_delete_tag "$CONTROLLER_PUBLIC_REPO" "$RELEASE_VERSION"
+  promote::_delete_tag "$CNI_PUBLIC_REPO" "$RELEASE_VERSION"
+}
+
+promote::_verify_anonymous_pulls() {
+  local verify_dir="${RELEASE_VERIFY_DIR:-$(dirname "$MANIFEST_PATH")/.release-verify-${RELEASE_TRANSACTION_TAG#_}}"
+  mkdir -p "${verify_dir}/docker"
+  printf '{}\n' >"${verify_dir}/oras-config.json"
+  DOCKER_CONFIG="${verify_dir}/docker" "$DOCKER_BIN" logout "$PUBLIC_ACR"
+  DOCKER_CONFIG="${verify_dir}/docker" "$DOCKER_BIN" pull \
+    "${PUBLIC_ACR}/${CONTROLLER_PUBLIC_REPO}:${RELEASE_VERSION}"
+  "$ORAS_BIN" pull --registry-config "${verify_dir}/oras-config.json" \
+    "${PUBLIC_ACR}/${CNI_PUBLIC_REPO}:${RELEASE_VERSION}" -o "${verify_dir}/cni"
+}
+
+promote::_post_publish_checks() {
+  promote::_assert_digest "${PUBLIC_ACR}/${CONTROLLER_PUBLIC_REPO}:${RELEASE_VERSION}" "$CTRL_DIGEST"
+  promote::_assert_digest "${PUBLIC_ACR}/${CNI_PUBLIC_REPO}:${RELEASE_VERSION}" "$CNI_DIGEST"
+  "$AZ_BIN" acr update --name "${PUBLIC_ACR%%.*}" --anonymous-pull-enabled true >/dev/null
+  [[ "$("$AZ_BIN" acr show --name "${PUBLIC_ACR%%.*}" --query anonymousPullEnabled -o tsv)" == "true" ]] \
+    || log::die "public ACR anonymous pull is not enabled"
+  promote::_verify_anonymous_pulls
+}
+
+promote::_publish_moving_tags() {
+  [[ -z "$MOVING_TAGS" ]] && return 0
+  local tag ctrl_old cni_old i rollback_rc=0
+  local -a touched=() ctrl_previous=() cni_previous=()
+  IFS=, read -ra tags <<<"$MOVING_TAGS"
+  for tag in "${tags[@]}"; do
+    ctrl_old="$(promote::_tag_digest "$CONTROLLER_PUBLIC_REPO" "$tag" || true)"
+    cni_old="$(promote::_tag_digest "$CNI_PUBLIC_REPO" "$tag" || true)"
+    touched+=("$tag")
+    ctrl_previous+=("$ctrl_old")
+    cni_previous+=("$cni_old")
+    if ! "$AZ_BIN" acr import --name "${PUBLIC_ACR%%.*}" \
+      --source "${PUBLIC_ACR}/${CONTROLLER_PUBLIC_REPO}@${CTRL_DIGEST}" \
+      --image "${CONTROLLER_PUBLIC_REPO}:${tag}" ||
+      ! "$ORAS_BIN" copy "${PUBLIC_ACR}/${CNI_PUBLIC_REPO}@${CNI_DIGEST}" \
+        "${PUBLIC_ACR}/${CNI_PUBLIC_REPO}:${tag}" ||
+      ! promote::_assert_digest "${PUBLIC_ACR}/${CONTROLLER_PUBLIC_REPO}:${tag}" "$CTRL_DIGEST" ||
+      ! promote::_assert_digest "${PUBLIC_ACR}/${CNI_PUBLIC_REPO}:${tag}" "$CNI_DIGEST"; then
+      for ((i=${#touched[@]} - 1; i >= 0; i--)); do
+        tag="${touched[i]}"
+        if [[ -n "${ctrl_previous[i]}" ]]; then
+          "$AZ_BIN" acr import --name "${PUBLIC_ACR%%.*}" \
+            --source "${PUBLIC_ACR}/${CONTROLLER_PUBLIC_REPO}@${ctrl_previous[i]}" \
+            --image "${CONTROLLER_PUBLIC_REPO}:${tag}" || rollback_rc=1
+        else
+          promote::_delete_tag "$CONTROLLER_PUBLIC_REPO" "$tag"
+        fi
+        if [[ -n "${cni_previous[i]}" ]]; then
+          "$ORAS_BIN" copy "${PUBLIC_ACR}/${CNI_PUBLIC_REPO}@${cni_previous[i]}" \
+            "${PUBLIC_ACR}/${CNI_PUBLIC_REPO}:${tag}" || rollback_rc=1
+        else
+          promote::_delete_tag "$CNI_PUBLIC_REPO" "$tag"
+        fi
+      done
+      (( rollback_rc == 0 )) || log::error "one or more moving tags could not be restored"
+      return 1
+    fi
+  done
+}
+
+promote::complete() {
+  promote::_require_release_inputs
+  [[ "$(manifest::get "$MANIFEST_PATH" '.release.prepared // false')" == "true" ]] \
+    || log::die "release transaction is not prepared"
+  promote::_assert_version_absent "$CONTROLLER_PUBLIC_REPO"
+  promote::_assert_version_absent "$CNI_PUBLIC_REPO"
+  promote::_assert_digest "${PUBLIC_ACR}/${CONTROLLER_PUBLIC_REPO}:${RELEASE_TRANSACTION_TAG}" "$CTRL_DIGEST"
+  promote::_assert_digest "${PUBLIC_ACR}/${CNI_PUBLIC_REPO}:${RELEASE_TRANSACTION_TAG}" "$CNI_DIGEST"
+  promote::_verify_supply_chain
+  promote::_publish_version
+  if ! promote::_post_publish_checks; then
+    promote::_rollback_version
+    log::die "published set failed digest/anonymous verification; both version tags rolled back"
+  fi
+  if ! promote::_publish_moving_tags; then
+    promote::_rollback_version
+    log::die "moving-tag publication failed; both version tags rolled back"
+  fi
+  promote::_delete_tag "$CONTROLLER_PUBLIC_REPO" "$RELEASE_TRANSACTION_TAG"
+  promote::_delete_tag "$CNI_PUBLIC_REPO" "$RELEASE_TRANSACTION_TAG"
+  manifest::put "$MANIFEST_PATH" release.supply_chain.provenance_verified true
+  manifest::put "$MANIFEST_PATH" release.anonymous_pull_verified true
+  manifest::put "$MANIFEST_PATH" release.set_atomic true
+  manifest::put "$MANIFEST_PATH" release.complete true
+  manifest::put_json "$MANIFEST_PATH" release.moving_tags "$(jq -nc \
+    --arg tags "$MOVING_TAGS" '$tags | split(",") | map(select(length > 0))')"
   gha::output release_version "$RELEASE_VERSION"
-  gha::output controller_release "${PUBLIC_ACR}/${ctrl_repo}"
-  gha::output cni_release "$cni_dest"
-  gha::output set_atomic true
-  gha::summary "## Artifact-set promotion (\`release\`)"
-  gha::summary ""
-  gha::summary "| Artifact | Released (by digest) |"
-  gha::summary "|---|---|"
-  gha::summary "| Controller | \`${PUBLIC_ACR}/${ctrl_repo}\` @ \`${CTRL_DIGEST}\` |"
-  gha::summary "| CNI | \`${cni_dest}\` @ \`${CNI_DIGEST}\` |"
-  gha::summary ""
-  gha::summary "> Signing/SBOM/provenance (ITEM-020), anonymous-pull verification (ITEM-021), and immutability/moving tags (ITEM-019) are completed by EPIC-006."
-  log::info "artifact set promoted atomically under ${RELEASE_VERSION} (controller+CNI, by digest, no rebuild)"
+  gha::output controller_release "${PUBLIC_ACR}/${CONTROLLER_PUBLIC_REPO}:${RELEASE_VERSION}"
+  gha::output cni_release "${PUBLIC_ACR}/${CNI_PUBLIC_REPO}:${RELEASE_VERSION}"
+}
+
+promote::abort() {
+  promote::_require_release_inputs
+  promote::_delete_tag "$CONTROLLER_PUBLIC_REPO" "$RELEASE_TRANSACTION_TAG"
+  promote::_delete_tag "$CNI_PUBLIC_REPO" "$RELEASE_TRANSACTION_TAG"
 }
 
 promote::names() {
   promote::_derive
-  printf 'release_version=%s\ncontroller_digest=%s\ncni_digest=%s\nvalidate_tt=%s\npublic_acr=%s\n' \
-    "$RELEASE_VERSION" "$CTRL_DIGEST" "$CNI_DIGEST" "${VALIDATE_TT_STATUS:-$TT_STATUS_MANIFEST}" "$PUBLIC_ACR"
-  printf 'validate_cross_subscription=%s\ncleanup_xs=%s\nxs_in_scope=%s\n' \
-    "${VALIDATE_XS_STATUS:-$XS_STATUS_MANIFEST}" "${CLEANUP_XS_STATUS:-$CLEANUP_XS_STATUS_MANIFEST}" "$XS_IN_SCOPE_MANIFEST"
+  printf 'release_version=%s\ncontroller_digest=%s\ncni_digest=%s\npublic_acr=%s\n' \
+    "$RELEASE_VERSION" "$CTRL_DIGEST" "$CNI_DIGEST" "$PUBLIC_ACR"
 }
 
 promote::usage() {
-  cat <<USAGE
-Usage: promote-release.sh <command>
+  cat <<'USAGE'
+Usage: promote-release.sh <gate|prepare|secure|complete|abort|names>
 
-Commands:
-  release   Gate on validate_tt + atomic set, then promote BOTH artifacts by
-            digest under one \${SEMVER} (no rebuild). Default.
-  gate      Evaluate the configured validation/cleanup gates + both digests.
-  names     Print resolved release coordinates.
-  help      Show this help.
-
-EPIC-006 (ITEM-019/020/021) completes signing, SBOM, provenance, anonymous-pull,
-immutability, and moving tags on top of this seam.
+  gate      Fail closed unless all configured validation gates and both digests pass.
+  prepare   Check immutability, promote both digests to transaction tags, verify bytes.
+  secure    Keyless-sign both digests and attach both SBOMs.
+  complete  Verify signatures/SBOM/provenance, publish version/moving tags, verify anonymous pulls.
+  abort     Remove transaction tags without touching a completed semantic version.
 USAGE
 }
 
 promote::main() {
-  local cmd="${1:-release}"
-  [[ $# -gt 0 ]] && shift
+  local cmd="${1:-}"
   case "$cmd" in
-    release) promote::release ;;
-    gate)    promote::gate ;;
-    names)   promote::names ;;
-    help|-h|--help) promote::usage ;;
+    gate) promote::gate ;;
+    prepare) promote::prepare ;;
+    secure) promote::secure ;;
+    complete) promote::complete ;;
+    abort) promote::abort ;;
+    names) promote::names ;;
+    help|-h|--help|"") promote::usage ;;
     *) log::error "unknown command: ${cmd}"; promote::usage >&2; return 1 ;;
   esac
 }

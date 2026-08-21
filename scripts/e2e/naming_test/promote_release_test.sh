@@ -1,22 +1,6 @@
 #!/usr/bin/env bash
-# =============================================================================
-# promote_release_test.sh - behavioural tests for the artifact-set atomicity +
-# validate_tt release-gate SEAM in ../promote-release.sh (EPIC-009 / ITEM-035).
-#
-# Scope: ITEM-035 introduces the promotion/release INTEGRATION SEAM that (a)
-# promotes the CNI digest ALONGSIDE the controller digest under ONE ${SEMVER},
-# by digest, with no rebuild, ATOMICALLY (both or neither), and (b) requires
-# validate_tt success. The full EPIC-006 promotion logic - cosign signing, SBOM
-# attach, SLSA provenance (ITEM-020), anonymous-pull enable/verify (ITEM-021),
-# immutability + moving tags (ITEM-019) - is intentionally NOT exercised here.
-#
-# Fully hermetic: az (`acr import`) and oras (`copy`) are mocks. The suite proves
-# AC-023 (released set == validated set) and TEST-009 (a TTS failure blocks BOTH
-# promotions).
-#
-# Traceability: ITEM-035, FR-024, NFR-011, AC-023, AC-009, TEST-009, RD-013/014,
-# PRD Section 3.6.
-# =============================================================================
+# Hermetic behavioral coverage for EPIC-006 release promotion.
+# Traceability: ITEM-019..021, AC-010/011/013/023, NFR-009/NFR-011.
 set -uo pipefail
 
 TEST_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -28,17 +12,16 @@ MOCKBIN="${WORK}/bin"
 PASS=0; FAIL=0
 pass() { PASS=$((PASS + 1)); printf '  PASS %s\n' "$1"; }
 fail() { FAIL=$((FAIL + 1)); printf '  FAIL %s\n' "$1" >&2; }
-assert_eq() { if [[ "$2" == "$3" ]]; then pass "$1"; else fail "$1"; printf '        expected [%s] got [%s]\n' "$2" "$3" >&2; fi; }
-assert_match() { if [[ "$3" =~ $2 ]]; then pass "$1"; else fail "$1"; printf '        value [%s] did not match /%s/\n' "$3" "$2" >&2; fi; }
+assert_eq() {
+  if [[ "$2" == "$3" ]]; then pass "$1"; else fail "$1"; printf '        expected [%s] got [%s]\n' "$2" "$3" >&2; fi
+}
+assert_match() {
+  if [[ "$3" =~ $2 ]]; then pass "$1"; else fail "$1"; printf '        value [%s] did not match /%s/\n' "$3" "$2" >&2; fi
+}
 assert_nonzero() { if (( $2 != 0 )); then pass "$1"; else fail "$1"; fi; }
 
-if [[ ! -f "$PROMOTE_SH" ]]; then
-  printf 'FATAL promote-release.sh not found at %s\n' "$PROMOTE_SH" >&2
-  exit 1
-fi
 # shellcheck source=/dev/null
 source "$LIB_SH"
-
 cleanup() { rm -rf "$WORK"; }
 trap cleanup EXIT
 mkdir -p "$MOCKBIN"
@@ -46,174 +29,243 @@ mkdir -p "$MOCKBIN"
 CTRL_SHA="sha256:$(printf ctrl | sha256sum | cut -c1-64)"
 CNI_SHA="sha256:$(printf cni | sha256sum | cut -c1-64)"
 
-cat > "${MOCKBIN}/az" <<'AZ'
+cat >"${MOCKBIN}/az" <<'AZ'
 #!/usr/bin/env bash
-{ printf '%s' "$*" | tr '\n\t' '  '; printf '\n'; } >> "${MOCK_AZ_LOG}"
+printf '%s\n' "$*" >>"${MOCK_LOG}"
 case "$1 $2" in
-  "acr import") [ -n "${MOCK_IMPORT_FAIL:-}" ] && exit 1; exit 0 ;;
-  "acr login")  exit 0 ;;
-  *) exit 0 ;;
+  "acr repository")
+    case "$3" in
+      show)
+        image=""; while (($#)); do [[ "$1" == "--image" ]] && image="$2"; shift || true; done
+        if [[ ",${MOCK_EXISTING_TAGS:-}," == *",${image},"* ]]; then
+          printf '%s\n' "${MOCK_EXISTING_DIGEST:-sha256:existing}"
+          exit 0
+        fi
+        exit 1
+        ;;
+      delete) exit 0 ;;
+    esac
+    ;;
+  "acr import")
+    [[ "${MOCK_IMPORT_FAIL_IMAGE:-}" && "$*" == *"${MOCK_IMPORT_FAIL_IMAGE}"* ]] && exit 1
+    exit 0
+    ;;
+  "acr update") exit 0 ;;
+  "acr show") printf '%s\n' "${MOCK_ANONYMOUS_STATE:-true}"; exit 0 ;;
+  "acr login") exit 0 ;;
 esac
+exit 0
 AZ
-cat > "${MOCKBIN}/oras" <<'ORAS'
+
+cat >"${MOCKBIN}/oras" <<'ORAS'
 #!/usr/bin/env bash
-{ printf '%s' "$*" | tr '\n\t' '  '; printf '\n'; } >> "${MOCK_ORAS_LOG}"
+printf '%s\n' "$*" >>"${MOCK_LOG}"
 case "${1:-}" in
-  copy) [ -n "${MOCK_COPY_FAIL:-}" ] && exit 1; echo "Copied"; exit 0 ;;
-  *) exit 0 ;;
+  copy)
+    [[ "${MOCK_COPY_FAIL_DEST:-}" && "$*" == *"${MOCK_COPY_FAIL_DEST}"* ]] && exit 1
+    exit 0
+    ;;
+  manifest)
+    ref="${*: -1}"
+    if [[ "$ref" == *pod-nsg-controller* ]]; then printf '{"digest":"%s"}\n' "${MOCK_CTRL_REMOTE:-$CTRL_SHA}"
+    else printf '{"digest":"%s"}\n' "${MOCK_CNI_REMOTE:-$CNI_SHA}"; fi
+    ;;
+  pull) [[ -n "${MOCK_ORAS_PULL_FAIL:-}" ]] && exit 1; exit 0 ;;
 esac
 ORAS
-chmod +x "${MOCKBIN}/az" "${MOCKBIN}/oras"
 
-# seed_manifest <tt_status> [--no-cni] [--no-ctrl]
+cat >"${MOCKBIN}/cosign" <<'COSIGN'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >>"${MOCK_LOG}"
+case "${1:-}" in
+  sign|attach) exit 0 ;;
+  verify)
+    [[ -n "${MOCK_COSIGN_VERIFY_FAIL:-}" ]] && exit 1
+    printf '{"critical":{"identity":{"docker-reference":"ok"}}}\n'
+    ;;
+  verify-attestation)
+    [[ -n "${MOCK_ATTEST_VERIFY_FAIL:-}" ]] && exit 1
+    printf '{"payload":"verified"}\n'
+    ;;
+  tree) printf 'SBOM: sha256:attached\n' ;;
+esac
+COSIGN
+
+cat >"${MOCKBIN}/docker" <<'DOCKER'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >>"${MOCK_LOG}"
+case "${1:-}" in
+  logout) exit 0 ;;
+  pull) [[ -n "${MOCK_DOCKER_PULL_FAIL:-}" ]] && exit 1; exit 0 ;;
+esac
+DOCKER
+chmod +x "${MOCKBIN}/az" "${MOCKBIN}/oras" "${MOCKBIN}/cosign" "${MOCKBIN}/docker"
+
 seed_manifest() {
-  local tt="$1"; shift || true
-  manifest::init "$MANIFEST"
-  local no_cni=0 no_ctrl=0
-  for a in "$@"; do case "$a" in --no-cni) no_cni=1;; --no-ctrl) no_ctrl=1;; esac; done
-  (( no_ctrl == 0 )) && manifest::record_controller_artifact "$MANIFEST" pncstg.azurecr.io candidate/pod-nsg-controller run-x "$CTRL_SHA" true
-  (( no_cni == 0 ))  && manifest::record_cni_artifact "$MANIFEST" pncstg.azurecr.io candidate/pod-nsg-cni-transparent-tunnel run-x "$CNI_SHA" true
-  [[ -n "$tt" ]] && manifest::put "$MANIFEST" validate.tt.status "$tt"
-}
-
-run_promote() {
-  local name="$1"; shift
-  local casedir="${WORK}/${name}"
-  AZLOG="${casedir}/az.log"; ORASLOG="${casedir}/oras.log"; MANIFEST="${casedir}/run-manifest.json"; LOG="${casedir}/log"
-  mkdir -p "$casedir"; : > "$AZLOG"; : > "$ORASLOG"
-  SEED_TT="${SEED_TT-pass}"; SEED_ARGS="${SEED_ARGS:-}"
-  # shellcheck disable=SC2086
-  seed_manifest "$SEED_TT" $SEED_ARGS
-  env \
-    MOCK_AZ_LOG="$AZLOG" MOCK_ORAS_LOG="$ORASLOG" AZ_BIN="${MOCKBIN}/az" ORAS_BIN="${MOCKBIN}/oras" \
-    PUBLIC_ACR="pncpub.azurecr.io" STAGING_ACR="pncstg.azurecr.io" \
-    MANIFEST_PATH="$MANIFEST" \
-    "$@" bash "$PROMOTE_SH" release >"$LOG" 2>"${LOG}.err"
-  RC=$?
-}
-
-echo "== happy path: BOTH artifacts promoted by digest under ONE semver (AC-023) =="
-SEED_TT=pass run_promote ok RELEASE_VERSION=v1.2.3
-assert_eq "release seam succeeds when validated" "0" "$RC"
-assert_match "controller promoted by digest via az acr import" \
-  "acr import .*candidate/pod-nsg-controller@${CTRL_SHA}" "$(tr '\n' '|' < "$AZLOG")"
-assert_match "controller lands under the semver tag" 'pod-nsg-controller:v1.2.3' "$(tr '\n' '|' < "$AZLOG")"
-assert_match "CNI promoted by digest via oras copy" \
-  "copy .*candidate/pod-nsg-cni-transparent-tunnel@${CNI_SHA}" "$(tr '\n' '|' < "$ORASLOG")"
-assert_match "CNI lands under the SAME semver tag (set atomicity, NFR-011)" \
-  'pod-nsg-cni-transparent-tunnel:v1.2.3' "$(tr '\n' '|' < "$ORASLOG")"
-assert_eq "manifest records the released version" "v1.2.3" "$(manifest::get "$MANIFEST" '.release.version')"
-assert_eq "released controller digest == validated candidate digest (AC-023)" \
-  "$CTRL_SHA" "$(manifest::get "$MANIFEST" '.release.controller.digest')"
-assert_eq "released CNI digest == validated candidate digest (AC-023)" \
-  "$CNI_SHA" "$(manifest::get "$MANIFEST" '.release.cni.digest')"
-assert_eq "manifest marks the set atomic" "true" "$(manifest::get "$MANIFEST" '.release.set_atomic')"
-
-echo "== a TTS/validate_tt failure blocks BOTH promotions (TEST-009 / AC-009) =="
-SEED_TT=fail run_promote ttsfail RELEASE_VERSION=v1.2.3
-assert_nonzero "release is blocked when validate_tt failed" "$RC"
-assert_eq "controller was NOT imported" "0" "$(grep -c 'acr import' "$AZLOG")"
-assert_eq "CNI was NOT copied" "0" "$(grep -c 'copy' "$ORASLOG")"
-
-echo "== validate_tt status absent fails closed =="
-SEED_TT="" run_promote ttsabsent RELEASE_VERSION=v1.2.3
-assert_nonzero "release is blocked when validate_tt result is missing" "$RC"
-assert_eq "no promotion attempted (controller)" "0" "$(grep -c 'acr import' "$AZLOG")"
-
-echo "== atomicity: a missing CNI digest blocks the controller promotion too =="
-SEED_TT=pass SEED_ARGS="--no-cni" run_promote nocni RELEASE_VERSION=v1.2.3
-assert_nonzero "release fails when the CNI digest is missing (NFR-011)" "$RC"
-assert_eq "controller NOT imported when the set is incomplete" "0" "$(grep -c 'acr import' "$AZLOG")"
-
-echo "== atomicity: a missing controller digest blocks release =="
-SEED_TT=pass SEED_ARGS="--no-ctrl" run_promote noctrl RELEASE_VERSION=v1.2.3
-assert_nonzero "release fails when the controller digest is missing" "$RC"
-
-echo "== a missing semver fails fast =="
-SEED_TT=pass run_promote nover RELEASE_VERSION=""
-assert_nonzero "release requires a semantic version" "$RC"
-
-echo "== VALIDATE_TT_STATUS env override gates the seam (job needs result) =="
-SEED_TT=pass run_promote envfail RELEASE_VERSION=v1.2.3 VALIDATE_TT_STATUS=failure
-assert_nonzero "explicit validate_tt=failure blocks release even if manifest says pass" "$RC"
-assert_eq "no promotion under an env gate failure" "0" "$(grep -c 'acr import' "$AZLOG")"
-
-# ---------------------------------------------------------------------------
-# EPIC-010 / ITEM-040: the release gate ALSO requires validate_cross_subscription
-# and cleanup_xs WHEN the xs topology is in scope (release forces ss,xs). The
-# ss-only seam above is unchanged because those manifests never include xs.
-# ---------------------------------------------------------------------------
-# seed_xs_manifest <validate_xs> <cleanup_xs>  ('-' omits a key)
-seed_xs_manifest() {
-  local vx="$1" cx="$2"
   manifest::init "$MANIFEST"
   manifest::record_controller_artifact "$MANIFEST" pncstg.azurecr.io candidate/pod-nsg-controller run-x "$CTRL_SHA" true
   manifest::record_cni_artifact "$MANIFEST" pncstg.azurecr.io candidate/pod-nsg-cni-transparent-tunnel run-x "$CNI_SHA" true
   manifest::put "$MANIFEST" validate.tt.status pass
-  manifest::put_json "$MANIFEST" run.validation_topologies '["ss","xs"]'
-  [[ "$vx" != "-" ]] && manifest::put "$MANIFEST" validate.xs.cross_subscription "$vx"
-  [[ "$cx" != "-" ]] && manifest::put "$MANIFEST" cleanup.xs.status "$cx"
-  return 0
 }
-run_xs_promote() {
-  local name="$1"; shift
-  local casedir="${WORK}/${name}"
-  AZLOG="${casedir}/az.log"; ORASLOG="${casedir}/oras.log"; MANIFEST="${casedir}/run-manifest.json"; LOG="${casedir}/log"
-  mkdir -p "$casedir"; : > "$AZLOG"; : > "$ORASLOG"
-  seed_xs_manifest "$1" "$2"; shift 2
-  env MOCK_AZ_LOG="$AZLOG" MOCK_ORAS_LOG="$ORASLOG" AZ_BIN="${MOCKBIN}/az" ORAS_BIN="${MOCKBIN}/oras" \
-    PUBLIC_ACR="pncpub.azurecr.io" STAGING_ACR="pncstg.azurecr.io" MANIFEST_PATH="$MANIFEST" \
-    "$@" bash "$PROMOTE_SH" release >"$LOG" 2>"${LOG}.err"
+
+new_case() {
+  local name="$1"
+  CASEDIR="${WORK}/${name}"
+  MANIFEST="${CASEDIR}/run-manifest.json"
+  LOG="${CASEDIR}/commands.log"
+  mkdir -p "$CASEDIR"
+  : >"$LOG"
+  printf '{"name":"controller"}\n' >"${CASEDIR}/controller.spdx.json"
+  printf '{"name":"cni"}\n' >"${CASEDIR}/cni.spdx.json"
+  seed_manifest
+}
+
+run_cmd() {
+  local cmd="$1"; shift
+  env MOCK_LOG="$LOG" CTRL_SHA="$CTRL_SHA" CNI_SHA="$CNI_SHA" \
+    AZ_BIN="${MOCKBIN}/az" ORAS_BIN="${MOCKBIN}/oras" COSIGN_BIN="${MOCKBIN}/cosign" DOCKER_BIN="${MOCKBIN}/docker" \
+    PUBLIC_ACR=pncpub.azurecr.io STAGING_ACR=pncstg.azurecr.io RELEASE_VERSION=v1.2.3 \
+    RELEASE_TRANSACTION_TAG=_release-test CONTROLLER_SBOM_PATH="${CASEDIR}/controller.spdx.json" \
+    CNI_SBOM_PATH="${CASEDIR}/cni.spdx.json" MANIFEST_PATH="$MANIFEST" \
+    COSIGN_CERTIFICATE_IDENTITY_REGEXP='^https://github.com/Azure/pod-nsg-controller/' \
+    "$@" bash "$PROMOTE_SH" "$cmd" >"${CASEDIR}/${cmd}.out" 2>"${CASEDIR}/${cmd}.err"
   RC=$?
 }
 
-echo "== xs gate: release requires validate_cross_subscription AND cleanup_xs (ITEM-040) =="
-run_xs_promote xs_ok pass pass RELEASE_VERSION=v1.2.3
-assert_eq "release succeeds when xs validation + cleanup both pass" "0" "$RC"
-assert_match "controller still promoted by digest" \
-  "acr import .*candidate/pod-nsg-controller@${CTRL_SHA}" "$(tr '\n' '|' < "$AZLOG")"
+echo "== ITEM-019: immutable, digest-preserving two-phase promotion =="
+new_case happy
+run_cmd prepare
+assert_eq "prepare succeeds" 0 "$RC"
+assert_match "controller candidate imported by exact digest to transaction tag" \
+  "acr import .*candidate/pod-nsg-controller@${CTRL_SHA}.*pod-nsg-controller:_release-test" "$(cat "$LOG")"
+assert_match "CNI candidate copied by exact digest to transaction tag" \
+  "copy .*candidate/pod-nsg-cni-transparent-tunnel@${CNI_SHA}.*pod-nsg-cni-transparent-tunnel:_release-test" "$(cat "$LOG")"
+assert_eq "prepare does not publish semantic version" 0 \
+  "$(grep -Ec '^(acr import|copy).*:v1\.2\.3' "$LOG")"
 
-run_xs_promote xs_valfail fail pass RELEASE_VERSION=v1.2.3
-assert_nonzero "a failed validate_cross_subscription blocks release (AC-009/FR-025)" "$RC"
-assert_eq "no controller promotion when xs validation failed" "0" "$(grep -c 'acr import' "$AZLOG")"
-assert_eq "no CNI promotion when xs validation failed" "0" "$(grep -c 'copy' "$ORASLOG")"
+run_cmd secure
+assert_eq "both released digests are keyless signed" 2 "$(grep -c '^sign --yes ' "$LOG")"
+assert_eq "both SBOMs are attached" 2 "$(grep -c '^attach sbom ' "$LOG")"
 
-run_xs_promote xs_cleanfail pass fail RELEASE_VERSION=v1.2.3
-assert_nonzero "a failed cleanup_xs blocks release (RD-007/AC-008)" "$RC"
-assert_eq "no promotion when cleanup_xs failed" "0" "$(grep -c 'acr import' "$AZLOG")"
+run_cmd complete PROVENANCE_AVAILABLE=true MOVING_TAGS=latest,v1,v1.2
+assert_eq "complete succeeds after verification" 0 "$RC"
+assert_eq "both signatures are verified fail-closed" 2 "$(grep -c '^verify --certificate-' "$LOG")"
+assert_eq "both SLSA attestations are verified fail-closed" 2 "$(grep -c '^verify-attestation --type slsaprovenance ' "$LOG")"
+assert_match "controller semantic version published from verified digest" \
+  "acr import .*pod-nsg-controller@${CTRL_SHA}.*pod-nsg-controller:v1.2.3" "$(cat "$LOG")"
+assert_match "CNI semantic version published from verified digest" \
+  "copy .*pod-nsg-cni-transparent-tunnel@${CNI_SHA}.*pod-nsg-cni-transparent-tunnel:v1.2.3" "$(cat "$LOG")"
+assert_eq "released controller digest equals validated digest" "$CTRL_SHA" "$(manifest::get "$MANIFEST" '.release.controller.digest')"
+assert_eq "released CNI digest equals validated digest" "$CNI_SHA" "$(manifest::get "$MANIFEST" '.release.cni.digest')"
+assert_eq "release is marked complete only after all checks" true "$(manifest::get "$MANIFEST" '.release.complete')"
 
-run_xs_promote xs_valabsent - pass RELEASE_VERSION=v1.2.3
-assert_nonzero "an ABSENT validate_cross_subscription fails closed" "$RC"
-run_xs_promote xs_cleanabsent pass - RELEASE_VERSION=v1.2.3
-assert_nonzero "an ABSENT cleanup_xs fails closed" "$RC"
-
-echo "== xs gate: env overrides gate even when the manifest says pass =="
-run_xs_promote xs_env_val pass pass RELEASE_VERSION=v1.2.3 VALIDATE_XS_STATUS=failure
-assert_nonzero "explicit validate_cross_subscription=failure blocks release" "$RC"
-run_xs_promote xs_env_clean pass pass RELEASE_VERSION=v1.2.3 CLEANUP_XS_STATUS=failure
-assert_nonzero "explicit cleanup_xs=failure blocks release" "$RC"
-
-echo "== ITEM-018: complete release gate fails closed for every required result =="
-COMPLETE_ENV=(
-  REQUIRE_COMPLETE=1
-  LINT_STATUS=success
-  VALIDATE_SS_STATUS=success
-  VALIDATE_TT_STATUS=success
-  CLEANUP_SS_STATUS=success
-  VALIDATE_XS_STATUS=success
-  CLEANUP_XS_STATUS=success
+echo "== prior release gates remain mandatory =="
+COMPLETE_GATES=(
+  REQUIRE_COMPLETE=1 REQUIRE_XS=1
+  LINT_STATUS=success VALIDATE_SS_STATUS=success VALIDATE_TT_STATUS=success
+  CLEANUP_SS_STATUS=success VALIDATE_XS_STATUS=success CLEANUP_XS_STATUS=success
 )
-run_xs_promote complete_ok pass pass RELEASE_VERSION=v1.2.3 "${COMPLETE_ENV[@]}"
-assert_eq "complete gate opens only when every required result passes" "0" "$RC"
+new_case complete_gate
+run_cmd prepare "${COMPLETE_GATES[@]}"
+assert_eq "all prior validation and cleanup gates permit prepare" 0 "$RC"
+run_cmd abort
 for failed_gate in LINT_STATUS VALIDATE_SS_STATUS VALIDATE_TT_STATUS CLEANUP_SS_STATUS VALIDATE_XS_STATUS CLEANUP_XS_STATUS; do
-  failure_env=("${COMPLETE_ENV[@]}")
-  for i in "${!failure_env[@]}"; do
-    [[ "${failure_env[i]}" == "${failed_gate}="* ]] && failure_env[i]="${failed_gate}=failure"
+  new_case "gate_${failed_gate}"
+  gate_env=("${COMPLETE_GATES[@]}")
+  for i in "${!gate_env[@]}"; do
+    [[ "${gate_env[i]}" == "${failed_gate}="* ]] && gate_env[i]="${failed_gate}=failure"
   done
-  run_xs_promote "complete_${failed_gate}" pass pass RELEASE_VERSION=v1.2.3 "${failure_env[@]}"
-  assert_nonzero "forced ${failed_gate} failure blocks release" "$RC"
-  assert_eq "forced ${failed_gate} failure promotes neither artifact" "0" "$(grep -c 'acr import' "$AZLOG")"
+  run_cmd prepare "${gate_env[@]}"
+  assert_nonzero "forced ${failed_gate} failure blocks prepare" "$RC"
+  assert_eq "forced ${failed_gate} failure writes no transaction artifact" 0 \
+    "$(grep -Ec '^(acr import|copy)' "$LOG")"
 done
+
+echo "== AC-013: an existing immutable version blocks all writes =="
+new_case immutable
+run_cmd prepare MOCK_EXISTING_TAGS='pod-nsg-controller:v1.2.3'
+assert_nonzero "existing controller version fails" "$RC"
+assert_eq "immutable failure imports nothing" 0 "$(grep -c '^acr import' "$LOG")"
+assert_eq "immutable failure copies nothing" 0 "$(grep -c '^copy' "$LOG")"
+
+new_case immutable_cni
+run_cmd prepare MOCK_EXISTING_TAGS='pod-nsg-cni-transparent-tunnel:v1.2.3'
+assert_nonzero "existing CNI version fails" "$RC"
+assert_eq "CNI immutability is checked before writes" 0 "$(grep -c '^acr import' "$LOG")"
+
+echo "== NFR-011: partial prepare/finalize is rolled back before complete =="
+new_case prepare_rollback
+run_cmd prepare MOCK_COPY_FAIL_DEST='pod-nsg-cni-transparent-tunnel:_release-test'
+assert_nonzero "CNI staging failure fails prepare" "$RC"
+assert_match "controller transaction tag is rolled back" \
+  'acr repository delete .*pod-nsg-controller:_release-test' "$(cat "$LOG")"
+assert_eq "no semantic version is published after prepare failure" 0 \
+  "$(grep -Ec '^(acr import|copy).*:v1\.2\.3' "$LOG")"
+
+new_case digest_mismatch
+run_cmd prepare MOCK_CTRL_REMOTE="sha256:$(printf wrong | sha256sum | cut -c1-64)"
+assert_nonzero "public digest mismatch fails prepare" "$RC"
+assert_match "digest mismatch removes controller transaction tag" \
+  'acr repository delete .*pod-nsg-controller:_release-test' "$(cat "$LOG")"
+assert_match "digest mismatch removes CNI transaction tag" \
+  'acr repository delete .*pod-nsg-cni-transparent-tunnel:_release-test' "$(cat "$LOG")"
+
+new_case final_rollback
+run_cmd prepare
+run_cmd secure
+run_cmd complete PROVENANCE_AVAILABLE=true MOCK_COPY_FAIL_DEST='pod-nsg-cni-transparent-tunnel:v1.2.3'
+assert_nonzero "second semantic publication failure fails release" "$RC"
+assert_match "partial controller semantic tag is rolled back" \
+  'acr repository delete .*pod-nsg-controller:v1.2.3' "$(cat "$LOG")"
+assert_eq "failed release is never marked complete" "" "$(manifest::get "$MANIFEST" '.release.complete // empty')"
+
+echo "== ITEM-020: supply-chain verification fails closed =="
+new_case verify_fail
+run_cmd prepare
+run_cmd secure
+run_cmd complete PROVENANCE_AVAILABLE=true MOCK_COSIGN_VERIFY_FAIL=1
+assert_nonzero "signature verification failure blocks release" "$RC"
+assert_eq "signature failure publishes no semantic tag" 0 \
+  "$(grep -Ec '^(acr import|copy).*:v1\.2\.3' "$LOG")"
+
+new_case attest_fail
+run_cmd prepare
+run_cmd secure
+run_cmd complete PROVENANCE_AVAILABLE=true MOCK_ATTEST_VERIFY_FAIL=1
+assert_nonzero "provenance verification failure blocks release" "$RC"
+assert_eq "attestation failure publishes no semantic tag" 0 \
+  "$(grep -Ec '^(acr import|copy).*:v1\.2\.3' "$LOG")"
+
+new_case moving_rollback
+run_cmd prepare
+run_cmd secure
+run_cmd complete PROVENANCE_AVAILABLE=true MOVING_TAGS=latest \
+  MOCK_COPY_FAIL_DEST='pod-nsg-cni-transparent-tunnel:latest'
+assert_nonzero "partial moving-tag advancement fails release" "$RC"
+assert_match "controller moving tag is rolled back with its CNI peer" \
+  'acr repository delete .*pod-nsg-controller:latest' "$(cat "$LOG")"
+assert_match "moving-tag failure rolls back controller version" \
+  'acr repository delete .*pod-nsg-controller:v1.2.3' "$(cat "$LOG")"
+assert_match "moving-tag failure rolls back CNI version" \
+  'acr repository delete .*pod-nsg-cni-transparent-tunnel:v1.2.3' "$(cat "$LOG")"
+
+echo "== ITEM-021: anonymous configuration and unauthenticated dual pulls =="
+assert_match "public ACR anonymous pull is enabled" 'acr update .*--anonymous-pull-enabled true' "$(cat "${WORK}/happy/commands.log")"
+assert_match "anonymous setting is verified" 'acr show .*anonymousPullEnabled' "$(cat "${WORK}/happy/commands.log")"
+assert_match "docker credentials are cleared before controller pull" \
+  'logout pncpub.azurecr.io.*pull pncpub.azurecr.io/pod-nsg-controller:v1.2.3' "$(tr '\n' '|' <"${WORK}/happy/commands.log")"
+assert_match "CNI semantic tag is pulled without registry credentials" \
+  'pull --registry-config .*pncpub.azurecr.io/pod-nsg-cni-transparent-tunnel:v1.2.3' "$(cat "${WORK}/happy/commands.log")"
+
+new_case pull_fail
+run_cmd prepare
+run_cmd secure
+run_cmd complete PROVENANCE_AVAILABLE=true MOCK_ORAS_PULL_FAIL=1
+assert_nonzero "anonymous CNI pull failure fails closed" "$RC"
+assert_match "failed anonymous verification rolls back controller version" \
+  'acr repository delete .*pod-nsg-controller:v1.2.3' "$(cat "$LOG")"
+assert_match "failed anonymous verification rolls back CNI version" \
+  'acr repository delete .*pod-nsg-cni-transparent-tunnel:v1.2.3' "$(cat "$LOG")"
 
 echo
 printf 'promote_release_test: %s passed, %s failed\n' "$PASS" "$FAIL"

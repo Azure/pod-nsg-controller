@@ -32,7 +32,7 @@
 # the centraluseuap workers (control-plane excluded), provisions NSG rules
 # 190/200 + PodASGMappings, runs TTS-001..TTS-007, and always collects CNI
 # diagnostics. The controller+CNI digests form one atomic artifact set gated on
-# validate_tt by scripts/e2e/promote-release.sh (release job lands in EPIC-006).
+# validate_tt and released by digest with EPIC-006 supply-chain verification.
 #
 # Traceability: ITEM-001..ITEM-014, FR-001..FR-005, FR-011, FR-012, FR-015,
 # FR-016, FR-028, ITEM-028..ITEM-035, FR-018..FR-024, TTS-001..TTS-007,
@@ -1282,6 +1282,108 @@ jobs:
           manifest::put_json run-manifest.json artifacts.cni "$(jq -n --arg d "${CNI_DIGEST}" '{digest:$d}')"
           REQUIRE_COMPLETE=1 REQUIRE_XS=1 MANIFEST_PATH=run-manifest.json bash scripts/e2e/promote-release.sh gate
 
+  # EPIC-006: both validated digests are copied to transaction tags, secured,
+  # and attested before immutable semantic-version tags become public.
+  release:
+    name: Promote, attest, and verify public artifact set
+    needs: [meta, build, build_cni, release_gate]
+    if: ${{ github.event_name != 'pull_request' && needs.meta.outputs.release_requested == 'true' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    env:
+      PUBLIC_ACR: ${{ vars.E2E_PUBLIC_ACR }}
+      STAGING_ACR: ${{ vars.E2E_STAGING_ACR }}
+      RELEASE_VERSION: ${{ needs.meta.outputs.release_version }}
+      RELEASE_TRANSACTION_TAG: _release-${{ github.run_id }}-${{ github.run_attempt }}
+      MOVING_TAGS: ${{ vars.E2E_RELEASE_MOVING_TAGS }}
+      MANIFEST_PATH: run-manifest.json
+      CONTROLLER_SBOM_PATH: sbom/controller/controller.spdx.json
+      CNI_SBOM_PATH: sbom/cni/cni.spdx.json
+      COSIGN_CERTIFICATE_IDENTITY_REGEXP: ^https://github.com/${{ github.repository }}/
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install oras
+        uses: oras-project/setup-oras@v1
+
+      - name: Install cosign
+        uses: sigstore/cosign-installer@v3.9.2
+
+      - name: Download controller SBOM
+        uses: actions/download-artifact@v4
+        with:
+          name: sbom-controller
+          path: sbom/controller
+
+      - name: Download CNI SBOM
+        uses: actions/download-artifact@v4
+        with:
+          name: sbom-cni
+          path: sbom/cni
+
+      - name: Azure Login (OIDC)
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ inputs.primary_subscription_id || vars.E2E_PRIMARY_SUBSCRIPTION_ID }}
+
+      - name: Recreate validated artifact-set manifest
+        env:
+          CTRL_DIGEST: ${{ needs.build.outputs.image_digest }}
+          CTRL_REFERENCE: ${{ needs.build.outputs.image_reference }}
+          CNI_DIGEST: ${{ needs.build_cni.outputs.cni_digest }}
+          CNI_REFERENCE: ${{ needs.build_cni.outputs.cni_reference }}
+        run: |
+          source scripts/e2e/lib.sh
+          manifest::init "${MANIFEST_PATH}"
+          manifest::put_json "${MANIFEST_PATH}" artifacts.controller \
+            "$(jq -n --arg d "${CTRL_DIGEST}" --arg r "${CTRL_REFERENCE}" '{digest:$d,reference:$r}')"
+          manifest::put_json "${MANIFEST_PATH}" artifacts.cni \
+            "$(jq -n --arg d "${CNI_DIGEST}" --arg r "${CNI_REFERENCE}" '{digest:$d,reference:$r}')"
+          manifest::put "${MANIFEST_PATH}" validate.tt.status pass
+
+      - name: Prepare digest-pinned release transaction
+        run: bash scripts/e2e/promote-release.sh prepare
+
+      - name: Keyless-sign both digests and attach both SBOMs
+        run: bash scripts/e2e/promote-release.sh secure
+
+      - name: Emit controller SLSA build provenance
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-name: ${{ vars.E2E_PUBLIC_ACR }}/pod-nsg-controller
+          subject-digest: ${{ needs.build.outputs.image_digest }}
+          push-to-registry: true
+
+      - name: Emit CNI SLSA build provenance
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-name: ${{ vars.E2E_PUBLIC_ACR }}/pod-nsg-cni-transparent-tunnel
+          subject-digest: ${{ needs.build_cni.outputs.cni_digest }}
+          push-to-registry: true
+
+      - name: Publish immutable version and verify anonymous pulls
+        env:
+          PROVENANCE_AVAILABLE: "true"
+        run: bash scripts/e2e/promote-release.sh complete
+
+      - name: Remove release transaction tags
+        if: always()
+        run: bash scripts/e2e/promote-release.sh abort
+
+      - name: Upload release manifest
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: run-manifest-release
+          path: run-manifest.json
+          retention-days: 30
+
   naming-tests:
     name: Naming & metadata tests
     runs-on: ubuntu-latest
@@ -1314,6 +1416,7 @@ jobs:
           bash scripts/e2e/naming_test/collect_diagnostics_test.sh
           bash scripts/e2e/naming_test/workflow_epic010_test.sh
           bash scripts/e2e/naming_test/workflow_epic005_test.sh
+          bash scripts/e2e/naming_test/workflow_epic006_test.sh
 
       - name: Verify naming self-check
         run: bash scripts/e2e/naming.sh self-check
