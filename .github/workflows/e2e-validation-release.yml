@@ -26,9 +26,19 @@
 # membership is verified from the runner with `az rest`. The remaining
 # diagnostics / cleanup / release jobs are added by later epics.
 #
+# EPIC-009 adds the `build_cni` and `validate_tt` jobs: `build_cni` builds the
+# transparent-tunnel CNI artifact once via `make cni-artifact` and publishes it
+# by digest; `validate_tt` (after validate_multicluster, RD-017) installs it on
+# the centraluseuap workers (control-plane excluded), provisions NSG rules
+# 190/200 + PodASGMappings, runs TTS-001..TTS-007, and always collects CNI
+# diagnostics. The controller+CNI digests form one atomic artifact set gated on
+# validate_tt by scripts/e2e/promote-release.sh (release job lands in EPIC-006).
+#
 # Traceability: ITEM-001..ITEM-014, FR-001..FR-005, FR-011, FR-012, FR-015,
-# FR-016, FR-028, NFR-003, NFR-006, NFR-007, SEC-001, SEC-003, SEC-004, RD-004,
-# RD-020, CON-003, PRD 3.1/3.3/3.4/3.5/9.1.
+# FR-016, FR-028, ITEM-028..ITEM-035, FR-018..FR-024, TTS-001..TTS-007,
+# NFR-003, NFR-006, NFR-007, NFR-010, NFR-011, SEC-001, SEC-003, SEC-004,
+# SEC-006, RD-004, RD-013..RD-017, RD-020, CON-003, CON-010, CON-011,
+# PRD 3.1/3.3/3.4/3.5/3.6/9.1.
 # =============================================================================
 name: E2E Validation & Release
 
@@ -183,6 +193,102 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: run-manifest-build
+          path: run-manifest.json
+          retention-days: 30
+
+  # ===========================================================================
+  # EPIC-009 - Transparent-tunnel CNI artifact build/publish (ITEM-028/029).
+  #
+  # Builds/packages the transparent-tunnel CNI artifact ONCE via the repo-native
+  # `make cni-artifact` target (wrapping scripts/e2e/build-cni.sh, FR-018): it
+  # acquires the azure-vnet binary + azure-linux-transparent-tunnel.conflist from
+  # a PINNED azure-container-networking source (CON-011/RD-015), verifies a
+  # recorded checksum, asserts the conflist declares "mode": "transparent-tunnel",
+  # packages a digest-addressable OCI artifact, pushes it BY DIGEST to the staging
+  # ACR via OIDC (skipped on PRs, RD-009), generates an SBOM, and records the CNI
+  # digest into the run manifest. The exact pin (ref / prebuilt URL+checksum) is
+  # provided by EPIC-008 environment vars (ASSUMPTION-005); build-cni.sh carries
+  # the defaults. Runs in parallel with `build`; both digests form the atomic
+  # artifact set consumed by validate_tt and release (NFR-011).
+  build_cni:
+    name: Build & publish CNI artifact (by digest)
+    needs: meta
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      id-token: write
+    outputs:
+      cni_reference: ${{ steps.build_cni.outputs.cni_reference }}
+      cni_digest: ${{ steps.build_cni.outputs.cni_digest }}
+      cni_repo: ${{ steps.build_cni.outputs.cni_repo }}
+      cni_tag: ${{ steps.build_cni.outputs.cni_tag }}
+      cni_registry: ${{ steps.build_cni.outputs.cni_registry }}
+      pushed: ${{ steps.build_cni.outputs.pushed }}
+      sbom_path: ${{ steps.build_cni.outputs.sbom_path }}
+    steps:
+      - uses: actions/checkout@v4
+
+      # Thread the CNI digest through the single run manifest started by `meta`.
+      - name: Download run-manifest foundation
+        uses: actions/download-artifact@v4
+        with:
+          name: run-manifest
+          path: .
+
+      # Go toolchain for the primary source-build mode (GUD-001); oras packages
+      # the OCI artifact by digest; syft generates the SBOM.
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Install oras (OCI artifact push/copy by digest)
+        uses: oras-project/setup-oras@v1
+
+      - name: Install syft (SBOM)
+        uses: anchore/sbom-action/download-syft@v0.17.9
+
+      # OIDC login only for cloud-publishing runs (skipped on PRs, SEC-001).
+      - name: Azure Login (OIDC)
+        if: ${{ github.event_name != 'pull_request' }}
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      # Repo-native build/package/push by digest (make target wraps build-cni.sh).
+      # The CNI source pin is EPIC-008 configuration surfaced as environment vars;
+      # build-cni.sh supplies defaults when a var is unset (ASSUMPTION-005).
+      - name: Build CNI artifact, publish by digest, generate SBOM
+        id: build_cni
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          STAGING_ACR: ${{ vars.E2E_STAGING_ACR }}
+          CNI_STAGING_REPO: ${{ needs.meta.outputs.cni_staging_repo }}
+          CNI_STAGING_TAG: ${{ needs.meta.outputs.cni_staging_tag }}
+          CNI_SOURCE_MODE: ${{ vars.E2E_CNI_SOURCE_MODE }}
+          CNI_SOURCE_REPO: ${{ vars.E2E_CNI_SOURCE_REPO }}
+          CNI_SOURCE_REF: ${{ vars.E2E_CNI_SOURCE_REF }}
+          CNI_BINARY_URL: ${{ vars.E2E_CNI_BINARY_URL }}
+          CNI_CONFLIST_URL: ${{ vars.E2E_CNI_CONFLIST_URL }}
+          CNI_BINARY_SHA256: ${{ vars.E2E_CNI_BINARY_SHA256 }}
+          MANIFEST_PATH: run-manifest.json
+          SBOM_PATH: sbom/cni.spdx.json
+        run: make cni-artifact
+
+      - name: Upload CNI SBOM
+        uses: actions/upload-artifact@v4
+        with:
+          name: sbom-cni
+          path: sbom/cni.spdx.json
+          retention-days: 30
+
+      - name: Upload run-manifest (with candidate CNI digest)
+        uses: actions/upload-artifact@v4
+        with:
+          name: run-manifest-build-cni
           path: run-manifest.json
           retention-days: 30
 
@@ -453,6 +559,117 @@ jobs:
           path: run-manifest.json
           retention-days: 30
 
+  # ===========================================================================
+  # EPIC-009 - Transparent-tunnel same-node enforcement (ITEM-033/030/031/032/034).
+  #
+  # Runs AFTER validate_multicluster on the SHARED centraluseuap cluster (RD-017):
+  # installing transparent-tunnel and adding the deny rule mutate that cluster's
+  # data plane, so the stock-CNI membership tests MUST complete first. This job
+  # (1) pulls the candidate CNI artifact BY DIGEST and installs it on every
+  # centraluseuap worker (control-plane excluded, TTS-001), (2) provisions the
+  # NSG rules 190/200 + PodASGMappings, (3) runs TTS-001..TTS-007, publishing a
+  # per-scenario result into the run manifest, and (4) ALWAYS collects CNI/network
+  # diagnostics (FR-023). Any TTS failure fails the job and blocks release
+  # (FR-022/AC-009). kubectl/worker access is via `az vm run-command`; ASG
+  # membership is read from the runner with `az rest`.
+  validate_tt:
+    name: Validate transparent-tunnel (TTS-001..007)
+    needs: [meta, build_cni, validate_multicluster]
+    if: ${{ github.event_name != 'pull_request' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      TOPOLOGY: ss
+      REGION: centraluseuap
+      PRIMARY_SUBSCRIPTION_ID: ${{ inputs.primary_subscription_id || vars.E2E_PRIMARY_SUBSCRIPTION_ID }}
+      STAGING_ACR: ${{ vars.E2E_STAGING_ACR }}
+      CNI_REFERENCE: ${{ needs.build_cni.outputs.cni_reference }}
+    steps:
+      - uses: actions/checkout@v4
+
+      # Start from the build_cni manifest so artifacts.cni.* (reference, digest,
+      # recorded checksum) is available to install-cni-tt.sh (NFR-010).
+      - name: Download run-manifest (with candidate CNI digest)
+        uses: actions/download-artifact@v4
+        with:
+          name: run-manifest-build-cni
+          path: .
+
+      - name: Install oras (OCI artifact pull by digest)
+        uses: oras-project/setup-oras@v1
+
+      - name: Azure Login (OIDC)
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ env.PRIMARY_SUBSCRIPTION_ID }}
+
+      # 1) Install the validated CNI on every centraluseuap worker (CP excluded).
+      - name: Install transparent-tunnel CNI on workers (digest-verified)
+        env:
+          REPO: ${{ github.repository }}
+          RUN_ID: ${{ github.run_id }}
+          RUN_ATTEMPT: ${{ github.run_attempt }}
+          DATE_UTC: ${{ needs.meta.outputs.date_utc }}
+          MANIFEST_PATH: run-manifest.json
+        run: bash scripts/e2e/install-cni-tt.sh all
+
+      # 2) Provision NSG rules 190/200 + PodASGMappings (test doc §3).
+      - name: Provision transparent-tunnel enforcement fixtures
+        env:
+          REPO: ${{ github.repository }}
+          RUN_ID: ${{ github.run_id }}
+          RUN_ATTEMPT: ${{ github.run_attempt }}
+          DATE_UTC: ${{ needs.meta.outputs.date_utc }}
+          MANIFEST_PATH: run-manifest.json
+        run: bash scripts/e2e/provision-tt-fixtures.sh all
+
+      # 3) Run the seven enforcement scenarios; any failure fails the job.
+      - name: Run TTS-001..TTS-007
+        id: validate_tt
+        env:
+          REPO: ${{ github.repository }}
+          RUN_ID: ${{ github.run_id }}
+          RUN_ATTEMPT: ${{ github.run_attempt }}
+          DATE_UTC: ${{ needs.meta.outputs.date_utc }}
+          MANIFEST_PATH: run-manifest.json
+        run: bash scripts/e2e/run-tt-validation.sh all
+
+      # 4) ALWAYS collect CNI/network diagnostics so evidence exists on pass AND
+      # forced-fail runs (FR-023/AC-007). The standalone EPIC-005 diagnostics job
+      # (ITEM-015) also invokes this collector; wiring it here keeps CNI evidence
+      # attached to validate_tt without coupling to that job.
+      - name: Collect transparent-tunnel CNI/network diagnostics
+        if: always()
+        env:
+          REPO: ${{ github.repository }}
+          RUN_ID: ${{ github.run_id }}
+          RUN_ATTEMPT: ${{ github.run_attempt }}
+          DATE_UTC: ${{ needs.meta.outputs.date_utc }}
+          MANIFEST_PATH: run-manifest.json
+          CNI_DIAG_DIR: cni-diagnostics
+        run: bash scripts/e2e/collect-cni-diagnostics.sh all
+
+      - name: Upload CNI/network diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: cni-diagnostics
+          path: cni-diagnostics/
+          retention-days: 30
+
+      - name: Upload transparent-tunnel validation manifest
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: run-manifest-validate-tt
+          path: run-manifest.json
+          retention-days: 30
+
   naming-tests:
     name: Naming & metadata tests
     runs-on: ubuntu-latest
@@ -463,7 +680,7 @@ jobs:
       - name: shellcheck e2e scripts
         run: shellcheck scripts/e2e/*.sh scripts/e2e/naming_test/*.sh
 
-      - name: Run naming, lib, meta, build, provision, rbac, deploy, and validation test suites
+      - name: Run naming, lib, meta, build, provision, rbac, deploy, validation, and CNI/TT test suites
         run: |
           bash scripts/e2e/naming_test/naming_test.sh
           bash scripts/e2e/naming_test/lib_test.sh
@@ -473,6 +690,12 @@ jobs:
           bash scripts/e2e/naming_test/cross_region_rbac_test.sh
           bash scripts/e2e/naming_test/deploy_controller_test.sh
           bash scripts/e2e/naming_test/run_validation_test.sh
+          bash scripts/e2e/naming_test/build_cni_test.sh
+          bash scripts/e2e/naming_test/install_cni_tt_test.sh
+          bash scripts/e2e/naming_test/provision_tt_fixtures_test.sh
+          bash scripts/e2e/naming_test/run_tt_validation_test.sh
+          bash scripts/e2e/naming_test/collect_cni_diagnostics_test.sh
+          bash scripts/e2e/naming_test/promote_release_test.sh
 
       - name: Verify naming self-check
         run: bash scripts/e2e/naming.sh self-check

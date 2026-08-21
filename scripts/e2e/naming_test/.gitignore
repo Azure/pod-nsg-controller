@@ -4,3 +4,9 @@
 .meta_test_work/
 .metawork/
 .build_test_work/
+.build_cni_test_work/
+.install_cni_tt_test_work/
+.provision_tt_fixtures_test_work/
+.run_tt_validation_test_work/
+.collect_cni_diagnostics_test_work/
+.promote_release_test_work/

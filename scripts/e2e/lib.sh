@@ -303,6 +303,37 @@ manifest::record_controller_artifact() {
       digest: $digest, reference: $reference, pushed: $pushed}')"
 }
 
+# manifest::record_cni_artifact <path> <registry> <repo> <tag> <digest> <pushed>
+# Records the candidate transparent-tunnel CNI OCI artifact coordinates and its
+# immutable digest reference under `.artifacts.cni`, mirroring the controller
+# recorder so validate_tt/install/release consume the CNI by @sha256 digest too
+# (EPIC-009 / ITEM-029 / FR-002 / FR-018 / NFR-010 / NFR-011 / AC-001 / AC-016).
+#
+#   * pushed=true  -> reference is BY @sha256 digest: "<registry>/<repo>@<digest>"
+#                     (the only form install/release may pull, FR-002/NFR-011).
+#   * pushed=false + registry -> "<registry>/<repo>:<tag>" (candidate not pushed).
+#   * pushed=false, no registry -> bare "<repo>:<tag>" (PR local package, no cloud).
+#
+# The <digest> (registry/OCI manifest digest when pushed, local content digest
+# otherwise) is always recorded so build->validate->release references one CNI
+# digest (NFR-006/NFR-010), keeping the controller+CNI artifact set atomic.
+manifest::record_cni_artifact() {
+  local path="$1" registry="$2" repo="$3" tag="$4" digest="$5" pushed="${6:-false}"
+  local reference pushed_json
+  if [[ "$pushed" == "true" && -n "$digest" ]]; then
+    reference="${registry:+${registry}/}${repo}@${digest}"
+    pushed_json=true
+  else
+    reference="${registry:+${registry}/}${repo}:${tag}"
+    pushed_json=false
+  fi
+  manifest::put_json "$path" artifacts.cni "$(jq -n \
+    --arg registry "$registry" --arg repo "$repo" --arg tag "$tag" \
+    --arg digest "$digest" --arg reference "$reference" --argjson pushed "$pushed_json" \
+    '{registry: $registry, repo: $repo, tag: $tag,
+      digest: $digest, reference: $reference, pushed: $pushed}')"
+}
+
 # manifest::get <path> <jq-filter> : print a raw value from the manifest.
 manifest::get() { jq -r "$2" "$1"; }
 
