@@ -639,12 +639,12 @@ Each scenario below is a discrete, independently-reported validation gate derive
 | ITEM-024 | Configure concurrency: non-cancelable `pnc-e2e-cloud` group for provision/validate/release (RD-008) and a cancelable group for PR fast-checks; set `timeout-minutes` and retry/backoff via `lib.sh`. Validation: overlapping runs serialize; PR reruns cancel prior fast-checks. | Done | .github/workflows/e2e-validation-release.yml, scripts/e2e/lib.sh |
 | ITEM-025 | Finalize the manifest with topology/subscription-role maps, artifact digests, `ss` and `xs` Tests 1–4, XSUB/TTS results, assignment IDs, and per-subscription cleanup evidence. | Done | .github/workflows/e2e-validation-release.yml, scripts/e2e/finalize-manifest.sh, scripts/e2e/lib.sh |
 
-- EPIC-008: Bootstrap and documentation — one-time durable prerequisites and operator guide.
+- EPIC-008 (Status: Done): Bootstrap and documentation — one-time durable prerequisites and operator guide.
 
 | Task | Description | Status | Relevant Files |
 |------|-------------|--------|----------------|
-| ITEM-026 | Author `bootstrap.md` for separate primary/secondary OIDC identities, least-privilege custom roles, GitHub Environment variables, both-subscription provider/quota checks, registries, release controls, and CNI pin policy. | Not Started | docs/projects/infrastructure-e2e-validation-pipeline/bootstrap.md |
-| ITEM-027 | Add `shellcheck` linting for `scripts/e2e/*.sh` to the lint job and update `README.md` to document the released public image AND CNI artifact paths, the `make cni-artifact` target, and pull commands. Validation: TEST-001 passes; README shows `docker pull <public-acr>/pod-nsg-controller:<semver>` and the `oras pull` for the CNI artifact. | Not Started | .github/workflows/e2e-validation-release.yml, README.md, Makefile |
+| ITEM-026 | Author `bootstrap.md` for separate primary/secondary OIDC identities, least-privilege custom roles, GitHub Environment variables, both-subscription provider/quota checks, registries, release controls, and CNI pin policy. | Done | docs/projects/infrastructure-e2e-validation-pipeline/bootstrap.md |
+| ITEM-027 | Add `shellcheck` linting for `scripts/e2e/*.sh` to the lint job and update `README.md` to document the released public image AND CNI artifact paths, the `make cni-artifact` target, and pull commands. Validation: TEST-001 passes; README shows `docker pull <public-acr>/pod-nsg-controller:<semver>` and the `oras pull` for the CNI artifact. | Done | .github/workflows/e2e-validation-release.yml, README.md, Makefile |
 
 - EPIC-009 (Status: Done): Transparent-tunnel CNI build/packaging, install, enforcement validation, and artifact-set release.
 

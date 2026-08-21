@@ -1504,7 +1504,9 @@ jobs:
           make test
           make test-phase9-integration
 
-      - name: shellcheck e2e scripts
+      # EPIC-008 / TEST-001: shellcheck exits non-zero on findings, so any
+      # violation in the shipped E2E scripts fails the lint gate and release.
+      - name: ShellCheck E2E scripts (required)
         run: shellcheck scripts/e2e/*.sh scripts/e2e/naming_test/*.sh
 
       - name: Run naming, lib, meta, build, provision, rbac, deploy, validation, and CNI/TT test suites
@@ -1532,6 +1534,7 @@ jobs:
           bash scripts/e2e/naming_test/workflow_epic006_test.sh
           bash scripts/e2e/naming_test/finalize_manifest_test.sh
           bash scripts/e2e/naming_test/workflow_epic007_test.sh
+          bash scripts/e2e/naming_test/workflow_epic008_test.sh
 
       - name: Verify naming self-check
         run: bash scripts/e2e/naming.sh self-check

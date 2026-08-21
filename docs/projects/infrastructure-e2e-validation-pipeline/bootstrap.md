@@ -1,94 +1,394 @@
-# E2E validation & release — one-time bootstrap (cross-subscription scope)
+# E2E validation and release bootstrap
 
-> Scope note: this file currently documents the **cross-subscription (`xs`)
-> identity, RBAC, and pre-provisioning preflight** introduced by **EPIC-010
-> (ITEM-036)**. The full one-time setup guide — public/staging registries,
-> release-environment controls, and the transparent-tunnel CNI pin policy — is
-> authored by **EPIC-008 (ITEM-026)** and will extend this document. Everything
-> below is a durable, out-of-band operator action; the pipeline never creates
-> these resources per run (CON-007/CON-008).
+This guide covers the durable, one-time prerequisites for
+`.github/workflows/e2e-validation-release.yml` and
+`.github/workflows/e2e-reaper.yml`. The pipeline never creates these
+subscription identities, role definitions, registries, or GitHub Environment
+controls per run (CON-007/CON-008).
 
-The pipeline authenticates to Azure with **GitHub OIDC only** — no long-lived
-cloud secret is ever stored (NFR-005/SEC-001). The `xs` topology spans **two
-distinct subscriptions**, so it uses **two separate federated identities**, one
-per subscription, and passes an explicit `--subscription` on every Azure
-operation (RD-020). This bounds blast radius and eliminates mutable
-`az account` context mistakes.
+The pipeline authenticates to Azure with GitHub OIDC only. Do not create client
+secrets, registry passwords, or committed SAS URLs (NFR-005/SEC-001/SEC-006).
+The cross-subscription (`xs`) topology uses two distinct subscriptions and two
+distinct federated identities. Every Azure operation in the pipeline passes an
+explicit subscription ID; bootstrap and troubleshooting commands should do the
+same (RD-020).
 
-## 1. Separate OIDC federated identities (one per subscription)
+## 1. Record the bootstrap inputs
 
-Create one least-privilege app registration / user-assigned identity **per
-subscription** and federate each to this repository's `azure-e2e` GitHub
-Environment (SEC-002/RD-020).
-
-| Role | Subscription | GitHub secrets | GitHub variable |
-|------|--------------|----------------|-----------------|
-| Primary (Cluster A + shared ASGs) | `primary_subscription_id` | `AZURE_CLIENT_ID`, `AZURE_TENANT_ID` | `E2E_PRIMARY_SUBSCRIPTION_ID` |
-| Secondary (Cluster B, `xs` only) | `secondary_subscription_id` | `AZURE_SECONDARY_CLIENT_ID`, `AZURE_SECONDARY_TENANT_ID` | `E2E_SECONDARY_SUBSCRIPTION_ID` |
-
-- `E2E_SECONDARY_SUBSCRIPTION_ID` **MUST** be a separately configured Environment
-  variable and **MUST differ** from the primary; no secondary default is hard-coded
-  into workflow source (CON-002). A run may override either via the
-  `primary_subscription_id` / `secondary_subscription_id` workflow inputs.
-- Federated-credential subject: scope each credential to this repo and the
-  `azure-e2e` environment (and `public-release` for the release identity).
-
-### Least privilege (subscription-level bootstrap role)
-
-Each per-subscription federated identity gets a **custom role** limited to the
-run lifecycle — never `Owner` (SEC-002):
-
-- create/delete **tagged** run resource groups (`Microsoft.Resources/subscriptions/resourceGroups/*`);
-- assign/remove the approved runtime role (`Microsoft.Authorization/roleAssignments/write|delete`)
-  **scoped to run resource groups** so the workflow can grant/revoke the runtime
-  VM grants created by `scripts/e2e/setup-cross-sub-rbac.sh`.
-
-Runtime cluster-node (VM managed) identities receive only **`Network Contributor`
-on the primary run resource group** (RG-scoped, never subscription-scoped) so the
-controller can write the shared ASGs; Cluster B's grant crosses the subscription
-boundary. These grants are created, inventoried by assignment ID, and later
-removed/verified by the pipeline (FR-026/XSUB-003/AC-027).
-
-## 2. Cross-cutting job authentication (both subscriptions)
-
-Jobs that touch a **single** subscription log in once with that subscription's
-identity. Jobs that must touch **both** subscriptions in one job —
-`rbac_xs` (read Cluster B principals in secondary, grant on primary), the
-`validate_cross_subscription` seam, `diagnostics_xs`, and `cleanup_xs` —
-authenticate to **each** identity with two `azure/login@v2` steps. Because every
-script passes an explicit `--subscription`, the correct cached OIDC token is
-selected per call; no script relies on the active-account context (RD-020).
-
-## 3. Pre-provisioning preflight (fail before provisioning)
-
-Before **any** `xs` resource is created, the `preflight_xs` job fails closed unless
-all of the following pass for the relevant subscription(s) (FR-025/AC-024). The
-checks are implemented as side-effect-free helpers in `scripts/e2e/lib.sh`:
-
-| Check | Helper | Fails when |
-|-------|--------|-----------|
-| Distinct subscriptions | `lib::assert_distinct_subscriptions <primary> <secondary>` | IDs empty or equal |
-| Tenant/subscription validation | `lib::az_subscription_validate <az> <sub> [tenant]` | subscription inaccessible / not `Enabled` / tenant mismatch |
-| Network provider + EUAP API | `lib::az_provider_preflight <az> <sub> Microsoft.Network applicationSecurityGroups 2025-07-01` | `Microsoft.Network` not `Registered`, or the `addressPrefixSets` api-version `2025-07-01` is unavailable (CON-001) |
-| EUAP VM quota | `lib::az_vm_quota_preflight <az> <sub> <region> standardDSv5Family 16` | insufficient family/total vCPUs for 1 control-plane + 3 workers |
-
-`meta` (pure computation, no cloud) additionally fails the run early if a release
-omits either topology or if the `xs` subscription IDs are equal (CON-009/FR-025);
-`preflight_xs` adds the cloud-touching identity, provider, and quota gates for
-**both** subscriptions.
-
-## 4. Verify (dry run)
+Set local shell variables for the operator performing the one-time setup:
 
 ```bash
-# distinct + accessible + provider/API + quota, per subscription (uses real `az`)
-source scripts/e2e/lib.sh
-lib::assert_distinct_subscriptions "$PRIMARY_SUBSCRIPTION_ID" "$SECONDARY_SUBSCRIPTION_ID"
-lib::az_subscription_validate az "$PRIMARY_SUBSCRIPTION_ID"
-lib::az_subscription_validate az "$SECONDARY_SUBSCRIPTION_ID"
-lib::az_provider_preflight   az "$PRIMARY_SUBSCRIPTION_ID"   Microsoft.Network applicationSecurityGroups 2025-07-01
-lib::az_provider_preflight   az "$SECONDARY_SUBSCRIPTION_ID" Microsoft.Network
-lib::az_vm_quota_preflight   az "$PRIMARY_SUBSCRIPTION_ID"   eastus2euap    standardDSv5Family 16
-lib::az_vm_quota_preflight   az "$SECONDARY_SUBSCRIPTION_ID" centraluseuap  standardDSv5Family 16
+export GITHUB_OWNER="<owner>"
+export GITHUB_REPOSITORY="pod-nsg-controller"
+export PRIMARY_SUBSCRIPTION_ID="<primary-subscription-id>"
+export SECONDARY_SUBSCRIPTION_ID="<secondary-subscription-id>"
+export PRIMARY_TENANT_ID="<primary-tenant-id>"
+export SECONDARY_TENANT_ID="<secondary-tenant-id>"
+export PRIMARY_CLIENT_ID="<primary-federated-client-id>"
+export SECONDARY_CLIENT_ID="<secondary-federated-client-id>"
+export PRIMARY_PRINCIPAL_ID="<primary-service-principal-object-id>"
+export SECONDARY_PRINCIPAL_ID="<secondary-service-principal-object-id>"
+export STAGING_ACR="<private-staging-acr-login-server>"
+export PUBLIC_ACR="<public-release-acr-login-server>"
+
+test "${PRIMARY_SUBSCRIPTION_ID}" != "${SECONDARY_SUBSCRIPTION_ID}"
 ```
 
-All commands pass an explicit `--subscription` and never run `az account set`.
+The supported design is two subscriptions in the same tenant. A cross-tenant
+deployment requires an explicitly reviewed federation and RBAC design; do not
+reuse the same client ID as an implicit fallback.
+
+## 2. Create separate GitHub OIDC identities
+
+Use one app registration or user-assigned managed identity per subscription.
+The identity represented by `PRIMARY_CLIENT_ID` owns primary-subscription
+provisioning, staging publication, and reviewed public release. The identity
+represented by `SECONDARY_CLIENT_ID` can operate only in the secondary
+subscription.
+
+Create federated credentials with these exact GitHub subject forms:
+
+| Identity | GitHub Environment | Federated subject |
+|---|---|---|
+| Primary | `azure-e2e` | `repo:<owner>/pod-nsg-controller:environment:azure-e2e` |
+| Primary | `public-release` | `repo:<owner>/pod-nsg-controller:environment:public-release` |
+| Secondary | `azure-e2e` | `repo:<owner>/pod-nsg-controller:environment:azure-e2e` |
+
+Each credential uses issuer
+`https://token.actions.githubusercontent.com` and audience
+`api://AzureADTokenExchange`. Do not add branch-wide or pull-request subjects:
+cloud jobs are intentionally protected by GitHub Environments and pull requests
+must not receive an Azure token.
+
+Example federated-credential document for an app registration:
+
+```json
+{
+  "name": "github-azure-e2e",
+  "issuer": "https://token.actions.githubusercontent.com",
+  "subject": "repo:<owner>/pod-nsg-controller:environment:azure-e2e",
+  "description": "Pod NSG controller E2E environment",
+  "audiences": ["api://AzureADTokenExchange"]
+}
+```
+
+Create it with `az ad app federated-credential create --id <app-object-id>
+--parameters <credential-file>`. Create the second primary credential with the
+`public-release` subject. For a user-assigned managed identity, create the same
+issuer/subject/audience tuple with `az identity federated-credential create`.
+
+## 3. Assign least-privilege Azure roles
+
+Never assign `Owner`. Create purpose-specific custom roles and assign them only
+at the scopes shown below. The role-definition `AssignableScopes` permits the
+role to exist at a subscription; the role assignment is what grants access.
+
+Azure RBAC does not make resource-group create/delete permissions conditional
+on tags. The subscription-scoped permission therefore cannot itself enforce the
+`validation-purpose=pnc-e2e` tag. The workflow enforces and audits the required
+tag set, cleanup operates only on deterministic run names/recorded IDs, and the
+reaper filters on the required tags. Review those controls whenever the role is
+changed.
+
+### 3.1 Infrastructure operator roles
+
+Create one role definition in each subscription. Replace the assignable-scope
+placeholder and give each definition a unique role name. The primary role needs
+role-assignment write access because it grants VM managed identities `Network
+Contributor` on the primary run resource group. The secondary role does not.
+
+Primary role actions:
+
+```json
+{
+  "Name": "Pod NSG E2E Primary Infrastructure Operator",
+  "IsCustom": true,
+  "Description": "Provision and reap tagged Pod NSG E2E resources and manage run-RG Network Contributor assignments.",
+  "Actions": [
+    "Microsoft.Resources/subscriptions/read",
+    "Microsoft.Resources/subscriptions/resourceGroups/read",
+    "Microsoft.Resources/subscriptions/resourceGroups/write",
+    "Microsoft.Resources/subscriptions/resourceGroups/delete",
+    "Microsoft.Resources/subscriptions/resourceGroups/resources/read",
+    "Microsoft.Resources/providers/read",
+    "Microsoft.Compute/locations/usages/read",
+    "Microsoft.Compute/virtualMachines/*",
+    "Microsoft.Compute/disks/*",
+    "Microsoft.Network/networkSecurityGroups/*",
+    "Microsoft.Network/virtualNetworks/*",
+    "Microsoft.Network/publicIPAddresses/*",
+    "Microsoft.Network/natGateways/*",
+    "Microsoft.Network/networkInterfaces/*",
+    "Microsoft.Network/applicationSecurityGroups/*",
+    "Microsoft.Authorization/roleDefinitions/read",
+    "Microsoft.Authorization/roleAssignments/read",
+    "Microsoft.Authorization/roleAssignments/write",
+    "Microsoft.Authorization/roleAssignments/delete"
+  ],
+  "NotActions": [],
+  "DataActions": [],
+  "NotDataActions": [],
+  "AssignableScopes": ["/subscriptions/<primary-subscription-id>"]
+}
+```
+
+Secondary role actions are identical except that
+`Microsoft.Authorization/roleAssignments/write` is omitted:
+
+```json
+{
+  "Name": "Pod NSG E2E Secondary Infrastructure Operator",
+  "IsCustom": true,
+  "Description": "Provision and reap tagged Pod NSG E2E resources in the secondary subscription.",
+  "Actions": [
+    "Microsoft.Resources/subscriptions/read",
+    "Microsoft.Resources/subscriptions/resourceGroups/read",
+    "Microsoft.Resources/subscriptions/resourceGroups/write",
+    "Microsoft.Resources/subscriptions/resourceGroups/delete",
+    "Microsoft.Resources/subscriptions/resourceGroups/resources/read",
+    "Microsoft.Resources/providers/read",
+    "Microsoft.Compute/locations/usages/read",
+    "Microsoft.Compute/virtualMachines/*",
+    "Microsoft.Compute/disks/*",
+    "Microsoft.Network/networkSecurityGroups/*",
+    "Microsoft.Network/virtualNetworks/*",
+    "Microsoft.Network/publicIPAddresses/*",
+    "Microsoft.Network/natGateways/*",
+    "Microsoft.Network/networkInterfaces/*",
+    "Microsoft.Network/applicationSecurityGroups/*",
+    "Microsoft.Authorization/roleDefinitions/read",
+    "Microsoft.Authorization/roleAssignments/read",
+    "Microsoft.Authorization/roleAssignments/delete"
+  ],
+  "NotActions": [],
+  "DataActions": [],
+  "NotDataActions": [],
+  "AssignableScopes": ["/subscriptions/<secondary-subscription-id>"]
+}
+```
+
+Create and assign the definitions:
+
+```bash
+az role definition create --role-definition primary-role.json
+az role definition create --role-definition secondary-role.json
+
+az role assignment create \
+  --assignee-object-id "${PRIMARY_PRINCIPAL_ID}" \
+  --assignee-principal-type ServicePrincipal \
+  --role "Pod NSG E2E Primary Infrastructure Operator" \
+  --scope "/subscriptions/${PRIMARY_SUBSCRIPTION_ID}"
+
+az role assignment create \
+  --assignee-object-id "${SECONDARY_PRINCIPAL_ID}" \
+  --assignee-principal-type ServicePrincipal \
+  --role "Pod NSG E2E Secondary Infrastructure Operator" \
+  --scope "/subscriptions/${SECONDARY_SUBSCRIPTION_ID}"
+```
+
+At runtime, the primary identity assigns the built-in `Network Contributor`
+role to each run VM managed identity at exactly:
+
+```text
+/subscriptions/<primary-subscription-id>/resourceGroups/<primary-run-rg>
+```
+
+It must never grant a VM identity at subscription scope. Assignment IDs are
+recorded in `run-manifest.json`, removed by cleanup, and checked by the reaper.
+
+### 3.2 Registry roles
+
+Keep registry permissions separate from infrastructure permissions:
+
+- Assign the primary identity `AcrPush` on the staging ACR. Staging remains
+  private and anonymous pull stays disabled.
+- Grant the primary identity only the staging-registry control-plane actions
+  needed to create/delete repository-scoped scope maps and tokens and generate
+  their short-lived credentials. Scope this custom assignment to the staging
+  ACR, not the subscription.
+- Assign the primary identity `AcrPush` on the public ACR and a custom
+  public-release role scoped to that registry with
+  `Microsoft.ContainerRegistry/registries/read`,
+  `Microsoft.ContainerRegistry/registries/write`, and
+  `Microsoft.ContainerRegistry/registries/importImage/action`. These actions
+  support digest import, immutable release tags, and anonymous-pull
+  configuration.
+- The secondary identity receives no staging or public registry role.
+
+The staging token-manager role should contain only:
+
+```text
+Microsoft.ContainerRegistry/registries/read
+Microsoft.ContainerRegistry/registries/tokens/read
+Microsoft.ContainerRegistry/registries/tokens/write
+Microsoft.ContainerRegistry/registries/tokens/delete
+Microsoft.ContainerRegistry/registries/tokens/generateCredentials/action
+Microsoft.ContainerRegistry/registries/scopeMaps/read
+Microsoft.ContainerRegistry/registries/scopeMaps/write
+Microsoft.ContainerRegistry/registries/scopeMaps/delete
+```
+
+If the registries use ACR ABAC repository permissions, use the equivalent
+repository-scoped Reader/Writer roles instead of classic `AcrPush`; do not grant
+registry `Contributor` as a shortcut.
+
+## 4. Configure registries
+
+Provision two durable registries before enabling the workflow:
+
+| Registry | Visibility | Repository paths | Required behavior |
+|---|---|---|---|
+| Staging | Private | `candidate/pod-nsg-controller`, `candidate/pod-nsg-cni-transparent-tunnel` | Anonymous pull disabled; candidate tags are temporary; validation consumes digests |
+| Public release | Anonymous pull | `pod-nsg-controller`, `pod-nsg-cni-transparent-tunnel` | Both artifacts share one immutable semantic version; moving tags are optional |
+
+The release workflow promotes the exact validated controller and CNI digests;
+it never rebuilds either artifact. Public access is enabled only on the public
+registry. Confirm that organizational policy permits anonymous ACR pull before
+enabling releases.
+
+## 5. Configure GitHub Environments
+
+Create both Environments in the GitHub repository settings.
+
+### `azure-e2e`
+
+Configure these Environment secrets:
+
+| Secret | Value |
+|---|---|
+| `AZURE_CLIENT_ID` | Primary federated identity client ID |
+| `AZURE_TENANT_ID` | Primary tenant ID |
+| `AZURE_SUBSCRIPTION_ID` | Primary subscription ID; retained for the build jobs' `azure/login` contract |
+| `AZURE_SECONDARY_CLIENT_ID` | Secondary federated identity client ID |
+| `AZURE_SECONDARY_TENANT_ID` | Secondary tenant ID |
+
+Configure these Environment variables:
+
+| Variable | Required value |
+|---|---|
+| `E2E_PRIMARY_SUBSCRIPTION_ID` | Primary subscription ID; must match `AZURE_SUBSCRIPTION_ID` |
+| `E2E_SECONDARY_SUBSCRIPTION_ID` | Distinct secondary subscription ID |
+| `E2E_STAGING_ACR` | Staging ACR login server, without scheme |
+| `E2E_CNI_SOURCE_MODE` | `source` for production; `prebuilt` only under the checksum policy below |
+| `E2E_CNI_SOURCE_REPO` | `https://github.com/Azure/azure-container-networking` or an approved mirror |
+| `E2E_CNI_SOURCE_REF` | Reviewed immutable commit SHA (preferred) or immutable signed release tag |
+| `E2E_CNI_BINARY_SHA256` | Expected lowercase SHA-256 of the built or prebuilt `azure-vnet` |
+| `E2E_CNI_BINARY_URL` | Empty for `source`; pinned credential-free URL for `prebuilt` |
+| `E2E_CNI_CONFLIST_URL` | Empty for `source`; pinned credential-free URL for `prebuilt` |
+
+Require reviewers for `azure-e2e` if cloud cost or EUAP capacity policy requires
+manual approval. Restrict deployment branches to the default branch and
+approved release tags. Do not expose this Environment to pull requests from
+forks.
+
+### `public-release`
+
+Configure the same primary `AZURE_CLIENT_ID` and `AZURE_TENANT_ID` secrets, and
+these variables:
+
+| Variable | Required value |
+|---|---|
+| `E2E_PRIMARY_SUBSCRIPTION_ID` | Primary subscription ID |
+| `E2E_STAGING_ACR` | Private staging ACR login server |
+| `E2E_PUBLIC_ACR` | Public ACR login server, without scheme |
+| `E2E_RELEASE_MOVING_TAGS` | Optional reviewed list such as `latest,v1,v1.2`; empty publishes only the immutable version |
+
+Set at least one required reviewer who is authorized to publish. Prevent
+self-review when policy requires separation of duties, restrict deployment to
+protected release tags/default branch, and do not add bypass rules for the
+workflow identity. Approval is the final human boundary after all validation
+and verified cleanup gates pass.
+
+## 6. Validate both subscriptions before the first run
+
+The workflow performs these checks before provisioning. Run the same
+side-effect-free checks during bootstrap:
+
+```bash
+source scripts/e2e/lib.sh
+
+lib::assert_distinct_subscriptions \
+  "${PRIMARY_SUBSCRIPTION_ID}" "${SECONDARY_SUBSCRIPTION_ID}"
+
+lib::az_subscription_validate \
+  az "${PRIMARY_SUBSCRIPTION_ID}" "${PRIMARY_TENANT_ID}"
+lib::az_subscription_validate \
+  az "${SECONDARY_SUBSCRIPTION_ID}" "${SECONDARY_TENANT_ID}"
+
+# Both subscriptions need Network and Compute. The primary also hosts the
+# addressPrefixSets API used by the controller and validation.
+lib::az_provider_preflight \
+  az "${PRIMARY_SUBSCRIPTION_ID}" Microsoft.Network applicationSecurityGroups 2025-07-01
+lib::az_provider_preflight \
+  az "${PRIMARY_SUBSCRIPTION_ID}" Microsoft.Compute
+lib::az_provider_preflight \
+  az "${SECONDARY_SUBSCRIPTION_ID}" Microsoft.Network
+lib::az_provider_preflight \
+  az "${SECONDARY_SUBSCRIPTION_ID}" Microsoft.Compute
+
+# One control-plane plus three Standard_D4s_v5 workers requires 16 vCPUs.
+lib::az_vm_quota_preflight \
+  az "${PRIMARY_SUBSCRIPTION_ID}" eastus2euap standardDSv5Family 16
+lib::az_vm_quota_preflight \
+  az "${PRIMARY_SUBSCRIPTION_ID}" centraluseuap standardDSv5Family 16
+lib::az_vm_quota_preflight \
+  az "${SECONDARY_SUBSCRIPTION_ID}" centraluseuap standardDSv5Family 16
+```
+
+Also verify that:
+
+1. `Microsoft.Network` and `Microsoft.Compute` are already registered in both
+   subscriptions. The pipeline checks registration but does not register
+   providers.
+2. The primary subscription exposes the
+   `Microsoft.Network/applicationSecurityGroups/addressPrefixSets` API version
+   `2025-07-01`.
+3. Both subscriptions can allocate `Standard_D4s_v5` in their assigned EUAP
+   regions and have both family and total regional vCPU quota.
+4. Azure Policy allows the required VMs, managed identities, NSGs, public IPs,
+   NAT gateways, NIC secondary IP configurations, and required correlation
+   tags.
+
+## 7. CNI source pin and checksum update policy
+
+Production uses `source` mode. The repository default currently identifies the
+upstream source in `scripts/e2e/build-cni.sh`; the GitHub Environment values are
+the reviewed production pin. Prefer a full immutable commit SHA over a moving
+branch or mutable tag.
+
+To update the pin:
+
+1. Review the upstream commit/tag and transparent-tunnel conflist changes.
+   Confirm `cni/azure-linux-transparent-tunnel.conflist` still declares
+   `"mode": "transparent-tunnel"`.
+2. Build `azure-vnet` for `linux/amd64` from that exact ref in a clean,
+   controlled environment. Record `sha256sum azure-vnet`.
+3. Update `E2E_CNI_SOURCE_REF` and `E2E_CNI_BINARY_SHA256` together. If the
+   repository fallback pin changes, update the defaults in
+   `scripts/e2e/build-cni.sh` in the same reviewed change.
+4. Run the hermetic CNI packaging test and a no-push artifact build. Verify the
+   generated artifact contains only `azure-vnet` and
+   `azure-linux-transparent-tunnel.conflist`, the checksum matches, and the
+   conflist mode assertion passes.
+5. Require normal code-owner review. Never accept an update that changes only
+   the checksum after a mismatch without independently validating the source
+   bytes.
+
+`prebuilt` mode is a controlled fallback only. Both URLs must be immutable,
+HTTPS, and credential-free, and `E2E_CNI_BINARY_SHA256` is mandatory. Never put
+a SAS token or other credential in a GitHub variable, workflow, script, or
+documentation.
+
+## 8. Bootstrap completion checklist
+
+- Primary and secondary IDs are non-empty and distinct.
+- Each identity has only its own subscription role; only the primary identity
+  can create run-RG role assignments.
+- Runtime VM grants are `Network Contributor` on the primary run RG only.
+- Staging is private; public ACR anonymous pull is organizationally approved.
+- `azure-e2e` and `public-release` have the documented reviewers, branch/tag
+  restrictions, secrets, and variables.
+- Provider/API/quota checks pass in both subscriptions without `az account set`.
+- The CNI ref and checksum were independently reviewed and recorded together.
+- No client secret, registry password, kubeconfig, token, or credential-bearing
+  URL is stored in GitHub configuration.
