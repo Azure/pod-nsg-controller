@@ -1,0 +1,16 @@
+# Transient per-run work directories created by the test suites (auto-cleaned
+# on normal exit; ignored here so an interrupted run never leaks into git).
+.lib_test_work/
+.meta_test_work/
+.metawork/
+.build_test_work/
+.build_cni_test_work/
+.install_cni_tt_test_work/
+.provision_tt_fixtures_test_work/
+.run_tt_validation_test_work/
+.collect_cni_diagnostics_test_work/
+.promote_release_test_work/
+.setup_cross_sub_rbac_test_work/
+.run_cross_sub_validation_test_work/
+.teardown_test_work/
+.collect_diagnostics_test_work/

@@ -3,6 +3,14 @@
 # Cross-Subscription RBAC Setup
 # Grants managed identities from each cluster access to the other cluster's
 # resource group for pod-nsg-controller cross-subscription operations.
+#
+# NOTE (EPIC-010 / ITEM-038): this hand-run POC is the SOURCE that
+# scripts/e2e/setup-cross-sub-rbac.sh generalizes for the automated pipeline.
+# The pipeline variant is parameterized (no hard-coded subscriptions/prefixes),
+# scopes every grant to the run RG only (never a mesh of subscription-wide
+# grants), passes an explicit --subscription on every call (never `az account
+# set`), inventories assignment IDs, and adds a verified `remove` for cleanup.
+# Prefer the e2e script in CI; keep this for interactive POC bring-up.
 # =============================================================================
 set -euo pipefail
 

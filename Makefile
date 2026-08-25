@@ -70,6 +70,30 @@ docker-build: ## Build docker image with the manager.
 docker-push: ## Push docker image with the manager.
 	docker push ${IMG}
 
+##@ CNI (transparent-tunnel)
+
+# Repository-native build/packaging of the transparent-tunnel CNI artifact
+# (EPIC-009 / FR-018). These targets WRAP scripts/e2e/build-cni.sh, which pins
+# the external azure-container-networking transparent-tunnel source (CON-011),
+# verifies a recorded checksum, asserts the conflist declares
+# "mode": "transparent-tunnel", and packages a digest-addressable OCI artifact.
+# The source pin lives in build-cni.sh (CNI_SOURCE_REPO/REF); EPIC-008 records
+# how the exact ref/checksum is obtained and updated (ASSUMPTION-005). For an
+# offline dry run: `make cni-artifact CNI_SOURCE_MODE=fixture \
+# CNI_FIXTURE_DIR=<dir> BUILD_PUSH=false`.
+
+.PHONY: cni-build
+cni-build: ## Acquire+verify transparent-tunnel azure-vnet + conflist (pinned; asserts mode).
+	bash scripts/e2e/build-cni.sh build
+
+.PHONY: cni-package
+cni-package: cni-build ## Package the exact CNI bytes and compute a content digest.
+	bash scripts/e2e/build-cni.sh package
+
+.PHONY: cni-artifact
+cni-artifact: cni-package ## Push the digest-addressable CNI OCI artifact by digest (+SBOM, +manifest).
+	bash scripts/e2e/build-cni.sh artifact
+
 ##@ Deployment
 
 .PHONY: deploy
