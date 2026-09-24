@@ -65,6 +65,10 @@ make deploy IMG=<registry>/pod-nsg-controller:<tag>
 make undeploy
 ```
 
+## User Guides
+
+- [Create and validate a multi-cluster Pod NSG Controller test environment on Overlake VMs or VMSS with Azure CNI transparent-tunnel mode](docs/userguides/multicluster-overlake-transparent-tunnel.md)
+
 ## Configuration
 
 The controller is configured via a combination of environment variables and command-line flags.
