@@ -1,9 +1,9 @@
 ---
-title: "Multi-Cluster Pod NSG Controller on Overlake VMs and VMSS"
+title: "Multi-Cluster Pod NSG Controller on Azure VMs and VMSS"
 description: "Customer guide for building, deploying, and validating Pod NSG Controller across Azure regions with Azure CNI transparent-tunnel mode."
 ---
 
-# Multi-Cluster Pod NSG Controller on Overlake VMs and VMSS
+# Multi-Cluster Pod NSG Controller on Azure VMs and VMSS
 
 > [!IMPORTANT]
 > This is a **preview/test setup guide** for third-party customers. Build and
@@ -30,7 +30,7 @@ cluster's pod IPs to deterministic ASG child resources named
 
 | Area | Customer choice | Recommended test configuration | Source |
 |---|---|---|---|
-| Regions | Any two regions where the approved Overlake SKU is enabled | Two distinct regions and non-overlapping VNets | [docs/multi-cluster-test-setup.md:84-91](https://github.com/Azure/pod-nsg-controller/blob/main/docs/multi-cluster-test-setup.md#L84-L91) |
+| Regions | Any two regions where the selected VM SKU is available | Two distinct regions and non-overlapping VNets | [docs/multi-cluster-test-setup.md:84-91](https://github.com/Azure/pod-nsg-controller/blob/main/docs/multi-cluster-test-setup.md#L84-L91) |
 | Worker compute | Standalone VMs or Flexible VMSS instances | One control-plane VM and three workers per cluster | [scripts/poc/setup-cluster-eastus2euap.sh:20-29](https://github.com/Azure/pod-nsg-controller/blob/main/scripts/poc/setup-cluster-eastus2euap.sh#L20-L29) |
 | Controller image | Customer-built private image | One immutable tag per test run | [Makefile:56-66](https://github.com/Azure/pod-nsg-controller/blob/main/Makefile#L56-L66) |
 | CNI | Azure CNI `transparent-tunnel` on workers | Keep the control plane on the baseline CNI | [docs/transparent-tunnel-same-node-enforcement-test.md:125-143](https://github.com/Azure/pod-nsg-controller/blob/main/docs/transparent-tunnel-same-node-enforcement-test.md#L125-L143) |
@@ -43,14 +43,14 @@ graph TB
     subgraph Azure["Azure"]
         subgraph RegionA["Region A"]
             CP_A["Control-plane VM<br>Pod NSG Controller"]
-            WorkersA["Overlake workers<br>VMs or Flexible VMSS"]
+            WorkersA["Azure workers<br>VMs or Flexible VMSS"]
             NSG_A["Regional NSG A"]
             ASG_A_BE["Backend ASG A"]
             ASG_A_FE["Frontend ASG A"]
         end
         subgraph RegionB["Region B"]
             CP_B["Control-plane VM<br>Pod NSG Controller"]
-            WorkersB["Overlake workers<br>VMs or Flexible VMSS"]
+            WorkersB["Azure workers<br>VMs or Flexible VMSS"]
             NSG_B["Regional NSG B"]
             ASG_B_BE["Backend ASG B"]
             ASG_B_FE["Frontend ASG B"]
@@ -91,34 +91,33 @@ graph TB
 
 ## 1. Plan the Environment
 
-### 1.1 Overlake SKU requirement
+### 1.1 VM SKU requirement
 
-This repository does **not** define a public Overlake VM SKU name. Its checked-in
-PoC scripts currently use `Standard_D4s_v5`
+Choose a VM SKU that is available in both target regions and provides sufficient
+CPU, memory, accelerated networking, and secondary IP capacity for the planned
+pod scale. The checked-in PoC scripts use `Standard_D4s_v5` as a test reference
 ([scripts/poc/setup-cluster-eastus2euap.sh:20-29](https://github.com/Azure/pod-nsg-controller/blob/main/scripts/poc/setup-cluster-eastus2euap.sh#L20-L29)).
-For this guide:
 
-1. Obtain the exact **Overlake-enabled VM SKU** and eligible regions from your
-   Microsoft account or engineering contact.
-2. Confirm that the SKU is enabled in each subscription and region:
+1. Select the worker VM SKU for the test environment.
+2. Confirm that the SKU is available in each subscription and region:
 
    ```bash
    az vm list-skus \
      --subscription "$SUBSCRIPTION_A" \
      --location "$REGION_A" \
-     --size "$OVERLAKE_VM_SKU" \
+     --size "$WORKER_VM_SKU" \
      --all \
      --output table
    ```
 
 3. Repeat the check for Cluster B's subscription and region.
-4. Do not substitute another SKU if Overlake datapath behavior is part of the
-   test acceptance criteria.
+4. Confirm that the selected SKU supports the networking capabilities and
+   capacity required by your test plan.
 
 See the public
 [`az vm list-skus`](https://learn.microsoft.com/cli/azure/vm#az-vm-list-skus)
-reference for command options. Exact Overlake offer names and entitlement remain
-subscription-specific and must be verified with Microsoft.
+reference for command options. SKU availability and quota are
+subscription-specific and must be verified in each target region.
 
 ### 1.2 Define customer-specific values
 
@@ -136,7 +135,7 @@ export CLUSTER_A="customer-a-${REGION_A,,}"
 export CLUSTER_B="customer-b-${REGION_B,,}"
 export RG_A="${CLUSTER_A}-rg"
 export RG_B="${CLUSTER_B}-rg"
-export OVERLAKE_VM_SKU="<approved-overlake-sku>"
+export WORKER_VM_SKU="<azure-vm-sku>"
 
 export VNET_A_CIDR="10.40.0.0/16"
 export SUBNET_A_CIDR="10.40.1.0/24"
@@ -176,7 +175,7 @@ and kubeconfig export
 ```mermaid
 %%{init: {'theme': 'dark'}}%%
 flowchart LR
-    A["Confirm Overlake SKU access"] --> B["Create regional RG, VNet, subnet, NSG, NAT"]
+    A["Confirm VM SKU availability"] --> B["Create regional RG, VNet, subnet, NSG, NAT"]
     B --> C{"Worker model"}
     C -->|"VM"| D["Create worker NICs and VMs"]
     C -->|"Flexible VMSS"| E["Create empty Flexible VMSS<br>Attach named worker VMs"]
@@ -207,7 +206,7 @@ flowchart LR
 ### 2.1 Standalone VM workers
 
 Follow the existing cluster guide, replacing `Standard_D4s_v5` with
-`$OVERLAKE_VM_SKU` and adding `--subscription` explicitly:
+`$WORKER_VM_SKU` and adding `--subscription` explicitly:
 
 ```bash
 az vm create \
@@ -216,7 +215,7 @@ az vm create \
   --name "${CLUSTER_A}-worker-01" \
   --nics "${CLUSTER_A}-worker-01-nic" \
   --image "Canonical:0001-com-ubuntu-server-jammy:22_04-lts-gen2:latest" \
-  --size "$OVERLAKE_VM_SKU" \
+  --size "$WORKER_VM_SKU" \
   --admin-username azureuser \
   --assign-identity \
   --generate-ssh-keys
@@ -243,7 +242,7 @@ az vmss create \
   --subnet "${CLUSTER_A}-subnet" \
   --nsg "${CLUSTER_A}-nsg" \
   --image "Canonical:0001-com-ubuntu-server-jammy:22_04-lts-gen2:latest" \
-  --vm-sku "$OVERLAKE_VM_SKU" \
+  --vm-sku "$WORKER_VM_SKU" \
   --admin-username azureuser \
   --generate-ssh-keys
 
@@ -255,7 +254,7 @@ for i in 01 02 03; do
     --vmss "$VMSS_A" \
     --nics "${CLUSTER_A}-worker-${i}-nic" \
     --image "Canonical:0001-com-ubuntu-server-jammy:22_04-lts-gen2:latest" \
-    --size "$OVERLAKE_VM_SKU" \
+    --size "$WORKER_VM_SKU" \
     --admin-username azureuser \
     --assign-identity \
     --generate-ssh-keys
@@ -448,7 +447,7 @@ az acr repository show \
 
 Use the same immutable image in both clusters. Do not rebuild independently per
 cluster. The checked-in Dockerfile currently builds `linux/amd64`; verify that
-the selected Overlake-enabled SKU uses the AMD64 architecture.
+the selected worker VM SKU uses the AMD64 architecture.
 
 ## 5. Configure Azure Identity and RBAC
 

@@ -67,7 +67,7 @@ make undeploy
 
 ## User Guides
 
-- [Create and validate a multi-cluster Pod NSG Controller test environment on Overlake VMs or VMSS with Azure CNI transparent-tunnel mode](docs/userguides/multicluster-overlake-transparent-tunnel.md)
+- [Create and validate a multi-cluster Pod NSG Controller test environment on Azure VMs or VMSS with Azure CNI transparent-tunnel mode](docs/userguides/multicluster-vm-vmss-transparent-tunnel.md)
 
 ## Configuration
 
