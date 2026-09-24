@@ -46,7 +46,11 @@ jobs:
             echo "::error::target_sha must be a full commit SHA"
             exit 1
           }
-          git rev-parse "${TARGET_SHA}^{commit}" >/dev/null
+git rev-parse "${TARGET_SHA}^{commit}" >/dev/null
+          git merge-base --is-ancestor "$TARGET_SHA" origin/main || {
+            echo "::error::target_sha must be an ancestor of main"
+            exit 1
+          }
           if git ls-remote --exit-code --tags --refs origin "refs/tags/${TAG_NAME}" >/dev/null 2>&1; then
             echo "::error::tag already exists: ${TAG_NAME}"
             exit 1
