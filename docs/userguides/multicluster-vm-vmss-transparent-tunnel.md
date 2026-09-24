@@ -203,7 +203,56 @@ flowchart LR
 
 <!-- Sources: scripts/poc/setup-cluster-eastus2euap.sh:31-120, docs/self-managed-k8s-azure-cni-setup.md:150-310, docs/transparent-tunnel-same-node-enforcement-test.md:125-203 -->
 
-### 2.1 Standalone VM workers
+### 2.1 Create worker NICs
+
+Both worker models below attach explicitly named NICs. Create those NICs before
+creating either standalone VMs or Flexible VMSS instances. Each worker receives
+nine dynamic secondary IP configurations in addition to its primary IP, matching
+the capacity used by the repository's self-managed cluster setup
+([docs/self-managed-k8s-azure-cni-setup.md:118-146](https://github.com/Azure/pod-nsg-controller/blob/main/docs/self-managed-k8s-azure-cni-setup.md#L118-L146)).
+
+```bash
+export POD_IP_CONFIGS_PER_WORKER=9
+
+create_worker_nics() {
+  local subscription="$1"
+  local resource_group="$2"
+  local cluster_name="$3"
+  local subnet_id
+
+  subnet_id=$(az network vnet subnet show \
+    --subscription "$subscription" \
+    --resource-group "$resource_group" \
+    --vnet-name "${cluster_name}-vnet" \
+    --name "${cluster_name}-subnet" \
+    --query id -o tsv)
+
+  for worker in 01 02 03; do
+    local nic_name="${cluster_name}-worker-${worker}-nic"
+
+    az network nic create \
+      --subscription "$subscription" \
+      --resource-group "$resource_group" \
+      --name "$nic_name" \
+      --subnet "$subnet_id"
+
+    # Update each NIC sequentially to avoid ARM conflicts.
+    for ip_config in $(seq 1 "$POD_IP_CONFIGS_PER_WORKER"); do
+      az network nic ip-config create \
+        --subscription "$subscription" \
+        --resource-group "$resource_group" \
+        --nic-name "$nic_name" \
+        --name "ipconfig-pod-${ip_config}" \
+        --private-ip-address-version IPv4
+    done
+  done
+}
+
+create_worker_nics "$SUBSCRIPTION_A" "$RG_A" "$CLUSTER_A"
+create_worker_nics "$SUBSCRIPTION_B" "$RG_B" "$CLUSTER_B"
+```
+
+### 2.2 Standalone VM workers
 
 Follow the existing cluster guide, replacing `Standard_D4s_v5` with
 `$WORKER_VM_SKU` and adding `--subscription` explicitly:
@@ -223,7 +272,7 @@ az vm create \
 
 Repeat for each worker and for Cluster B.
 
-### 2.2 Flexible VMSS workers
+### 2.3 Flexible VMSS workers
 
 Create a Flexible scale set for organization and lifecycle management, then
 attach named worker VMs. Keep the control plane as a standalone VM.
@@ -261,10 +310,8 @@ for i in 01 02 03; do
 done
 ```
 
-Repeat for Cluster B. Add the secondary IP configurations required by Azure CNI
-to each worker NIC **sequentially**, because the existing setup guide records ARM
-conflicts when multiple IP configurations are added concurrently to one NIC
-([docs/self-managed-k8s-azure-cni-setup.md:118-146](https://github.com/Azure/pod-nsg-controller/blob/main/docs/self-managed-k8s-azure-cni-setup.md#L118-L146)).
+Repeat for Cluster B. The worker NICs and Azure CNI secondary IP configurations
+were created in the shared prerequisite step above.
 
 > [!WARNING]
 > Do not enable VMSS autoscale yet. A new instance must receive Kubernetes
@@ -273,7 +320,7 @@ conflicts when multiple IP configurations are added concurrently to one NIC
 > identity, and RBAC before it can safely host pods. Automate those operations in
 > an image or VM extension before enabling scale-out.
 
-### 2.3 Peer the VNets
+### 2.4 Peer the VNets
 
 Create bidirectional global VNet peering if the regions differ:
 
