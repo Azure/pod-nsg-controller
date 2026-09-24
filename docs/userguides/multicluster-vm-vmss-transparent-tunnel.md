@@ -542,6 +542,110 @@ credentials through `DefaultAzureCredential`; an optional wireserver identity
 path exists for environments where IMDS returns `410`
 ([internal/azure/client_factory.go:135-183](https://github.com/Azure/pod-nsg-controller/blob/main/internal/azure/client_factory.go#L135-L183)).
 
+### 5.1 Configure controller pod access to IMDS
+
+This step is required before deploying the controller. The checked-in deployment
+schedules the controller pod on the control-plane VM, and Azure IMDS rejects
+requests sourced from an Azure CNI secondary pod IP with HTTP `410`. Install a
+persistent masquerade rule on each control-plane VM so the request reaches IMDS
+with the node's primary source IP
+([docs/cross-subscription-pod-asg-access.md:146-175](https://github.com/Azure/pod-nsg-controller/blob/main/docs/cross-subscription-pod-asg-access.md#L146-L175)).
+
+```bash
+configure_control_plane_imds() {
+  local subscription="$1"
+  local resource_group="$2"
+  local cluster_name="$3"
+
+  az vm run-command invoke \
+    --subscription "$subscription" \
+    --resource-group "$resource_group" \
+    --name "${cluster_name}-cp-01" \
+    --command-id RunShellScript \
+    --scripts '
+      set -euo pipefail
+      cat > /usr/local/sbin/configure-imds-masquerade.sh <<'"'"'EOF'"'"'
+#!/usr/bin/env bash
+set -euo pipefail
+iptables -t nat -C POSTROUTING -d 169.254.169.254/32 -j MASQUERADE 2>/dev/null ||
+  iptables -t nat -A POSTROUTING -d 169.254.169.254/32 -j MASQUERADE
+EOF
+      chmod 0755 /usr/local/sbin/configure-imds-masquerade.sh
+
+      cat > /etc/systemd/system/imds-masquerade.service <<'"'"'EOF'"'"'
+[Unit]
+Description=Masquerade Azure CNI pod traffic to IMDS
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/configure-imds-masquerade.sh
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+      systemctl daemon-reload
+      systemctl enable --now imds-masquerade.service
+      iptables -t nat -C POSTROUTING -d 169.254.169.254/32 -j MASQUERADE
+    ' \
+    --query 'value[0].message' -o tsv
+}
+
+configure_control_plane_imds "$SUBSCRIPTION_A" "$RG_A" "$CLUSTER_A"
+configure_control_plane_imds "$SUBSCRIPTION_B" "$RG_B" "$CLUSTER_B"
+```
+
+Validate the exact pod-to-IMDS path the controller will use:
+
+```bash
+validate_control_plane_imds() {
+  local kubeconfig="$1"
+  local cluster_name="$2"
+  local pod_name="imds-validation"
+
+  cat <<EOF | kubectl --kubeconfig "$kubeconfig" apply -f -
+apiVersion: v1
+kind: Pod
+metadata:
+  name: ${pod_name}
+  namespace: default
+spec:
+  nodeName: ${cluster_name}-cp-01
+  tolerations:
+    - operator: Exists
+  containers:
+    - name: curl
+      image: curlimages/curl:8.5.0
+      command: ["sleep", "300"]
+  restartPolicy: Never
+EOF
+
+  kubectl --kubeconfig "$kubeconfig" wait \
+    --for=condition=Ready "pod/${pod_name}" --timeout=2m
+
+  if ! kubectl --kubeconfig "$kubeconfig" exec "$pod_name" -- \
+    curl -fsS -o /dev/null -H "Metadata: true" \
+    "http://169.254.169.254/metadata/identity/oauth2/token?api-version=2018-02-01&resource=https%3A%2F%2Fmanagement.azure.com%2F"; then
+    kubectl --kubeconfig "$kubeconfig" delete pod "$pod_name" --ignore-not-found
+    return 1
+  fi
+
+  kubectl --kubeconfig "$kubeconfig" delete pod "$pod_name" --wait=true
+}
+
+validate_control_plane_imds "$KUBECONFIG_A" "$CLUSTER_A"
+validate_control_plane_imds "$KUBECONFIG_B" "$CLUSTER_B"
+```
+
+Do not deploy the controller until both pod-level token requests succeed. If the
+environment cannot use IMDS, validate the wireserver credential path first and
+set `USE_WIRESERVER_IDENTITY=true` on the controller deployment instead.
+
+### 5.2 Grant Azure RBAC
+
 Grant the managed identity of the node that hosts the controller
 `Network Contributor` on every resource group containing an ASG that the
 cluster's mappings reference. The multi-cluster PoC applies a mesh of role
@@ -568,12 +672,6 @@ for principal in "$CP_A_PRINCIPAL" "$CP_B_PRINCIPAL"; do
     --scope "/subscriptions/${SUBSCRIPTION_B}/resourceGroups/${RG_B}"
 done
 ```
-
-If the controller cannot acquire an IMDS token, add the pod-to-IMDS masquerade
-rule described in
-[Cross-Subscription ASG Access](../cross-subscription-pod-asg-access.md#43-configure-imds-access-for-pods-iptables-masquerade),
-or set `USE_WIRESERVER_IDENTITY=true` after verifying the wireserver endpoint in
-your environment.
 
 ## 6. Create Regional ASGs and NSG Rules
 
