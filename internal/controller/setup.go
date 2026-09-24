@@ -59,4 +59,3 @@ func (r *MappingReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		Watches(&corev1.Pod{}, podHandler, builder.WithPredicates(PodPredicate())).
 		Complete(r)
 }
-

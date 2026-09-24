@@ -26,11 +26,11 @@ const (
 type InitialTerminalReason string
 
 const (
-	InitialTerminalSteadyState    InitialTerminalReason = "steady-state"
-	InitialTerminalValidation     InitialTerminalReason = "validation"
-	InitialTerminalDeleteComplete InitialTerminalReason = "delete-complete"
+	InitialTerminalSteadyState     InitialTerminalReason = "steady-state"
+	InitialTerminalValidation      InitialTerminalReason = "validation"
+	InitialTerminalDeleteComplete  InitialTerminalReason = "delete-complete"
 	InitialTerminalStaleGeneration InitialTerminalReason = "stale-generation"
-	InitialTerminalStatusNotFound InitialTerminalReason = "status-not-found"
+	InitialTerminalStatusNotFound  InitialTerminalReason = "status-not-found"
 	InitialTerminalMappingNotFound InitialTerminalReason = "mapping-not-found"
 )
 

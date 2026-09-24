@@ -4,8 +4,8 @@ import (
 	"testing"
 	"time"
 
-	dto "github.com/prometheus/client_model/go"
 	"github.com/prometheus/client_golang/prometheus"
+	dto "github.com/prometheus/client_model/go"
 	"k8s.io/apimachinery/pkg/types"
 
 	"github.com/Azure/pod-nsg-controller/internal/engine"
@@ -110,10 +110,10 @@ func TestPhase8_T87_ConvergenceAddRecordedFromDetectionToPUTSuccess(t *testing.T
 // Verifies that ClassifyConvergenceOperation correctly maps deltas to operations.
 func TestPhase8_ConvergenceOperationMapping_CreateToAdd_UpdateClassifiedByDelta(t *testing.T) {
 	tests := []struct {
-		name     string
-		delta    TargetDelta
-		wantOp   ConvergenceOperation
-		wantHas  bool
+		name    string
+		delta   TargetDelta
+		wantOp  ConvergenceOperation
+		wantHas bool
 	}{
 		{
 			name:    "only additions → add",
