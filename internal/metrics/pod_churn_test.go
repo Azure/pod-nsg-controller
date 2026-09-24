@@ -142,15 +142,15 @@ func TestPhase8_T813_PodChurnRateGaugeReflectsSlidingWindow(t *testing.T) {
 	// Second snapshot: 10 pods added after 5 seconds
 	tenPodsSnapshot := MappingPodSnapshot{
 		Pods: map[PodIdentity]PodMembership{
-			{Namespace: "default", Name: "p1", UID: "u1"}: {PodIP: "10.0.0.1"},
-			{Namespace: "default", Name: "p2", UID: "u2"}: {PodIP: "10.0.0.2"},
-			{Namespace: "default", Name: "p3", UID: "u3"}: {PodIP: "10.0.0.3"},
-			{Namespace: "default", Name: "p4", UID: "u4"}: {PodIP: "10.0.0.4"},
-			{Namespace: "default", Name: "p5", UID: "u5"}: {PodIP: "10.0.0.5"},
-			{Namespace: "default", Name: "p6", UID: "u6"}: {PodIP: "10.0.0.6"},
-			{Namespace: "default", Name: "p7", UID: "u7"}: {PodIP: "10.0.0.7"},
-			{Namespace: "default", Name: "p8", UID: "u8"}: {PodIP: "10.0.0.8"},
-			{Namespace: "default", Name: "p9", UID: "u9"}: {PodIP: "10.0.0.9"},
+			{Namespace: "default", Name: "p1", UID: "u1"}:   {PodIP: "10.0.0.1"},
+			{Namespace: "default", Name: "p2", UID: "u2"}:   {PodIP: "10.0.0.2"},
+			{Namespace: "default", Name: "p3", UID: "u3"}:   {PodIP: "10.0.0.3"},
+			{Namespace: "default", Name: "p4", UID: "u4"}:   {PodIP: "10.0.0.4"},
+			{Namespace: "default", Name: "p5", UID: "u5"}:   {PodIP: "10.0.0.5"},
+			{Namespace: "default", Name: "p6", UID: "u6"}:   {PodIP: "10.0.0.6"},
+			{Namespace: "default", Name: "p7", UID: "u7"}:   {PodIP: "10.0.0.7"},
+			{Namespace: "default", Name: "p8", UID: "u8"}:   {PodIP: "10.0.0.8"},
+			{Namespace: "default", Name: "p9", UID: "u9"}:   {PodIP: "10.0.0.9"},
 			{Namespace: "default", Name: "p10", UID: "u10"}: {PodIP: "10.0.0.10"},
 		},
 	}

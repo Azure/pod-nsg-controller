@@ -1288,98 +1288,98 @@ func TestCache_SetFromRecomputeArtifactsIfVersion_DeleteRecreateFenceStillReject
 // refactor has no output drift.
 // ---------------------------------------------------------------------------
 func TestPhase5_SetFromRecomputeArtifactsIfVersion_ProducesIdenticalOutputToSetFromRecompute(t *testing.T) {
-asgID := makeASGResourceID("sub1", "rg1", "asg1")
-target := ASGTarget{
-SubscriptionID: "sub1",
-ResourceGroup:  "rg1",
-ASGName:        "asg1",
-FullResourceID: asgID,
-PrefixSetName:  "test-cluster-default-parity-mapping",
-}
+	asgID := makeASGResourceID("sub1", "rg1", "asg1")
+	target := ASGTarget{
+		SubscriptionID: "sub1",
+		ResourceGroup:  "rg1",
+		ASGName:        "asg1",
+		FullResourceID: asgID,
+		PrefixSetName:  "test-cluster-default-parity-mapping",
+	}
 
-mapping := cacheTestMapping("default", "parity-mapping", 1,
-map[string]string{"app": "web"}, asgID)
+	mapping := cacheTestMapping("default", "parity-mapping", 1,
+		map[string]string{"app": "web"}, asgID)
 
-pods := []corev1.Pod{
-*cacheTestPod("default", "pod-1", map[string]string{"app": "web"}, "10.0.0.1"),
-*cacheTestPod("default", "pod-2", map[string]string{"app": "web"}, "10.0.0.2"),
-}
+	pods := []corev1.Pod{
+		*cacheTestPod("default", "pod-1", map[string]string{"app": "web"}, "10.0.0.1"),
+		*cacheTestPod("default", "pod-2", map[string]string{"app": "web"}, "10.0.0.2"),
+	}
 
-desired := map[ASGTarget]DesiredPrefixSet{
-target: {IPs: map[string]struct{}{
-"10.0.0.1/32": {},
-"10.0.0.2/32": {},
-}},
-}
-snapshot := PodSnapshot{Pods: map[PodIdentity]PodMembership{
-{Namespace: "default", Name: "pod-1"}: {PodIP: "10.0.0.1"},
-{Namespace: "default", Name: "pod-2"}: {PodIP: "10.0.0.2"},
-}}
+	desired := map[ASGTarget]DesiredPrefixSet{
+		target: {IPs: map[string]struct{}{
+			"10.0.0.1/32": {},
+			"10.0.0.2/32": {},
+		}},
+	}
+	snapshot := PodSnapshot{Pods: map[PodIdentity]PodMembership{
+		{Namespace: "default", Name: "pod-1"}: {PodIP: "10.0.0.1"},
+		{Namespace: "default", Name: "pod-2"}: {PodIP: "10.0.0.2"},
+	}}
 
-// Path A: SetFromRecompute (legacy)
-cacheA := NewDesiredStateCache("test-cluster")
-cacheA.SetFromRecompute(mapping, pods, desired, snapshot, []int{2}, false)
-gotA, okA := cacheA.Get(mapping)
-if !okA {
-t.Fatal("expected cache hit from SetFromRecompute")
-}
+	// Path A: SetFromRecompute (legacy)
+	cacheA := NewDesiredStateCache("test-cluster")
+	cacheA.SetFromRecompute(mapping, pods, desired, snapshot, []int{2}, false)
+	gotA, okA := cacheA.Get(mapping)
+	if !okA {
+		t.Fatal("expected cache hit from SetFromRecompute")
+	}
 
-// Path B: SetFromRecomputeArtifactsIfVersion (artifact path)
-cacheB := NewDesiredStateCache("test-cluster")
-_, ver, epoch, _ := cacheB.GetWithVersion(mapping)
-artifacts := DesiredStateRecomputeArtifacts{
-Desired:            desired,
-Snapshot:           snapshot,
-MatchedPodsByIndex: []int{2},
-HasPendingIPPods:   false,
-PodRules: map[PodIdentity]map[int]struct{}{
-{Namespace: "default", Name: "pod-1"}: {0: {}},
-{Namespace: "default", Name: "pod-2"}: {0: {}},
-},
-PendingIPCount: 0,
-}
-committed, _, _ := cacheB.SetFromRecomputeArtifactsIfVersion(mapping, artifacts, ver, epoch)
-if !committed {
-t.Fatal("expected artifact CAS commit to succeed")
-}
-gotB, okB := cacheB.Get(mapping)
-if !okB {
-t.Fatal("expected cache hit from SetFromRecomputeArtifactsIfVersion")
-}
+	// Path B: SetFromRecomputeArtifactsIfVersion (artifact path)
+	cacheB := NewDesiredStateCache("test-cluster")
+	_, ver, epoch, _ := cacheB.GetWithVersion(mapping)
+	artifacts := DesiredStateRecomputeArtifacts{
+		Desired:            desired,
+		Snapshot:           snapshot,
+		MatchedPodsByIndex: []int{2},
+		HasPendingIPPods:   false,
+		PodRules: map[PodIdentity]map[int]struct{}{
+			{Namespace: "default", Name: "pod-1"}: {0: {}},
+			{Namespace: "default", Name: "pod-2"}: {0: {}},
+		},
+		PendingIPCount: 0,
+	}
+	committed, _, _ := cacheB.SetFromRecomputeArtifactsIfVersion(mapping, artifacts, ver, epoch)
+	if !committed {
+		t.Fatal("expected artifact CAS commit to succeed")
+	}
+	gotB, okB := cacheB.Get(mapping)
+	if !okB {
+		t.Fatal("expected cache hit from SetFromRecomputeArtifactsIfVersion")
+	}
 
-// Compare outputs
-if len(gotA.Desired) != len(gotB.Desired) {
-t.Errorf("desired map length mismatch: A=%d, B=%d", len(gotA.Desired), len(gotB.Desired))
-}
-for tgt, dpsA := range gotA.Desired {
-dpsB, exists := gotB.Desired[tgt]
-if !exists {
-t.Errorf("target %v present in A but missing in B", tgt)
-continue
-}
-if len(dpsA.IPs) != len(dpsB.IPs) {
-t.Errorf("IP count mismatch for target %v: A=%d, B=%d", tgt, len(dpsA.IPs), len(dpsB.IPs))
-}
-for ip := range dpsA.IPs {
-if _, has := dpsB.IPs[ip]; !has {
-t.Errorf("IP %s in A but missing in B for target %v", ip, tgt)
-}
-}
-}
-if len(gotA.Snapshot.Pods) != len(gotB.Snapshot.Pods) {
-t.Errorf("snapshot pod count mismatch: A=%d, B=%d", len(gotA.Snapshot.Pods), len(gotB.Snapshot.Pods))
-}
-if len(gotA.MatchedPodsByIndex) != len(gotB.MatchedPodsByIndex) {
-t.Errorf("MatchedPodsByIndex length mismatch: A=%d, B=%d", len(gotA.MatchedPodsByIndex), len(gotB.MatchedPodsByIndex))
-}
-for i := range gotA.MatchedPodsByIndex {
-if gotA.MatchedPodsByIndex[i] != gotB.MatchedPodsByIndex[i] {
-t.Errorf("MatchedPodsByIndex[%d] mismatch: A=%d, B=%d", i, gotA.MatchedPodsByIndex[i], gotB.MatchedPodsByIndex[i])
-}
-}
-if gotA.HasPendingIPPods != gotB.HasPendingIPPods {
-t.Errorf("HasPendingIPPods mismatch: A=%v, B=%v", gotA.HasPendingIPPods, gotB.HasPendingIPPods)
-}
+	// Compare outputs
+	if len(gotA.Desired) != len(gotB.Desired) {
+		t.Errorf("desired map length mismatch: A=%d, B=%d", len(gotA.Desired), len(gotB.Desired))
+	}
+	for tgt, dpsA := range gotA.Desired {
+		dpsB, exists := gotB.Desired[tgt]
+		if !exists {
+			t.Errorf("target %v present in A but missing in B", tgt)
+			continue
+		}
+		if len(dpsA.IPs) != len(dpsB.IPs) {
+			t.Errorf("IP count mismatch for target %v: A=%d, B=%d", tgt, len(dpsA.IPs), len(dpsB.IPs))
+		}
+		for ip := range dpsA.IPs {
+			if _, has := dpsB.IPs[ip]; !has {
+				t.Errorf("IP %s in A but missing in B for target %v", ip, tgt)
+			}
+		}
+	}
+	if len(gotA.Snapshot.Pods) != len(gotB.Snapshot.Pods) {
+		t.Errorf("snapshot pod count mismatch: A=%d, B=%d", len(gotA.Snapshot.Pods), len(gotB.Snapshot.Pods))
+	}
+	if len(gotA.MatchedPodsByIndex) != len(gotB.MatchedPodsByIndex) {
+		t.Errorf("MatchedPodsByIndex length mismatch: A=%d, B=%d", len(gotA.MatchedPodsByIndex), len(gotB.MatchedPodsByIndex))
+	}
+	for i := range gotA.MatchedPodsByIndex {
+		if gotA.MatchedPodsByIndex[i] != gotB.MatchedPodsByIndex[i] {
+			t.Errorf("MatchedPodsByIndex[%d] mismatch: A=%d, B=%d", i, gotA.MatchedPodsByIndex[i], gotB.MatchedPodsByIndex[i])
+		}
+	}
+	if gotA.HasPendingIPPods != gotB.HasPendingIPPods {
+		t.Errorf("HasPendingIPPods mismatch: A=%v, B=%v", gotA.HasPendingIPPods, gotB.HasPendingIPPods)
+	}
 }
 
 // ===========================================================================
@@ -1811,59 +1811,59 @@ func TestPhase5_ConcurrentArtifactPublish_PodMutation_RaceStability(t *testing.T
 // lifecycle epoch + version fencing still works correctly after refactoring.
 // ---------------------------------------------------------------------------
 func TestPhase5_CASFence_VersionAdvancesPreventsStalePublish(t *testing.T) {
-asgID := makeASGResourceID("sub1", "rg1", "asg1")
-target := ASGTarget{
-SubscriptionID: "sub1",
-ResourceGroup:  "rg1",
-ASGName:        "asg1",
-FullResourceID: asgID,
-PrefixSetName:  "test-cluster-default-fence-mapping",
-}
+	asgID := makeASGResourceID("sub1", "rg1", "asg1")
+	target := ASGTarget{
+		SubscriptionID: "sub1",
+		ResourceGroup:  "rg1",
+		ASGName:        "asg1",
+		FullResourceID: asgID,
+		PrefixSetName:  "test-cluster-default-fence-mapping",
+	}
 
-mapping := cacheTestMapping("default", "fence-mapping", 1,
-map[string]string{"app": "web"}, asgID)
+	mapping := cacheTestMapping("default", "fence-mapping", 1,
+		map[string]string{"app": "web"}, asgID)
 
-cache := NewDesiredStateCache("test-cluster")
+	cache := NewDesiredStateCache("test-cluster")
 
-// Seed cache
-cache.SetFromRecompute(mapping, nil,
-map[ASGTarget]DesiredPrefixSet{
-target: {IPs: map[string]struct{}{"10.0.0.1/32": {}}},
-},
-PodSnapshot{Pods: map[PodIdentity]PodMembership{
-{Namespace: "default", Name: "pod-1"}: {PodIP: "10.0.0.1"},
-}}, []int{1}, false)
+	// Seed cache
+	cache.SetFromRecompute(mapping, nil,
+		map[ASGTarget]DesiredPrefixSet{
+			target: {IPs: map[string]struct{}{"10.0.0.1/32": {}}},
+		},
+		PodSnapshot{Pods: map[PodIdentity]PodMembership{
+			{Namespace: "default", Name: "pod-1"}: {PodIP: "10.0.0.1"},
+		}}, []int{1}, false)
 
-// Capture fences (simulating start of a recompute)
-_, ver, epoch, _ := cache.GetWithVersion(mapping)
+	// Capture fences (simulating start of a recompute)
+	_, ver, epoch, _ := cache.GetWithVersion(mapping)
 
-// Concurrent pod event advances the version
-newPod := cacheTestPod("default", "pod-new", map[string]string{"app": "web"}, "10.0.0.2")
-cache.OnPodAdd(mapping, newPod)
+	// Concurrent pod event advances the version
+	newPod := cacheTestPod("default", "pod-new", map[string]string{"app": "web"}, "10.0.0.2")
+	cache.OnPodAdd(mapping, newPod)
 
-// Attempt to publish with stale fences — should be rejected
-staleArtifacts := DesiredStateRecomputeArtifacts{
-Desired:            map[ASGTarget]DesiredPrefixSet{target: {IPs: map[string]struct{}{"10.0.0.STALE/32": {}}}},
-Snapshot:           PodSnapshot{},
-MatchedPodsByIndex: []int{1},
-HasPendingIPPods:   false,
-PodRules:           map[PodIdentity]map[int]struct{}{},
-PendingIPCount:     0,
-}
-committed, _, _ := cache.SetFromRecomputeArtifactsIfVersion(mapping, staleArtifacts, ver, epoch)
-if committed {
-t.Error("Phase 5: stale recompute with outdated version fence MUST be rejected by CAS")
-}
+	// Attempt to publish with stale fences — should be rejected
+	staleArtifacts := DesiredStateRecomputeArtifacts{
+		Desired:            map[ASGTarget]DesiredPrefixSet{target: {IPs: map[string]struct{}{"10.0.0.STALE/32": {}}}},
+		Snapshot:           PodSnapshot{},
+		MatchedPodsByIndex: []int{1},
+		HasPendingIPPods:   false,
+		PodRules:           map[PodIdentity]map[int]struct{}{},
+		PendingIPCount:     0,
+	}
+	committed, _, _ := cache.SetFromRecomputeArtifactsIfVersion(mapping, staleArtifacts, ver, epoch)
+	if committed {
+		t.Error("Phase 5: stale recompute with outdated version fence MUST be rejected by CAS")
+	}
 
-// Verify cache still has the incrementally-updated state (not stale)
-got, ok := cache.Get(mapping)
-if !ok {
-t.Fatal("expected cache hit")
-}
-if _, hasStale := got.Desired[target].IPs["10.0.0.STALE/32"]; hasStale {
-t.Error("Phase 5: stale data must not be committed to cache")
-}
-if _, hasNew := got.Desired[target].IPs["10.0.0.2/32"]; !hasNew {
-t.Error("Phase 5: incrementally-added pod IP must be preserved after rejected stale publish")
-}
+	// Verify cache still has the incrementally-updated state (not stale)
+	got, ok := cache.Get(mapping)
+	if !ok {
+		t.Fatal("expected cache hit")
+	}
+	if _, hasStale := got.Desired[target].IPs["10.0.0.STALE/32"]; hasStale {
+		t.Error("Phase 5: stale data must not be committed to cache")
+	}
+	if _, hasNew := got.Desired[target].IPs["10.0.0.2/32"]; !hasNew {
+		t.Error("Phase 5: incrementally-added pod IP must be preserved after rejected stale publish")
+	}
 }

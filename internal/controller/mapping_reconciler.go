@@ -68,10 +68,10 @@ type MappingReconciler struct {
 	DesiredStateCache *engine.DesiredStateCache
 
 	// Metrics instrumentation (all optional; nil disables the metric path).
-	MetricsRecorder      *metrics.Recorder
-	PodChurnTracker      *metrics.PodChurnTracker
-	ConvergenceTracker   *metrics.ConvergenceTracker
-	InitialTracker       *metrics.InitialReconcileTracker
+	MetricsRecorder    *metrics.Recorder
+	PodChurnTracker    *metrics.PodChurnTracker
+	ConvergenceTracker *metrics.ConvergenceTracker
+	InitialTracker     *metrics.InitialReconcileTracker
 
 	// lastReconcileState tracks per-key debounce state for Phase 3.
 	lastReconcileState sync.Map

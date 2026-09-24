@@ -27,9 +27,9 @@ type TargetDelta struct {
 
 // ConvergenceRecorder records convergence Prometheus metrics.
 type ConvergenceRecorder struct {
-	convergenceSeconds   *prometheus.HistogramVec
-	driftCorrections     *prometheus.CounterVec
-	prefixSetActions     *prometheus.CounterVec
+	convergenceSeconds *prometheus.HistogramVec
+	driftCorrections   *prometheus.CounterVec
+	prefixSetActions   *prometheus.CounterVec
 }
 
 func newConvergenceRecorder() *ConvergenceRecorder {

@@ -23,11 +23,11 @@ type ARMRateLimitObserver interface {
 
 // ARMRecorder records ARM call Prometheus metrics.
 type ARMRecorder struct {
-	requestsTotal      *prometheus.CounterVec
-	requestDuration    *prometheus.HistogramVec
-	retriesTotal       *prometheus.CounterVec
-	rateLimitDelays    *prometheus.CounterVec
-	rateLimitDuration  *prometheus.HistogramVec
+	requestsTotal     *prometheus.CounterVec
+	requestDuration   *prometheus.HistogramVec
+	retriesTotal      *prometheus.CounterVec
+	rateLimitDelays   *prometheus.CounterVec
+	rateLimitDuration *prometheus.HistogramVec
 	// Phase 6: executor-side metrics
 	callDuration       *prometheus.HistogramVec
 	concurrentActions  prometheus.Gauge

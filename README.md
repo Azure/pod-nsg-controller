@@ -38,6 +38,28 @@ In Kubernetes clusters running on Azure, network traffic is governed by NSGs att
 make build
 ```
 
+### Build the transparent-tunnel CNI artifact
+
+The transparent-tunnel CNI is released separately from the controller image.
+The repository-native target acquires the pinned
+`azure-container-networking` source, verifies the configured `azure-vnet`
+checksum when supplied, asserts that
+`azure-linux-transparent-tunnel.conflist` selects `transparent-tunnel` mode,
+and packages both files as a digest-addressable OCI artifact:
+
+```bash
+CNI_STAGING_TAG=local-$(git rev-parse --short HEAD) \
+BUILD_PUSH=false \
+make cni-artifact
+```
+
+Production publication also sets `STAGING_ACR`,
+`CNI_SOURCE_REF`, and `CNI_BINARY_SHA256`; see the
+[E2E bootstrap guide](docs/projects/infrastructure-e2e-validation-pipeline/bootstrap.md)
+for the pin and checksum update policy. The related `make cni-build` and
+`make cni-package` targets stop after acquisition/verification and local
+packaging, respectively.
+
 ### Run Locally (against a cluster)
 
 ```bash
@@ -58,6 +80,38 @@ make docker-build docker-push IMG=<registry>/pod-nsg-controller:<tag>
 # Deploy the controller
 make deploy IMG=<registry>/pod-nsg-controller:<tag>
 ```
+
+### Pull released artifacts
+
+Operators supply the public registry login server; this repository does not
+hard-code a deployment-specific hostname. A completed release has a canonical
+release-index OCI artifact plus the controller image and transparent-tunnel CNI
+artifact under the same immutable semantic version:
+
+```text
+<public-acr>/pod-nsg-release-index:<semver>
+<public-acr>/pod-nsg-controller:<semver>
+<public-acr>/pod-nsg-cni-transparent-tunnel:<semver>
+```
+
+Resolve the release index first, then pull the exact digests it records:
+
+```bash
+export PUBLIC_ACR="<public-acr>"
+export SEMVER="v1.2.3"
+
+oras pull "${PUBLIC_ACR}/pod-nsg-release-index:${SEMVER}" -o release-index
+jq . release-index/release-index.json
+docker pull "${PUBLIC_ACR}/pod-nsg-controller:${SEMVER}"
+oras pull "${PUBLIC_ACR}/pod-nsg-cni-transparent-tunnel:${SEMVER}"
+```
+
+The release pipeline promotes validated digests without rebuilding them. Use
+the release index as the completion/audit contract: direct semantic tags may be
+prepared during promotion, but the release is complete only when the signed,
+attested index tag exists and records both verified digests. The direct
+controller and CNI repositories remain required operator surfaces; use the
+index's digest references for immutable deployment pinning.
 
 ### Uninstall
 

@@ -1,0 +1,1651 @@
+# =============================================================================
+# E2E Validation & Release pipeline.
+#
+# EPIC-007 completes orchestration and governance: typed triggers/inputs,
+# environment protection, event-specific concurrency, least-privilege job
+# permissions, topology selection, and an always-on final manifest/summary.
+#
+# EPIC-002 adds the `build` job: it builds the candidate controller image once
+# (reusing `make docker-build`), publishes it to the staging ACR BY DIGEST via
+# OIDC (skipped on PRs), generates an SBOM (syft), and records the immutable
+# digest/reference into the run manifest for downstream jobs (build-once,
+# promote-by-digest). The trigger matrix, GitHub Environments, concurrency
+# policy, and the provision / deploy / validate / diagnostics / cleanup /
+# release jobs are added by later epics (see docs/projects/...).
+#
+# EPIC-003 adds the per-region `provision` job (self-managed clusters, shared
+# ASGs, explicit-subscription) and the same-subscription `rbac` job.
+#
+# EPIC-004 adds the `deploy` (per-region) and `validate_multicluster` jobs:
+# `deploy` applies CRD + RBAC + manager@digest with a short-lived, repo-scoped
+# ACR imagePullSecret plus the documented PodASGMappings/workloads and baseline;
+# `validate_multicluster` runs Tests 1-4 from docs/multi-cluster-test-setup.md
+# and publishes machine-readable per-test results into the run manifest. Because
+# the runner has NO path to the self-managed API server, all kubectl runs ON the
+# control-plane node via `az vm run-command` (scripts/e2e/lib.sh azrun::*); ASG
+# membership is verified from the runner with `az rest`. The remaining
+# diagnostics / cleanup / release jobs are added by later epics.
+#
+# EPIC-009 adds the `build_cni` and `validate_tt` jobs: `build_cni` builds the
+# transparent-tunnel CNI artifact once via `make cni-artifact` and publishes it
+# by digest; `validate_tt` (after validate_multicluster, RD-017) installs it on
+# the centraluseuap workers (control-plane excluded), provisions NSG rules
+# 190/200 + PodASGMappings, runs TTS-001..TTS-007, and always collects CNI
+# diagnostics. The controller+CNI digests form one atomic artifact set gated on
+# validate_tt and released by digest with EPIC-006 supply-chain verification.
+#
+# Traceability: ITEM-001..ITEM-025, FR-001..FR-015,
+# FR-016, FR-028, ITEM-028..ITEM-035, FR-018..FR-024, TTS-001..TTS-007,
+# NFR-003, NFR-006, NFR-007, NFR-010, NFR-011, SEC-001, SEC-003, SEC-004,
+# SEC-006, RD-004, RD-013..RD-017, RD-020, CON-003, CON-010, CON-011,
+# PRD 3.1/3.3/3.4/3.5/3.6/9.1.
+# =============================================================================
+name: E2E Validation & Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      validation_topologies:
+        description: "Validation topology (a release always forces ss,xs)."
+        type: choice
+        options:
+          - "ss,xs"
+          - "ss"
+          - "xs"
+        default: "ss,xs"
+      regions:
+        description: "Canary regions used by the selected topology."
+        type: choice
+        options:
+          - "eastus2euap,centraluseuap"
+        default: "eastus2euap,centraluseuap"
+      release:
+        description: "Promote the validated artifact set to the public ACR (requires ss,xs)."
+        type: boolean
+        default: false
+      release_version:
+        description: "Semantic version to release, e.g. v1.2.3 (required when release=true)."
+        type: string
+        default: ""
+      run_full_validation:
+        description: "Force both ss and xs validation without requesting a release."
+        type: boolean
+        default: false
+      moving_tags:
+        description: "Comma-separated release moving tags: latest,vMAJOR,vMAJOR.MINOR."
+        type: string
+        default: ""
+      keep_resources_on_failure:
+        description: "Retain selected-topology resources only after upstream validation/provisioning failure. Forbidden for releases."
+        type: boolean
+        default: false
+      primary_subscription_id:
+        description: "Primary subscription (Cluster A + shared ASGs). Non-sensitive identifier."
+        type: string
+        default: ""
+      secondary_subscription_id:
+        description: "Secondary subscription (Cluster B, xs only). MUST differ from primary."
+        type: string
+        default: ""
+  pull_request:
+    branches: [main]
+  schedule:
+    - cron: "0 7 * * *"
+  release:
+    types: [published]
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.event_name == 'pull_request' && format('pnc-e2e-pr-{0}', github.event.pull_request.number) || 'pnc-e2e-cloud' }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  meta:
+    name: Compute run metadata & names
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      date_utc: ${{ steps.meta.outputs.date_utc }}
+      run_suffix: ${{ steps.meta.outputs.run_suffix }}
+      git_sha: ${{ steps.meta.outputs.git_sha }}
+      validation_topologies: ${{ steps.meta.outputs.validation_topologies }}
+      regions: ${{ steps.meta.outputs.regions }}
+      regions_json: ${{ steps.meta.outputs.regions_json }}
+      release_requested: ${{ steps.meta.outputs.release_requested }}
+      release_version: ${{ steps.meta.outputs.release_version }}
+      run_full_validation: ${{ steps.meta.outputs.run_full_validation }}
+      moving_tags: ${{ steps.meta.outputs.moving_tags }}
+      keep_resources_on_failure: ${{ steps.meta.outputs.keep_resources_on_failure }}
+      controller_staging_repo: ${{ steps.meta.outputs.controller_staging_repo }}
+      controller_staging_tag: ${{ steps.meta.outputs.controller_staging_tag }}
+      cni_staging_repo: ${{ steps.meta.outputs.cni_staging_repo }}
+      cni_staging_tag: ${{ steps.meta.outputs.cni_staging_tag }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Compute run metadata, names, and run-manifest foundation
+        id: meta
+        env:
+          REPO: ${{ github.repository }}
+          RUN_ID: ${{ github.run_id }}
+          RUN_ATTEMPT: ${{ github.run_attempt }}
+          GIT_SHA: ${{ github.sha }}
+          GIT_REF: ${{ github.ref }}
+          EVENT_NAME: ${{ github.event_name }}
+          REF_TYPE: ${{ github.ref_type }}
+          REF_NAME: ${{ github.ref_name }}
+          INPUT_TOPOLOGIES: ${{ inputs.validation_topologies || 'ss,xs' }}
+          INPUT_REGIONS: ${{ inputs.regions || 'eastus2euap,centraluseuap' }}
+          INPUT_RELEASE: ${{ inputs.release || false }}
+          INPUT_RELEASE_VERSION: ${{ inputs.release_version || '' }}
+          INPUT_RUN_FULL_VALIDATION: ${{ inputs.run_full_validation || false }}
+          INPUT_MOVING_TAGS: ${{ inputs.moving_tags || '' }}
+          INPUT_KEEP_RESOURCES_ON_FAILURE: ${{ inputs.keep_resources_on_failure || false }}
+          PRIMARY_SUBSCRIPTION_ID: ${{ inputs.primary_subscription_id || vars.E2E_PRIMARY_SUBSCRIPTION_ID }}
+          SECONDARY_SUBSCRIPTION_ID: ${{ inputs.secondary_subscription_id || vars.E2E_SECONDARY_SUBSCRIPTION_ID }}
+          MANIFEST_PATH: run-manifest.json
+        run: bash scripts/e2e/meta.sh
+
+      - name: Upload run-manifest foundation
+        uses: actions/upload-artifact@v4
+        with:
+          name: run-manifest
+          path: run-manifest.json
+          retention-days: 30
+
+  build:
+    name: Build & publish candidate (by digest)
+    needs: meta
+    if: ${{ github.event_name != 'pull_request' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    environment: azure-e2e
+    # Cloud publish uses GitHub OIDC only (no standing secrets, NFR-005/SEC-001).
+    # PR validation is isolated in build_pr so this job can be environment-bound.
+    permissions:
+      contents: read
+      id-token: write
+    outputs:
+      image_reference: ${{ steps.build.outputs.image_reference }}
+      image_digest: ${{ steps.build.outputs.image_digest }}
+      image_repo: ${{ steps.build.outputs.image_repo }}
+      image_tag: ${{ steps.build.outputs.image_tag }}
+      image_registry: ${{ steps.build.outputs.image_registry }}
+      pushed: ${{ steps.build.outputs.pushed }}
+      sbom_path: ${{ steps.build.outputs.sbom_path }}
+    steps:
+      - uses: actions/checkout@v4
+
+      # Start from the meta job's run-manifest so the recorded controller digest
+      # is threaded through the single run manifest (ITEM-006 / NFR-006).
+      - name: Download run-manifest foundation
+        uses: actions/download-artifact@v4
+        with:
+          name: run-manifest
+          path: .
+
+      # syft provides the SBOM generator on PATH for both PR and cloud runs.
+      - name: Install syft (SBOM)
+        uses: anchore/sbom-action/download-syft@v0.17.9
+
+      - name: Azure Login (OIDC)
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Build candidate, publish by digest, generate SBOM
+        id: build
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          STAGING_ACR: ${{ vars.E2E_STAGING_ACR }}
+          CONTROLLER_STAGING_REPO: ${{ needs.meta.outputs.controller_staging_repo }}
+          CONTROLLER_STAGING_TAG: ${{ needs.meta.outputs.controller_staging_tag }}
+          MANIFEST_PATH: run-manifest.json
+          SBOM_PATH: sbom/controller.spdx.json
+        run: bash scripts/e2e/build.sh
+
+      - name: Upload controller SBOM
+        uses: actions/upload-artifact@v4
+        with:
+          name: sbom-controller
+          path: sbom/controller.spdx.json
+          retention-days: 30
+
+      - name: Upload run-manifest (with candidate digest)
+        uses: actions/upload-artifact@v4
+        with:
+          name: run-manifest-build
+          path: run-manifest.json
+          retention-days: 30
+
+  # ===========================================================================
+  # EPIC-009 - Transparent-tunnel CNI artifact build/publish (ITEM-028/029).
+  #
+  # Builds/packages the transparent-tunnel CNI artifact ONCE via the repo-native
+  # `make cni-artifact` target (wrapping scripts/e2e/build-cni.sh, FR-018): it
+  # acquires the azure-vnet binary + azure-linux-transparent-tunnel.conflist from
+  # a PINNED azure-container-networking source (CON-011/RD-015), verifies a
+  # recorded checksum, asserts the conflist declares "mode": "transparent-tunnel",
+  # packages a digest-addressable OCI artifact, pushes it BY DIGEST to the staging
+  # ACR via OIDC (skipped on PRs, RD-009), generates an SBOM, and records the CNI
+  # digest into the run manifest. The exact pin (ref / prebuilt URL+checksum) is
+  # provided by EPIC-008 environment vars (ASSUMPTION-005); build-cni.sh carries
+  # the defaults. Runs in parallel with `build`; both digests form the atomic
+  # artifact set consumed by validate_tt and release (NFR-011).
+  build_cni:
+    name: Build & publish CNI artifact (by digest)
+    needs: meta
+    if: ${{ github.event_name != 'pull_request' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    environment: azure-e2e
+    permissions:
+      contents: read
+      id-token: write
+    outputs:
+      cni_reference: ${{ steps.build_cni.outputs.cni_reference }}
+      cni_digest: ${{ steps.build_cni.outputs.cni_digest }}
+      cni_repo: ${{ steps.build_cni.outputs.cni_repo }}
+      cni_tag: ${{ steps.build_cni.outputs.cni_tag }}
+      cni_registry: ${{ steps.build_cni.outputs.cni_registry }}
+      pushed: ${{ steps.build_cni.outputs.pushed }}
+      sbom_path: ${{ steps.build_cni.outputs.sbom_path }}
+    steps:
+      - uses: actions/checkout@v4
+
+      # Thread the CNI digest through the single run manifest started by `meta`.
+      - name: Download run-manifest foundation
+        uses: actions/download-artifact@v4
+        with:
+          name: run-manifest
+          path: .
+
+      # Go toolchain for the primary source-build mode (GUD-001); oras packages
+      # the OCI artifact by digest; syft generates the SBOM.
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Install oras (OCI artifact push/copy by digest)
+        uses: oras-project/setup-oras@v1
+
+      - name: Install syft (SBOM)
+        uses: anchore/sbom-action/download-syft@v0.17.9
+
+      - name: Azure Login (OIDC)
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      # Repo-native build/package/push by digest (make target wraps build-cni.sh).
+      # The CNI source pin is EPIC-008 configuration surfaced as environment vars;
+      # build-cni.sh supplies defaults when a var is unset (ASSUMPTION-005).
+      - name: Build CNI artifact, publish by digest, generate SBOM
+        id: build_cni
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          STAGING_ACR: ${{ vars.E2E_STAGING_ACR }}
+          CNI_STAGING_REPO: ${{ needs.meta.outputs.cni_staging_repo }}
+          CNI_STAGING_TAG: ${{ needs.meta.outputs.cni_staging_tag }}
+          CNI_SOURCE_MODE: ${{ vars.E2E_CNI_SOURCE_MODE }}
+          CNI_SOURCE_REPO: ${{ vars.E2E_CNI_SOURCE_REPO }}
+          CNI_SOURCE_REF: ${{ vars.E2E_CNI_SOURCE_REF }}
+          CNI_BINARY_URL: ${{ vars.E2E_CNI_BINARY_URL }}
+          CNI_CONFLIST_URL: ${{ vars.E2E_CNI_CONFLIST_URL }}
+          CNI_BINARY_SHA256: ${{ vars.E2E_CNI_BINARY_SHA256 }}
+          MANIFEST_PATH: run-manifest.json
+          SBOM_PATH: sbom/cni.spdx.json
+        run: make cni-artifact
+
+      - name: Upload CNI SBOM
+        uses: actions/upload-artifact@v4
+        with:
+          name: sbom-cni
+          path: sbom/cni.spdx.json
+          retention-days: 30
+
+      - name: Upload run-manifest (with candidate CNI digest)
+        uses: actions/upload-artifact@v4
+        with:
+          name: run-manifest-build-cni
+          path: run-manifest.json
+          retention-days: 30
+
+  # PR fast checks build/package both artifacts locally without requesting an
+  # OIDC token, authenticating to Azure, pushing, or entering a cloud
+  # environment (RD-009).
+  build_pr:
+    name: Build candidate (PR, no cloud)
+    needs: meta
+    if: ${{ github.event_name == 'pull_request' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - name: Download run-manifest foundation
+        uses: actions/download-artifact@v4
+        with:
+          name: run-manifest
+          path: .
+      - name: Install syft
+        uses: anchore/sbom-action/download-syft@v0.17.9
+      - name: Build controller candidate locally
+        env:
+          EVENT_NAME: pull_request
+          CONTROLLER_STAGING_REPO: ${{ needs.meta.outputs.controller_staging_repo }}
+          CONTROLLER_STAGING_TAG: ${{ needs.meta.outputs.controller_staging_tag }}
+          MANIFEST_PATH: run-manifest.json
+          SBOM_PATH: sbom/controller.spdx.json
+        run: bash scripts/e2e/build.sh
+      - name: Upload PR controller manifest
+        uses: actions/upload-artifact@v4
+        with:
+          name: run-manifest-build-pr
+          path: run-manifest.json
+          retention-days: 30
+
+  build_cni_pr:
+    name: Build CNI artifact (PR, no cloud)
+    needs: meta
+    if: ${{ github.event_name == 'pull_request' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - name: Download run-manifest foundation
+        uses: actions/download-artifact@v4
+        with:
+          name: run-manifest
+          path: .
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - uses: oras-project/setup-oras@v1
+      - uses: anchore/sbom-action/download-syft@v0.17.9
+      - name: Build CNI candidate locally
+        env:
+          EVENT_NAME: pull_request
+          CNI_STAGING_REPO: ${{ needs.meta.outputs.cni_staging_repo }}
+          CNI_STAGING_TAG: ${{ needs.meta.outputs.cni_staging_tag }}
+          CNI_SOURCE_MODE: ${{ vars.E2E_CNI_SOURCE_MODE }}
+          CNI_SOURCE_REPO: ${{ vars.E2E_CNI_SOURCE_REPO }}
+          CNI_SOURCE_REF: ${{ vars.E2E_CNI_SOURCE_REF }}
+          CNI_BINARY_URL: ${{ vars.E2E_CNI_BINARY_URL }}
+          CNI_CONFLIST_URL: ${{ vars.E2E_CNI_CONFLIST_URL }}
+          CNI_BINARY_SHA256: ${{ vars.E2E_CNI_BINARY_SHA256 }}
+          MANIFEST_PATH: run-manifest.json
+          SBOM_PATH: sbom/cni.spdx.json
+        run: make cni-artifact
+      - name: Upload PR CNI manifest
+        uses: actions/upload-artifact@v4
+        with:
+          name: run-manifest-build-cni-pr
+          path: run-manifest.json
+          retention-days: 30
+
+  # ===========================================================================
+  # EPIC-003 - Provisioning generalization (ITEM-007/008/010).
+  #
+  # Per-region matrix that provisions the same-subscription (`ss`) topology with
+  # explicit subscription context on every Azure call (RD-020). Region input is
+  # re-validated (canary-only, CON-001) and a VM-quota preflight GATES
+  # provisioning (RISK-003) before any resource is created. Cloud steps are
+  # skipped on pull_request (RD-009: no fork OIDC / no per-PR cost). GitHub
+  # The azure-e2e environment and non-cancelable cloud concurrency group enforce
+  # the EPIC-007 approval/serialization boundary (FR-013/RD-008).
+  provision:
+    name: Provision ss / ${{ matrix.region }}
+    needs: meta
+    if: ${{ github.event_name != 'pull_request' && contains(needs.meta.outputs.validation_topologies, 'ss') }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    environment: azure-e2e
+    permissions:
+      contents: read
+      id-token: write
+    strategy:
+      fail-fast: false
+      matrix:
+        region: ${{ fromJSON(needs.meta.outputs.regions_json) }}
+    env:
+      TOPOLOGY: ss
+      REGION: ${{ matrix.region }}
+      PRIMARY_SUBSCRIPTION_ID: ${{ inputs.primary_subscription_id || vars.E2E_PRIMARY_SUBSCRIPTION_ID }}
+      VM_QUOTA_FAMILY: standardDSv5Family
+      VM_QUOTA_REQUIRED: "16"
+    steps:
+      - uses: actions/checkout@v4
+
+      # Defensive canary-only re-validation (meta already rejects non-canary
+      # regions in `run`, but the provision job fails fast too, ITEM-010/CON-001).
+      - name: Validate region (canary-only)
+        run: |
+          source scripts/e2e/lib.sh
+          # shellcheck disable=SC2153  # REGION comes from the job env (matrix.region)
+          lib::validate_canary_region "${REGION}" >/dev/null
+
+      # Start from the meta foundation (names tree) and augment it with this
+      # region's provision entry; the per-region manifests are merged in the
+      # summary job (EPIC-007).
+      - name: Download run-manifest foundation
+        uses: actions/download-artifact@v4
+        with:
+          name: run-manifest
+          path: .
+
+      - name: Azure Login (OIDC)
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ env.PRIMARY_SUBSCRIPTION_ID }}
+
+      # VM quota preflight GATES provisioning: 1 control-plane + 3 workers of the
+      # smallest viable SKU (Standard_D4s_v5 = 4 vCPU) = 16 vCPUs (NFR-004).
+      - name: VM quota preflight (gates provisioning)
+        run: |
+          source scripts/e2e/lib.sh
+          lib::az_subscription_validate az "${PRIMARY_SUBSCRIPTION_ID}"
+          lib::az_provider_preflight az "${PRIMARY_SUBSCRIPTION_ID}" Microsoft.Network applicationSecurityGroups 2025-07-01
+          lib::az_provider_preflight az "${PRIMARY_SUBSCRIPTION_ID}" Microsoft.Compute
+          # shellcheck disable=SC2153  # REGION comes from the job env (matrix.region)
+          lib::az_vm_quota_preflight az "${PRIMARY_SUBSCRIPTION_ID}" "${REGION}" \
+            "${VM_QUOTA_FAMILY}" "${VM_QUOTA_REQUIRED}"
+
+      - name: Provision self-managed cluster (explicit subscription)
+        id: provision
+        env:
+          SUBSCRIPTION_ID: ${{ env.PRIMARY_SUBSCRIPTION_ID }}
+          REPO: ${{ github.repository }}
+          RUN_ID: ${{ github.run_id }}
+          RUN_ATTEMPT: ${{ github.run_attempt }}
+          DATE_UTC: ${{ needs.meta.outputs.date_utc }}
+          GIT_SHA: ${{ github.sha }}
+          GIT_REF: ${{ github.ref }}
+          MANIFEST_PATH: run-manifest.json
+        run: bash scripts/e2e/provision-cluster.sh all
+
+      - name: Upload provisioning manifest
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: run-manifest-provision-ss-${{ matrix.region }}
+          path: run-manifest.json
+          retention-days: 30
+
+  # ===========================================================================
+  # EPIC-003 - Same-subscription, run-scoped cross-region RBAC (ITEM-009).
+  #
+  # Grants both clusters' node identities the minimal `Network Contributor` role
+  # on the PRIMARY run RG scope ONLY (never a subscription-scope grant), waits
+  # for propagation with a bounded retry, records assignment IDs, and asserts no
+  # subscription-scope grant references a run principal. The `xs` cross-subscription
+  # variant (setup-cross-sub-rbac.sh) is EPIC-010.
+  rbac:
+    name: Cross-region RBAC (ss)
+    needs: [meta, provision]
+    if: ${{ github.event_name != 'pull_request' && contains(needs.meta.outputs.validation_topologies, 'ss') }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    environment: azure-e2e
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      TOPOLOGY: ss
+      REGIONS: ${{ needs.meta.outputs.regions }}
+      PRIMARY_SUBSCRIPTION_ID: ${{ inputs.primary_subscription_id || vars.E2E_PRIMARY_SUBSCRIPTION_ID }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download run-manifest foundation
+        uses: actions/download-artifact@v4
+        with:
+          name: run-manifest
+          path: .
+
+      - name: Azure Login (OIDC)
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ env.PRIMARY_SUBSCRIPTION_ID }}
+
+      - name: Grant run-scoped cross-region RBAC (RG-scoped, bounded propagation)
+        id: rbac
+        env:
+          REPO: ${{ github.repository }}
+          RUN_ID: ${{ github.run_id }}
+          RUN_ATTEMPT: ${{ github.run_attempt }}
+          DATE_UTC: ${{ needs.meta.outputs.date_utc }}
+          MANIFEST_PATH: run-manifest.json
+        run: bash scripts/e2e/cross-region-rbac.sh all
+
+      - name: Upload RBAC manifest
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: run-manifest-rbac-ss
+          path: run-manifest.json
+          retention-days: 30
+
+  # ===========================================================================
+  # EPIC-004 - Candidate deploy (ITEM-011 / ITEM-012).
+  #
+  # Per-region matrix that deploys the SAME candidate digest to each cluster.
+  # kubectl runs ON the control-plane node via `az vm run-command` (the runner
+  # has no path to the self-managed API server; the provisioning NSG admits 6443
+  # from VirtualNetwork only). Each deploy mints a short-lived, repository-scoped
+  # ACR token as the imagePullSecret (SEC-004/RD-004), applies CRD + RBAC +
+  # manager@digest with CLUSTER_NAME set to the cluster RG (ownership-key match),
+  # applies the documented PodASGMappings + Cluster-A/Cluster-B workloads
+  # (CON-003), and establishes the baseline (A=4, B=0). Cloud steps are skipped
+  # on pull_request (RD-009). `xs` deploy is EPIC-010.
+  deploy:
+    name: Deploy candidate ss / ${{ matrix.region }}
+    needs: [meta, build, provision, rbac]
+    if: ${{ github.event_name != 'pull_request' && contains(needs.meta.outputs.validation_topologies, 'ss') }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    environment: azure-e2e
+    permissions:
+      contents: read
+      id-token: write
+    strategy:
+      fail-fast: false
+      matrix:
+        region: ${{ fromJSON(needs.meta.outputs.regions_json) }}
+    env:
+      TOPOLOGY: ss
+      REGION: ${{ matrix.region }}
+      PRIMARY_SUBSCRIPTION_ID: ${{ inputs.primary_subscription_id || vars.E2E_PRIMARY_SUBSCRIPTION_ID }}
+      IMAGE_REFERENCE: ${{ needs.build.outputs.image_reference }}
+      STAGING_ACR: ${{ vars.E2E_STAGING_ACR }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download run-manifest foundation
+        uses: actions/download-artifact@v4
+        with:
+          name: run-manifest
+          path: .
+
+      - name: Azure Login (OIDC)
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ env.PRIMARY_SUBSCRIPTION_ID }}
+
+      - name: Deploy candidate + mappings + baseline (kubectl via run-command)
+        id: deploy
+        env:
+          REPO: ${{ github.repository }}
+          RUN_ID: ${{ github.run_id }}
+          RUN_ATTEMPT: ${{ github.run_attempt }}
+          DATE_UTC: ${{ needs.meta.outputs.date_utc }}
+          GIT_SHA: ${{ github.sha }}
+          GIT_REF: ${{ github.ref }}
+          MANIFEST_PATH: run-manifest.json
+        run: bash scripts/e2e/deploy-controller.sh all
+
+      - name: Upload deploy manifest
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: run-manifest-deploy-ss-${{ matrix.region }}
+          path: run-manifest.json
+          retention-days: 30
+
+  # ===========================================================================
+  # EPIC-004 - Multi-cluster validation (ITEM-013 / ITEM-014).
+  #
+  # A SINGLE job (both clusters at once) that runs Tests 1-4 from
+  # docs/multi-cluster-test-setup.md exactly per the documented pass criteria:
+  # kubectl scale/status/log reads run ON each control-plane node via
+  # `az vm run-command`, and ASG address-prefix-set membership is verified from
+  # the runner with `az rest` (api 2025-07-01, CON-001), with bounded
+  # reconciliation polling. Machine-readable per-test results are published into
+  # run-manifest.json (AC-003..006). Diagnostics/cleanup and the release gate are
+  # added by later epics.
+  validate_multicluster:
+    name: Validate multicluster (ss Tests 1-4)
+    needs: [meta, deploy]
+    if: ${{ github.event_name != 'pull_request' && contains(needs.meta.outputs.validation_topologies, 'ss') }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    environment: azure-e2e
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      TOPOLOGY: ss
+      PRIMARY_SUBSCRIPTION_ID: ${{ inputs.primary_subscription_id || vars.E2E_PRIMARY_SUBSCRIPTION_ID }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download run-manifest foundation
+        uses: actions/download-artifact@v4
+        with:
+          name: run-manifest
+          path: .
+
+      - name: Azure Login (OIDC)
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ env.PRIMARY_SUBSCRIPTION_ID }}
+
+      - name: Run Tests 1-4 (kubectl via run-command; az rest prefix-set checks)
+        id: validate
+        env:
+          REPO: ${{ github.repository }}
+          RUN_ID: ${{ github.run_id }}
+          RUN_ATTEMPT: ${{ github.run_attempt }}
+          DATE_UTC: ${{ needs.meta.outputs.date_utc }}
+          GIT_SHA: ${{ github.sha }}
+          GIT_REF: ${{ github.ref }}
+          MANIFEST_PATH: run-manifest.json
+        run: bash scripts/e2e/run-validation.sh all
+
+      - name: Upload validation manifest (per-test results)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: run-manifest-validate-ss
+          path: run-manifest.json
+          retention-days: 30
+
+  # ===========================================================================
+  # EPIC-009 - Transparent-tunnel same-node enforcement (ITEM-033/030/031/032/034).
+  #
+  # Runs AFTER validate_multicluster on the SHARED centraluseuap cluster (RD-017):
+  # installing transparent-tunnel and adding the deny rule mutate that cluster's
+  # data plane, so the stock-CNI membership tests MUST complete first. This job
+  # (1) pulls the candidate CNI artifact BY DIGEST and installs it on every
+  # centraluseuap worker (control-plane excluded, TTS-001), (2) provisions the
+  # NSG rules 190/200 + PodASGMappings, (3) runs TTS-001..TTS-007, publishing a
+  # per-scenario result into the run manifest, and (4) ALWAYS collects CNI/network
+  # diagnostics (FR-023). Any TTS failure fails the job and blocks release
+  # (FR-022/AC-009). kubectl/worker access is via `az vm run-command`; ASG
+  # membership is read from the runner with `az rest`.
+  validate_tt:
+    name: Validate transparent-tunnel (TTS-001..007)
+    needs: [meta, build_cni, validate_multicluster]
+    if: ${{ github.event_name != 'pull_request' && contains(needs.meta.outputs.validation_topologies, 'ss') }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    environment: azure-e2e
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      TOPOLOGY: ss
+      REGION: centraluseuap
+      PRIMARY_SUBSCRIPTION_ID: ${{ inputs.primary_subscription_id || vars.E2E_PRIMARY_SUBSCRIPTION_ID }}
+      STAGING_ACR: ${{ vars.E2E_STAGING_ACR }}
+      CNI_REFERENCE: ${{ needs.build_cni.outputs.cni_reference }}
+    steps:
+      - uses: actions/checkout@v4
+
+      # Start from the build_cni manifest so artifacts.cni.* (reference, digest,
+      # recorded checksum) is available to install-cni-tt.sh (NFR-010).
+      - name: Download run-manifest (with candidate CNI digest)
+        uses: actions/download-artifact@v4
+        with:
+          name: run-manifest-build-cni
+          path: .
+
+      - name: Install oras (OCI artifact pull by digest)
+        uses: oras-project/setup-oras@v1
+
+      - name: Azure Login (OIDC)
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ env.PRIMARY_SUBSCRIPTION_ID }}
+
+      # 1) Install the validated CNI on every centraluseuap worker (CP excluded).
+      - name: Install transparent-tunnel CNI on workers (digest-verified)
+        env:
+          REPO: ${{ github.repository }}
+          RUN_ID: ${{ github.run_id }}
+          RUN_ATTEMPT: ${{ github.run_attempt }}
+          DATE_UTC: ${{ needs.meta.outputs.date_utc }}
+          MANIFEST_PATH: run-manifest.json
+        run: bash scripts/e2e/install-cni-tt.sh all
+
+      # 2) Provision NSG rules 190/200 + PodASGMappings (test doc §3).
+      - name: Provision transparent-tunnel enforcement fixtures
+        env:
+          REPO: ${{ github.repository }}
+          RUN_ID: ${{ github.run_id }}
+          RUN_ATTEMPT: ${{ github.run_attempt }}
+          DATE_UTC: ${{ needs.meta.outputs.date_utc }}
+          MANIFEST_PATH: run-manifest.json
+        run: bash scripts/e2e/provision-tt-fixtures.sh all
+
+      # 3) Run the seven enforcement scenarios; any failure fails the job.
+      - name: Run TTS-001..TTS-007
+        id: validate_tt
+        env:
+          REPO: ${{ github.repository }}
+          RUN_ID: ${{ github.run_id }}
+          RUN_ATTEMPT: ${{ github.run_attempt }}
+          DATE_UTC: ${{ needs.meta.outputs.date_utc }}
+          MANIFEST_PATH: run-manifest.json
+        run: bash scripts/e2e/run-tt-validation.sh all
+
+      # 4) ALWAYS collect CNI/network diagnostics so evidence exists on pass AND
+      # forced-fail runs (FR-023/AC-007). The standalone EPIC-005 diagnostics job
+      # (ITEM-015) also invokes this collector; wiring it here keeps CNI evidence
+      # attached to validate_tt without coupling to that job.
+      - name: Collect transparent-tunnel CNI/network diagnostics
+        if: always()
+        env:
+          REPO: ${{ github.repository }}
+          RUN_ID: ${{ github.run_id }}
+          RUN_ATTEMPT: ${{ github.run_attempt }}
+          DATE_UTC: ${{ needs.meta.outputs.date_utc }}
+          MANIFEST_PATH: run-manifest.json
+          CNI_DIAG_DIR: cni-diagnostics
+        run: bash scripts/e2e/collect-cni-diagnostics.sh all
+
+      - name: Upload CNI/network diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: cni-diagnostics
+          path: cni-diagnostics/
+          retention-days: 30
+
+      - name: Upload transparent-tunnel validation manifest
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: run-manifest-validate-tt
+          path: run-manifest.json
+          retention-days: 30
+
+  # ===========================================================================
+  # EPIC-005 - Always-on same-subscription diagnostics and verified cleanup.
+  diagnostics_ss:
+    name: Diagnostics (ss, always)
+    needs: [meta, provision, deploy, validate_multicluster, validate_tt]
+    if: ${{ always() && github.event_name != 'pull_request' && contains(needs.meta.outputs.validation_topologies, 'ss') }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    environment: azure-e2e
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      TOPOLOGY: ss
+      PRIMARY_SUBSCRIPTION_ID: ${{ inputs.primary_subscription_id || vars.E2E_PRIMARY_SUBSCRIPTION_ID }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download run-manifest foundation
+        uses: actions/download-artifact@v4
+        with:
+          name: run-manifest
+          path: .
+
+      - name: Azure Login (OIDC)
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ env.PRIMARY_SUBSCRIPTION_ID }}
+
+      - name: Collect controller, mapping, pod, ASG, node, and CNI diagnostics
+        env:
+          REPO: ${{ github.repository }}
+          RUN_ID: ${{ github.run_id }}
+          RUN_ATTEMPT: ${{ github.run_attempt }}
+          DATE_UTC: ${{ needs.meta.outputs.date_utc }}
+          MANIFEST_PATH: run-manifest.json
+          DIAG_DIR: diagnostics-ss
+        run: bash scripts/e2e/collect-diagnostics.sh all
+
+      - name: Upload same-subscription diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: diagnostics-ss
+          path: diagnostics-ss/
+          retention-days: 30
+
+  cleanup_ss:
+    name: Cleanup (ss, always)
+    needs: [meta, provision, rbac, deploy, validate_multicluster, validate_tt, diagnostics_ss]
+    if: ${{ always() && github.event_name != 'pull_request' && contains(needs.meta.outputs.validation_topologies, 'ss') }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    environment: azure-e2e
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      TOPOLOGY: ss
+      PRIMARY_SUBSCRIPTION_ID: ${{ inputs.primary_subscription_id || vars.E2E_PRIMARY_SUBSCRIPTION_ID }}
+      RELEASE_REQUESTED: ${{ needs.meta.outputs.release_requested }}
+      KEEP_RESOURCES: ${{ needs.meta.outputs.keep_resources_on_failure == 'true' && (needs.provision.result == 'failure' || needs.validate_multicluster.result == 'failure' || needs.validate_tt.result == 'failure') && 'true' || 'false' }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download RBAC assignment inventory for verified cleanup
+        continue-on-error: true
+        uses: actions/download-artifact@v4
+        with:
+          name: run-manifest-rbac-ss
+          path: .
+
+      - name: Azure Login (OIDC)
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ env.PRIMARY_SUBSCRIPTION_ID }}
+
+      - name: Remove assignments + delete both run RGs and verify not-found
+        env:
+          REPO: ${{ github.repository }}
+          RUN_ID: ${{ github.run_id }}
+          RUN_ATTEMPT: ${{ github.run_attempt }}
+          DATE_UTC: ${{ needs.meta.outputs.date_utc }}
+          MANIFEST_PATH: run-manifest.json
+        run: bash scripts/e2e/teardown.sh cleanup
+
+      - name: Upload cleanup manifest (ss)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: run-manifest-cleanup-ss
+          path: run-manifest.json
+          retention-days: 30
+
+  # ===========================================================================
+  # EPIC-010 - Cross-subscription topology (ITEM-036/037/038/039/040).
+  #
+  # Runs the `xs` topology AFTER the `ss` multicluster validation (PAT-003/RD-019:
+  # ss then xs, sequential, to cap EUAP quota) with Cluster A + shared ASGs in the
+  # PRIMARY subscription and Cluster B in the SECONDARY. Two SEPARATE OIDC
+  # identities authenticate to each subscription and EVERY Azure call carries an
+  # explicit --subscription (RD-020). All jobs are gated on the xs topology being
+  # in scope (release forces ss,xs) and skipped on pull_request (RD-009).
+  # ---------------------------------------------------------------------------
+
+  # ITEM-036: fail BEFORE provisioning unless the two subscriptions are
+  # distinct/valid, Microsoft.Network + the addressPrefixSets EUAP api are
+  # available, and both subscriptions have EUAP VM quota (FR-025/AC-024).
+  preflight_xs:
+    name: Cross-subscription preflight (xs)
+    needs: meta
+    if: ${{ github.event_name != 'pull_request' && contains(needs.meta.outputs.validation_topologies, 'xs') }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    environment: azure-e2e
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      PRIMARY_SUBSCRIPTION_ID: ${{ inputs.primary_subscription_id || vars.E2E_PRIMARY_SUBSCRIPTION_ID }}
+      SECONDARY_SUBSCRIPTION_ID: ${{ inputs.secondary_subscription_id || vars.E2E_SECONDARY_SUBSCRIPTION_ID }}
+      PRIMARY_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
+      SECONDARY_TENANT_ID: ${{ secrets.AZURE_SECONDARY_TENANT_ID }}
+      VM_QUOTA_FAMILY: standardDSv5Family
+      VM_QUOTA_REQUIRED: "16"
+    steps:
+      - uses: actions/checkout@v4
+
+      # Separate OIDC identities per subscription (RD-020/SEC-002).
+      - name: Azure Login (primary OIDC)
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ env.PRIMARY_SUBSCRIPTION_ID }}
+
+      - name: Azure Login (secondary OIDC)
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_SECONDARY_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_SECONDARY_TENANT_ID }}
+          subscription-id: ${{ env.SECONDARY_SUBSCRIPTION_ID }}
+
+      - name: Validate identities, providers, and EUAP quota (both subscriptions)
+        run: |
+          source scripts/e2e/lib.sh
+          lib::assert_distinct_subscriptions "${PRIMARY_SUBSCRIPTION_ID}" "${SECONDARY_SUBSCRIPTION_ID}"
+          lib::az_subscription_validate az "${PRIMARY_SUBSCRIPTION_ID}" "${PRIMARY_TENANT_ID}"
+          lib::az_subscription_validate az "${SECONDARY_SUBSCRIPTION_ID}" "${SECONDARY_TENANT_ID}"
+          lib::az_provider_preflight az "${PRIMARY_SUBSCRIPTION_ID}" Microsoft.Network applicationSecurityGroups 2025-07-01
+          lib::az_provider_preflight az "${SECONDARY_SUBSCRIPTION_ID}" Microsoft.Network
+          lib::az_provider_preflight az "${PRIMARY_SUBSCRIPTION_ID}" Microsoft.Compute
+          lib::az_provider_preflight az "${SECONDARY_SUBSCRIPTION_ID}" Microsoft.Compute
+          lib::az_vm_quota_preflight az "${PRIMARY_SUBSCRIPTION_ID}" eastus2euap "${VM_QUOTA_FAMILY}" "${VM_QUOTA_REQUIRED}"
+          lib::az_vm_quota_preflight az "${SECONDARY_SUBSCRIPTION_ID}" centraluseuap "${VM_QUOTA_FAMILY}" "${VM_QUOTA_REQUIRED}"
+
+  # ITEM-037: sequential provisioning - Cluster A + shared ASGs in PRIMARY first,
+  # then Cluster B in SECONDARY. Reuses the parameterized provision-cluster.sh
+  # (explicit --subscription; ASGs only in the primary region RG).
+  provision_xs_primary:
+    name: Provision xs / Cluster A + shared ASGs (primary)
+    needs: [meta, preflight_xs, cleanup_ss]
+    if: ${{ always() && github.event_name != 'pull_request' && contains(needs.meta.outputs.validation_topologies, 'xs') && needs.preflight_xs.result == 'success' && (!contains(needs.meta.outputs.validation_topologies, 'ss') || needs.cleanup_ss.result == 'success') }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    environment: azure-e2e
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      TOPOLOGY: xs
+      REGION: eastus2euap
+      PRIMARY_SUBSCRIPTION_ID: ${{ inputs.primary_subscription_id || vars.E2E_PRIMARY_SUBSCRIPTION_ID }}
+      VM_QUOTA_FAMILY: standardDSv5Family
+      VM_QUOTA_REQUIRED: "16"
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download run-manifest foundation
+        uses: actions/download-artifact@v4
+        with:
+          name: run-manifest
+          path: .
+
+      - name: Azure Login (primary OIDC)
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ env.PRIMARY_SUBSCRIPTION_ID }}
+
+      - name: VM quota preflight (gates provisioning)
+        run: |
+          source scripts/e2e/lib.sh
+          # shellcheck disable=SC2153  # REGION comes from the job env (constant)
+          lib::az_vm_quota_preflight az "${PRIMARY_SUBSCRIPTION_ID}" "${REGION}" \
+            "${VM_QUOTA_FAMILY}" "${VM_QUOTA_REQUIRED}"
+
+      - name: Provision Cluster A + shared ASGs (explicit subscription)
+        env:
+          SUBSCRIPTION_ID: ${{ env.PRIMARY_SUBSCRIPTION_ID }}
+          REPO: ${{ github.repository }}
+          RUN_ID: ${{ github.run_id }}
+          RUN_ATTEMPT: ${{ github.run_attempt }}
+          DATE_UTC: ${{ needs.meta.outputs.date_utc }}
+          GIT_SHA: ${{ github.sha }}
+          GIT_REF: ${{ github.ref }}
+          MANIFEST_PATH: run-manifest.json
+        run: bash scripts/e2e/provision-cluster.sh all
+
+      - name: Upload provisioning manifest (xs primary)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: run-manifest-provision-xs-eastus2euap
+          path: run-manifest.json
+          retention-days: 30
+
+  provision_xs_secondary:
+    name: Provision xs / Cluster B (secondary)
+    needs: [meta, provision_xs_primary]
+    if: ${{ github.event_name != 'pull_request' && contains(needs.meta.outputs.validation_topologies, 'xs') }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    environment: azure-e2e
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      TOPOLOGY: xs
+      REGION: centraluseuap
+      SECONDARY_SUBSCRIPTION_ID: ${{ inputs.secondary_subscription_id || vars.E2E_SECONDARY_SUBSCRIPTION_ID }}
+      VM_QUOTA_FAMILY: standardDSv5Family
+      VM_QUOTA_REQUIRED: "16"
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download xs primary provisioning manifest
+        uses: actions/download-artifact@v4
+        with:
+          name: run-manifest-provision-xs-eastus2euap
+          path: .
+
+      - name: Azure Login (secondary OIDC)
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_SECONDARY_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_SECONDARY_TENANT_ID }}
+          subscription-id: ${{ env.SECONDARY_SUBSCRIPTION_ID }}
+
+      - name: VM quota preflight (gates provisioning)
+        run: |
+          source scripts/e2e/lib.sh
+          # shellcheck disable=SC2153  # REGION comes from the job env (constant)
+          lib::az_vm_quota_preflight az "${SECONDARY_SUBSCRIPTION_ID}" "${REGION}" \
+            "${VM_QUOTA_FAMILY}" "${VM_QUOTA_REQUIRED}"
+
+      - name: Provision Cluster B (explicit secondary subscription)
+        env:
+          SUBSCRIPTION_ID: ${{ env.SECONDARY_SUBSCRIPTION_ID }}
+          REPO: ${{ github.repository }}
+          RUN_ID: ${{ github.run_id }}
+          RUN_ATTEMPT: ${{ github.run_attempt }}
+          DATE_UTC: ${{ needs.meta.outputs.date_utc }}
+          GIT_SHA: ${{ github.sha }}
+          GIT_REF: ${{ github.ref }}
+          MANIFEST_PATH: run-manifest.json
+        run: bash scripts/e2e/provision-cluster.sh all
+
+      - name: Upload provisioning manifest (xs secondary)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: run-manifest-provision-xs-centraluseuap
+          path: run-manifest.json
+          retention-days: 30
+
+  # ITEM-038: run-RG-scoped Network Contributor for BOTH clusters' node
+  # identities on the PRIMARY run RG (Cluster B crosses the subscription
+  # boundary). Needs both identities (read B principals in secondary, grant in
+  # primary).
+  rbac_xs:
+    name: Cross-subscription RBAC (xs)
+    needs: [meta, provision_xs_primary, provision_xs_secondary]
+    if: ${{ github.event_name != 'pull_request' && contains(needs.meta.outputs.validation_topologies, 'xs') }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    environment: azure-e2e
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      TOPOLOGY: xs
+      PRIMARY_SUBSCRIPTION_ID: ${{ inputs.primary_subscription_id || vars.E2E_PRIMARY_SUBSCRIPTION_ID }}
+      SECONDARY_SUBSCRIPTION_ID: ${{ inputs.secondary_subscription_id || vars.E2E_SECONDARY_SUBSCRIPTION_ID }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download combined xs provisioning manifest
+        uses: actions/download-artifact@v4
+        with:
+          name: run-manifest-provision-xs-centraluseuap
+          path: .
+
+      - name: Azure Login (primary OIDC)
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ env.PRIMARY_SUBSCRIPTION_ID }}
+
+      - name: Azure Login (secondary OIDC)
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_SECONDARY_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_SECONDARY_TENANT_ID }}
+          subscription-id: ${{ env.SECONDARY_SUBSCRIPTION_ID }}
+
+      - name: Grant run-RG-scoped cross-subscription RBAC (record IDs, bounded wait)
+        env:
+          REPO: ${{ github.repository }}
+          RUN_ID: ${{ github.run_id }}
+          RUN_ATTEMPT: ${{ github.run_attempt }}
+          DATE_UTC: ${{ needs.meta.outputs.date_utc }}
+          MANIFEST_PATH: run-manifest.json
+        run: bash scripts/e2e/setup-cross-sub-rbac.sh setup
+
+      - name: Upload RBAC manifest (xs)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: run-manifest-rbac-xs
+          path: run-manifest.json
+          retention-days: 30
+
+  # ITEM-037: deploy the SAME candidate digest to BOTH clusters, both controllers
+  # targeting the PRIMARY ASG RG (deploy-controller.sh sets AZURE_SUBSCRIPTION_ID
+  # / AZURE_RESOURCE_GROUP to the primary ASG target, FR-028).
+  deploy_xs:
+    name: Deploy candidate xs (both clusters -> primary ASG RG)
+    needs: [meta, build, provision_xs_primary, provision_xs_secondary, rbac_xs]
+    if: ${{ github.event_name != 'pull_request' && contains(needs.meta.outputs.validation_topologies, 'xs') }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    environment: azure-e2e
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      TOPOLOGY: xs
+      PRIMARY_SUBSCRIPTION_ID: ${{ inputs.primary_subscription_id || vars.E2E_PRIMARY_SUBSCRIPTION_ID }}
+      SECONDARY_SUBSCRIPTION_ID: ${{ inputs.secondary_subscription_id || vars.E2E_SECONDARY_SUBSCRIPTION_ID }}
+      IMAGE_REFERENCE: ${{ needs.build.outputs.image_reference }}
+      STAGING_ACR: ${{ vars.E2E_STAGING_ACR }}
+      REPO: ${{ github.repository }}
+      RUN_ID: ${{ github.run_id }}
+      RUN_ATTEMPT: ${{ github.run_attempt }}
+      DATE_UTC: ${{ needs.meta.outputs.date_utc }}
+      GIT_SHA: ${{ github.sha }}
+      GIT_REF: ${{ github.ref }}
+      MANIFEST_PATH: run-manifest.json
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download xs RBAC manifest
+        uses: actions/download-artifact@v4
+        with:
+          name: run-manifest-rbac-xs
+          path: .
+
+      - name: Azure Login (primary OIDC)
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ env.PRIMARY_SUBSCRIPTION_ID }}
+
+      - name: Azure Login (secondary OIDC)
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_SECONDARY_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_SECONDARY_TENANT_ID }}
+          subscription-id: ${{ env.SECONDARY_SUBSCRIPTION_ID }}
+
+      - name: Deploy candidate to Cluster A (primary)
+        env:
+          REGION: eastus2euap
+        run: bash scripts/e2e/deploy-controller.sh all
+
+      - name: Deploy candidate to Cluster B (secondary; targets primary ASG RG)
+        env:
+          REGION: centraluseuap
+        run: bash scripts/e2e/deploy-controller.sh all
+
+      - name: Upload deploy manifest (xs)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: run-manifest-deploy-xs
+          path: run-manifest.json
+          retention-days: 30
+
+  # ITEM-039: XSUB-001..003 + topology-keyed Tests 1-4 (reuses run-validation.sh).
+  validate_cross_subscription:
+    name: Validate cross-subscription (XSUB-001..003 + xs Tests 1-4)
+    needs: [meta, deploy_xs]
+    if: ${{ github.event_name != 'pull_request' && contains(needs.meta.outputs.validation_topologies, 'xs') }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    environment: azure-e2e
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      TOPOLOGY: xs
+      PRIMARY_SUBSCRIPTION_ID: ${{ inputs.primary_subscription_id || vars.E2E_PRIMARY_SUBSCRIPTION_ID }}
+      SECONDARY_SUBSCRIPTION_ID: ${{ inputs.secondary_subscription_id || vars.E2E_SECONDARY_SUBSCRIPTION_ID }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download xs deploy manifest
+        uses: actions/download-artifact@v4
+        with:
+          name: run-manifest-deploy-xs
+          path: .
+
+      - name: Azure Login (primary OIDC)
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ env.PRIMARY_SUBSCRIPTION_ID }}
+
+      - name: Azure Login (secondary OIDC)
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_SECONDARY_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_SECONDARY_TENANT_ID }}
+          subscription-id: ${{ env.SECONDARY_SUBSCRIPTION_ID }}
+
+      - name: Run XSUB-001..003 + xs Tests 1-4 (IMDS/ARM on nodes; az rest checks)
+        id: validate_xs
+        env:
+          REPO: ${{ github.repository }}
+          RUN_ID: ${{ github.run_id }}
+          RUN_ATTEMPT: ${{ github.run_attempt }}
+          DATE_UTC: ${{ needs.meta.outputs.date_utc }}
+          GIT_SHA: ${{ github.sha }}
+          GIT_REF: ${{ github.ref }}
+          MANIFEST_PATH: run-manifest.json
+        run: bash scripts/e2e/run-cross-sub-validation.sh all
+
+      - name: Upload cross-subscription validation manifest
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: run-manifest-validate-xs
+          path: run-manifest.json
+          retention-days: 30
+
+  # ITEM-040: always() cross-subscription diagnostics from BOTH clusters (AC-007).
+  diagnostics_xs:
+    name: Diagnostics (xs, always)
+    needs: [meta, provision_xs_primary, provision_xs_secondary, deploy_xs, validate_cross_subscription]
+    if: ${{ always() && github.event_name != 'pull_request' && contains(needs.meta.outputs.validation_topologies, 'xs') }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    environment: azure-e2e
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      TOPOLOGY: xs
+      PRIMARY_SUBSCRIPTION_ID: ${{ inputs.primary_subscription_id || vars.E2E_PRIMARY_SUBSCRIPTION_ID }}
+      SECONDARY_SUBSCRIPTION_ID: ${{ inputs.secondary_subscription_id || vars.E2E_SECONDARY_SUBSCRIPTION_ID }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download run-manifest foundation
+        uses: actions/download-artifact@v4
+        with:
+          name: run-manifest
+          path: .
+
+      - name: Azure Login (primary OIDC)
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ env.PRIMARY_SUBSCRIPTION_ID }}
+
+      - name: Azure Login (secondary OIDC)
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_SECONDARY_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_SECONDARY_TENANT_ID }}
+          subscription-id: ${{ env.SECONDARY_SUBSCRIPTION_ID }}
+
+      - name: Collect cross-subscription diagnostics (best-effort, sanitized)
+        env:
+          REPO: ${{ github.repository }}
+          RUN_ID: ${{ github.run_id }}
+          RUN_ATTEMPT: ${{ github.run_attempt }}
+          DATE_UTC: ${{ needs.meta.outputs.date_utc }}
+          MANIFEST_PATH: run-manifest.json
+          DIAG_DIR: diagnostics-xs
+        run: bash scripts/e2e/collect-diagnostics.sh all
+
+      - name: Upload cross-subscription diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: diagnostics-xs
+          path: diagnostics-xs/
+          retention-days: 30
+
+  # ITEM-040: always() cross-subscription cleanup - remove recorded run
+  # assignments + delete BOTH run RGs in their owning subscription and verify
+  # not-found. Debug retention is forbidden for release runs (RD-007).
+  cleanup_xs:
+    name: Cleanup (xs, always)
+    needs: [meta, preflight_xs, provision_xs_primary, provision_xs_secondary, rbac_xs, deploy_xs, validate_cross_subscription, diagnostics_xs]
+    if: ${{ always() && github.event_name != 'pull_request' && contains(needs.meta.outputs.validation_topologies, 'xs') }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    environment: azure-e2e
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      TOPOLOGY: xs
+      PRIMARY_SUBSCRIPTION_ID: ${{ inputs.primary_subscription_id || vars.E2E_PRIMARY_SUBSCRIPTION_ID }}
+      SECONDARY_SUBSCRIPTION_ID: ${{ inputs.secondary_subscription_id || vars.E2E_SECONDARY_SUBSCRIPTION_ID }}
+      RELEASE_REQUESTED: ${{ needs.meta.outputs.release_requested }}
+      KEEP_RESOURCES: ${{ needs.meta.outputs.keep_resources_on_failure == 'true' && (needs.preflight_xs.result == 'failure' || needs.provision_xs_primary.result == 'failure' || needs.provision_xs_secondary.result == 'failure' || needs.validate_cross_subscription.result == 'failure') && 'true' || 'false' }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download RBAC assignment inventory for verified cleanup
+        continue-on-error: true
+        uses: actions/download-artifact@v4
+        with:
+          name: run-manifest-rbac-xs
+          path: .
+
+      - name: Azure Login (primary OIDC)
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ env.PRIMARY_SUBSCRIPTION_ID }}
+
+      - name: Azure Login (secondary OIDC)
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_SECONDARY_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_SECONDARY_TENANT_ID }}
+          subscription-id: ${{ env.SECONDARY_SUBSCRIPTION_ID }}
+
+      - name: Remove assignments + delete BOTH run RGs and verify not-found
+        env:
+          REPO: ${{ github.repository }}
+          RUN_ID: ${{ github.run_id }}
+          RUN_ATTEMPT: ${{ github.run_attempt }}
+          DATE_UTC: ${{ needs.meta.outputs.date_utc }}
+          MANIFEST_PATH: run-manifest.json
+        run: bash scripts/e2e/teardown.sh cleanup
+
+      - name: Upload cleanup manifest (xs)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: run-manifest-cleanup-xs
+          path: run-manifest.json
+          retention-days: 30
+
+  # ITEM-018: complete release gate. Without always(), any failed required job
+  # skips this job; promote-release.sh also evaluates every result fail-closed.
+  release_gate:
+    name: Release gate (ss + tt + xs validation & cleanup)
+    needs: [meta, build, build_cni, naming-tests, validate_multicluster, validate_tt, cleanup_ss, validate_cross_subscription, cleanup_xs]
+    if: ${{ github.event_name != 'pull_request' && needs.meta.outputs.release_requested == 'true' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    environment: public-release
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Evaluate every required validation and cleanup gate
+        env:
+          CTRL_DIGEST: ${{ needs.build.outputs.image_digest }}
+          CNI_DIGEST: ${{ needs.build_cni.outputs.cni_digest }}
+          LINT_STATUS: ${{ needs['naming-tests'].result }}
+          VALIDATE_SS_STATUS: ${{ needs.validate_multicluster.result }}
+          VALIDATE_TT_STATUS: ${{ needs.validate_tt.result }}
+          CLEANUP_SS_STATUS: ${{ needs.cleanup_ss.result }}
+          VALIDATE_XS_STATUS: ${{ needs.validate_cross_subscription.result }}
+          CLEANUP_XS_STATUS: ${{ needs.cleanup_xs.result }}
+        run: |
+          source scripts/e2e/lib.sh
+          manifest::init run-manifest.json
+          manifest::put_json run-manifest.json artifacts.controller "$(jq -n --arg d "${CTRL_DIGEST}" '{digest:$d}')"
+          manifest::put_json run-manifest.json artifacts.cni "$(jq -n --arg d "${CNI_DIGEST}" '{digest:$d}')"
+          REQUIRE_COMPLETE=1 REQUIRE_XS=1 MANIFEST_PATH=run-manifest.json bash scripts/e2e/promote-release.sh gate
+
+  # EPIC-006: both validated digests are copied to transaction tags, secured,
+  # and attested before immutable semantic-version tags become public.
+  release:
+    name: Promote, attest, and verify public artifact set
+    needs: [meta, build, build_cni, release_gate]
+    if: ${{ github.event_name != 'pull_request' && needs.meta.outputs.release_requested == 'true' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    environment: public-release
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    env:
+      PUBLIC_ACR: ${{ vars.E2E_PUBLIC_ACR }}
+      STAGING_ACR: ${{ vars.E2E_STAGING_ACR }}
+      RELEASE_VERSION: ${{ needs.meta.outputs.release_version }}
+      RELEASE_TRANSACTION_TAG: _release-${{ github.run_id }}-${{ github.run_attempt }}
+      MOVING_TAGS: ${{ needs.meta.outputs.moving_tags }}
+      MANIFEST_PATH: run-manifest.json
+      CONTROLLER_SBOM_PATH: sbom/controller/controller.spdx.json
+      CNI_SBOM_PATH: sbom/cni/cni.spdx.json
+      COSIGN_CERTIFICATE_IDENTITY_REGEXP: ^https://github.com/${{ github.repository }}/
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install oras
+        uses: oras-project/setup-oras@v1
+
+      - name: Install cosign
+        uses: sigstore/cosign-installer@v3.9.2
+
+      - name: Download controller SBOM
+        uses: actions/download-artifact@v4
+        with:
+          name: sbom-controller
+          path: sbom/controller
+
+      - name: Download CNI SBOM
+        uses: actions/download-artifact@v4
+        with:
+          name: sbom-cni
+          path: sbom/cni
+
+      - name: Azure Login (OIDC)
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ inputs.primary_subscription_id || vars.E2E_PRIMARY_SUBSCRIPTION_ID }}
+
+      - name: Recreate validated artifact-set manifest
+        env:
+          CTRL_DIGEST: ${{ needs.build.outputs.image_digest }}
+          CTRL_REFERENCE: ${{ needs.build.outputs.image_reference }}
+          CNI_DIGEST: ${{ needs.build_cni.outputs.cni_digest }}
+          CNI_REFERENCE: ${{ needs.build_cni.outputs.cni_reference }}
+        run: |
+          source scripts/e2e/lib.sh
+          manifest::init "${MANIFEST_PATH}"
+          manifest::put_json "${MANIFEST_PATH}" artifacts.controller \
+            "$(jq -n --arg d "${CTRL_DIGEST}" --arg r "${CTRL_REFERENCE}" '{digest:$d,reference:$r}')"
+          manifest::put_json "${MANIFEST_PATH}" artifacts.cni \
+            "$(jq -n --arg d "${CNI_DIGEST}" --arg r "${CNI_REFERENCE}" '{digest:$d,reference:$r}')"
+          manifest::put "${MANIFEST_PATH}" validate.tt.status pass
+
+      - name: Prepare digest-pinned release transaction
+        run: bash scripts/e2e/promote-release.sh prepare
+
+      - name: Keyless-sign both digests and attach both SBOMs
+        run: bash scripts/e2e/promote-release.sh secure
+
+      - name: Emit controller SLSA build provenance
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-name: ${{ vars.E2E_PUBLIC_ACR }}/pod-nsg-controller
+          subject-digest: ${{ needs.build.outputs.image_digest }}
+          push-to-registry: true
+
+      - name: Emit CNI SLSA build provenance
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-name: ${{ vars.E2E_PUBLIC_ACR }}/pod-nsg-cni-transparent-tunnel
+          subject-digest: ${{ needs.build_cni.outputs.cni_digest }}
+          push-to-registry: true
+
+      - name: Publish immutable version and verify anonymous pulls
+        env:
+          PROVENANCE_AVAILABLE: "true"
+        run: bash scripts/e2e/promote-release.sh complete
+
+      - name: Remove release transaction tags
+        if: always()
+        run: bash scripts/e2e/promote-release.sh abort
+
+      - name: Upload release manifest
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: run-manifest-release
+          path: run-manifest.json
+          retention-days: 30
+
+  artifact_cleanup:
+    name: Delete staging candidates and pull tokens (always)
+    needs: [meta, build, build_cni, cleanup_ss, cleanup_xs, release]
+    if: ${{ always() && github.event_name != 'pull_request' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    environment: azure-e2e
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      STAGING_ACR: ${{ vars.E2E_STAGING_ACR }}
+      STAGING_ACR_SUBSCRIPTION_ID: ${{ inputs.primary_subscription_id || vars.E2E_PRIMARY_SUBSCRIPTION_ID }}
+      CONTROLLER_STAGING_REPO: ${{ needs.meta.outputs.controller_staging_repo }}
+      CONTROLLER_STAGING_TAG: ${{ needs.meta.outputs.controller_staging_tag }}
+      CNI_STAGING_REPO: ${{ needs.meta.outputs.cni_staging_repo }}
+      CNI_STAGING_TAG: ${{ needs.meta.outputs.cni_staging_tag }}
+      VALIDATION_TOPOLOGIES: ${{ needs.meta.outputs.validation_topologies }}
+      REGIONS: ${{ needs.meta.outputs.regions }}
+      MANIFEST_PATH: run-manifest.json
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download run-manifest foundation
+        if: ${{ needs.meta.result == 'success' }}
+        uses: actions/download-artifact@v4
+        with:
+          name: run-manifest
+          path: .
+
+      - name: Azure Login to staging registry context (OIDC)
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ env.STAGING_ACR_SUBSCRIPTION_ID }}
+
+      - name: Delete and verify per-run candidate tags and ACR tokens
+        env:
+          REPO: ${{ github.repository }}
+          RUN_ID: ${{ github.run_id }}
+          RUN_ATTEMPT: ${{ github.run_attempt }}
+          DATE_UTC: ${{ needs.meta.outputs.date_utc }}
+          GIT_SHA: ${{ github.sha }}
+          GIT_REF: ${{ github.ref }}
+        run: bash scripts/e2e/cleanup-artifacts.sh cleanup
+
+      - name: Upload artifact cleanup manifest
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: run-manifest-cleanup-artifacts
+          path: run-manifest.json
+          retention-days: 30
+
+  naming-tests:
+    name: Lint, unit, integration, and E2E script tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Run Go unit and phase9 integration tests
+        run: |
+          make test
+          make test-phase9-integration
+
+      # EPIC-008 / TEST-001: shellcheck exits non-zero on findings, so any
+      # violation in the shipped E2E scripts fails the lint gate and release.
+      - name: ShellCheck E2E scripts (required)
+        run: shellcheck scripts/e2e/*.sh scripts/e2e/naming_test/*.sh
+
+      - name: Run naming, lib, meta, build, provision, rbac, deploy, validation, and CNI/TT test suites
+        run: |
+          bash scripts/e2e/naming_test/naming_test.sh
+          bash scripts/e2e/naming_test/lib_test.sh
+          bash scripts/e2e/naming_test/meta_test.sh
+          bash scripts/e2e/naming_test/build_test.sh
+          bash scripts/e2e/naming_test/provision_cluster_test.sh
+          bash scripts/e2e/naming_test/cross_region_rbac_test.sh
+          bash scripts/e2e/naming_test/deploy_controller_test.sh
+          bash scripts/e2e/naming_test/run_validation_test.sh
+          bash scripts/e2e/naming_test/build_cni_test.sh
+          bash scripts/e2e/naming_test/install_cni_tt_test.sh
+          bash scripts/e2e/naming_test/provision_tt_fixtures_test.sh
+          bash scripts/e2e/naming_test/run_tt_validation_test.sh
+          bash scripts/e2e/naming_test/collect_cni_diagnostics_test.sh
+          bash scripts/e2e/naming_test/promote_release_test.sh
+          bash scripts/e2e/naming_test/setup_cross_sub_rbac_test.sh
+          bash scripts/e2e/naming_test/run_cross_sub_validation_test.sh
+          bash scripts/e2e/naming_test/teardown_test.sh
+          bash scripts/e2e/naming_test/artifact_cleanup_test.sh
+          bash scripts/e2e/naming_test/collect_diagnostics_test.sh
+          bash scripts/e2e/naming_test/workflow_epic010_test.sh
+          bash scripts/e2e/naming_test/workflow_epic005_test.sh
+          bash scripts/e2e/naming_test/workflow_epic006_test.sh
+          bash scripts/e2e/naming_test/finalize_manifest_test.sh
+          bash scripts/e2e/naming_test/workflow_epic007_test.sh
+          bash scripts/e2e/naming_test/workflow_epic008_test.sh
+          bash scripts/e2e/naming_test/workflow_final_review_test.sh
+
+      - name: Verify naming self-check
+        run: bash scripts/e2e/naming.sh self-check
+
+  # ITEM-025: merge every available per-job manifest snapshot after all
+  # terminal paths settle. This job deliberately remains successful when an
+  # upstream job failed; missing evidence is explicit in `.audit` and in the
+  # step summary, while the validation/release jobs retain their own failures.
+  summary:
+    name: Finalize auditable run manifest (always)
+    needs: [meta, build, build_cni, build_pr, build_cni_pr, naming-tests, cleanup_ss, cleanup_xs, release, artifact_cleanup]
+    if: ${{ always() }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      actions: read
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download run-manifest foundation
+        if: ${{ needs.meta.result == 'success' }}
+        uses: actions/download-artifact@v4
+        with:
+          name: run-manifest
+          path: manifest-fragments/run-manifest-foundation
+
+      - name: Download all run-manifest fragments
+        continue-on-error: true
+        uses: actions/download-artifact@v4
+        with:
+          pattern: run-manifest-*
+          path: manifest-fragments
+
+      - name: Finalize manifest and job summary
+        env:
+          MANIFEST_FRAGMENTS_DIR: manifest-fragments
+          MANIFEST_PATH: run-manifest.json
+        run: bash scripts/e2e/finalize-manifest.sh
+
+      - name: Upload final run manifest
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: run-manifest-final
+          path: run-manifest.json
+          retention-days: 30

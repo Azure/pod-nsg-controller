@@ -130,19 +130,19 @@ func TestLoad_MaxConcurrentReconciles(t *testing.T) {
 			wantErr:   false,
 		},
 		{
-			name:    "zero is invalid",
+			name:     "zero is invalid",
 			envValue: "0",
-			wantErr: true,
+			wantErr:  true,
 		},
 		{
-			name:    "negative is invalid",
+			name:     "negative is invalid",
 			envValue: "-1",
-			wantErr: true,
+			wantErr:  true,
 		},
 		{
-			name:    "non-integer is invalid",
+			name:     "non-integer is invalid",
 			envValue: "abc",
-			wantErr: true,
+			wantErr:  true,
 		},
 	}
 
@@ -198,14 +198,14 @@ func TestLoad_MinReconcileInterval(t *testing.T) {
 			wantValue: 0,
 		},
 		{
-			name:    "negative is invalid",
+			name:     "negative is invalid",
 			envValue: "-1",
-			wantErr: true,
+			wantErr:  true,
 		},
 		{
-			name:    "non-integer is invalid",
+			name:     "non-integer is invalid",
 			envValue: "abc",
-			wantErr: true,
+			wantErr:  true,
 		},
 	}
 
@@ -271,19 +271,19 @@ func TestLoad_MaxConcurrentAzureReads(t *testing.T) {
 			wantValue: 10,
 		},
 		{
-			name:    "zero is invalid",
+			name:     "zero is invalid",
 			envValue: "0",
-			wantErr: true,
+			wantErr:  true,
 		},
 		{
-			name:    "negative is invalid",
+			name:     "negative is invalid",
 			envValue: "-1",
-			wantErr: true,
+			wantErr:  true,
 		},
 		{
-			name:    "non-integer is invalid",
+			name:     "non-integer is invalid",
 			envValue: "abc",
-			wantErr: true,
+			wantErr:  true,
 		},
 	}
 
@@ -344,24 +344,24 @@ func TestLoad_PatchThresholdPercent(t *testing.T) {
 			wantValue: 100,
 		},
 		{
-			name:    "zero is invalid",
+			name:     "zero is invalid",
 			envValue: "0",
-			wantErr: true,
+			wantErr:  true,
 		},
 		{
-			name:    "over 100 is invalid",
+			name:     "over 100 is invalid",
 			envValue: "101",
-			wantErr: true,
+			wantErr:  true,
 		},
 		{
-			name:    "negative is invalid",
+			name:     "negative is invalid",
 			envValue: "-1",
-			wantErr: true,
+			wantErr:  true,
 		},
 		{
-			name:    "non-integer is invalid",
+			name:     "non-integer is invalid",
 			envValue: "abc",
-			wantErr: true,
+			wantErr:  true,
 		},
 	}
 

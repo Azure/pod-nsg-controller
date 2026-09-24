@@ -1,0 +1,31 @@
+# Golden core-name snapshot for the deterministic naming algorithm (PRD Section 3.4).
+# Fixed inputs: REPO=Azure/pod-nsg-controller RUN_ID=10293847561 RUN_ATTEMPT=1 DATE_UTC=20260820
+# Derived: RUN_SUFFIX=vahdkc  (lowercase base36 of int(sha256("REPO:RUN_ID:RUN_ATTEMPT")[0:8]) mod 36^6)
+# The test harness sorts both sides (LC_ALL=C), so ordering here is not significant.
+# Comment lines (leading '#') and blank lines are ignored by the comparison.
+run.date_utc=20260820
+run.run_suffix=vahdkc
+run.purpose=pnc-e2e
+staging.controller_repo=candidate/pod-nsg-controller
+staging.controller_tag=run-20260820-vahdkc
+staging.cni_repo=candidate/pod-nsg-cni-transparent-tunnel
+staging.cni_tag=run-20260820-vahdkc
+ss.base=pnc-e2e-ss-20260820-vahdkc
+ss.storage_account=pnce2ess20260820vahdkc
+ss.eastus2euap.subscription_role=primary
+ss.eastus2euap.resource_group=pnc-e2e-ss-20260820-vahdkc-eastus2euap
+ss.eastus2euap.vnet=pnc-e2e-ss-20260820-vahdkc-eastus2euap-vnet
+ss.eastus2euap.nsg=pnc-e2e-ss-20260820-vahdkc-eastus2euap-nsg
+ss.eastus2euap.cp_vm=pnc-e2e-ss-20260820-vahdkc-eastus2euap-cp-01
+ss.eastus2euap.prefix_set_backend=pnc-e2e-ss-20260820-vahdkc-eastus2euap-test-apps-backend-asg-mapping
+ss.centraluseuap.subscription_role=primary
+ss.centraluseuap.resource_group=pnc-e2e-ss-20260820-vahdkc-centraluseuap
+ss.centraluseuap.prefix_set_frontend=pnc-e2e-ss-20260820-vahdkc-centraluseuap-default-frontend-asg-mapping
+xs.base=pnc-e2e-xs-20260820-vahdkc
+xs.storage_account=pnce2exs20260820vahdkc
+xs.eastus2euap.subscription_role=primary
+xs.eastus2euap.resource_group=pnc-e2e-xs-20260820-vahdkc-eastus2euap
+xs.centraluseuap.subscription_role=secondary
+xs.centraluseuap.resource_group=pnc-e2e-xs-20260820-vahdkc-centraluseuap
+xs.centraluseuap.worker1_vm=pnc-e2e-xs-20260820-vahdkc-centraluseuap-worker-01
+xs.centraluseuap.prefix_set_frontend=pnc-e2e-xs-20260820-vahdkc-centraluseuap-default-frontend-asg-mapping

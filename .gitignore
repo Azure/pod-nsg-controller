@@ -30,6 +30,11 @@ go.work.sum
 # Build output
 bin/
 
+# EPIC-009 transparent-tunnel CNI build/package + node-pull scratch dirs
+# (scripts/e2e/build-cni.sh, scripts/e2e/install-cni-tt.sh).
+.cni-build/
+.cni-install/
+
 # Editor/IDE
 # .idea/
 # .vscode/
