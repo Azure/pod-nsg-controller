@@ -1,0 +1,232 @@
+pr:
+  branches:
+    include:
+      - main
+
+trigger:
+  branches:
+    include:
+      - main
+  tags:
+    include:
+      - v*
+
+resources:
+  repositories:
+    - repository: 1ESPipelineTemplates
+      type: git
+      name: 1ESPipelineTemplates/1ESPipelineTemplates
+      ref: refs/tags/release
+
+variables:
+  # Configure these values in the pipeline/variable groups during onboarding.
+  # The release environment must require Container Networking lead approval.
+  RELEASE_POOL: $(BUILD_POOL_1ESPT_AMD)
+  VALIDATION_ACR_REPOSITORY: pod-nsg-controller-validation
+  MCR_REPOSITORY: mcr.microsoft.com/containernetworking/pod-nsg-controller
+
+extends:
+  template: v1/1ES.Official.PipelineTemplate.yml@1ESPipelineTemplates
+  parameters:
+    pool:
+      name: $(RELEASE_POOL)
+      os: linux
+
+    stages:
+      - stage: verify
+        displayName: Verify source
+        jobs:
+          - job: tests
+            displayName: Unit and integration tests
+            steps:
+              - script: make test
+                displayName: Run tests
+
+      - stage: binaries
+        displayName: Build and sign binaries
+        dependsOn: verify
+        condition: and(succeeded(), startsWith(variables['Build.SourceBranch'], 'refs/tags/v'))
+        jobs:
+          - job: build
+            displayName: Build signed Linux binaries
+            templateContext:
+              outputs:
+                - output: pipelineArtifact
+                  targetPath: $(Build.ArtifactStagingDirectory)/binaries
+                  artifactName: signed-binaries
+                  sbomEnabled: true
+                  condition: succeeded()
+            steps:
+              - bash: |
+                  set -euo pipefail
+                  if [[ "$(Build.SourceBranch)" == refs/tags/* ]]; then
+                    VERSION="${BUILD_SOURCEBRANCH#refs/tags/}"
+                    [[ "$VERSION" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || {
+                      echo "release tag must use vMAJOR.MINOR.PATCH" >&2
+                      exit 1
+                    }
+                    [[ "$(git rev-parse HEAD)" == "$(git rev-list -n 1 "$VERSION")" ]] || {
+                      echo "checked out commit does not match ${VERSION}" >&2
+                      exit 1
+                    }
+                  else
+                    VERSION="v0.0.0"
+                  fi
+                  echo "##vso[task.setvariable variable=releaseVersion;isOutput=true]${VERSION}"
+                  VERSION="$VERSION" OUTPUT_DIR="$(Build.ArtifactStagingDirectory)/binaries" \
+                    ./scripts/release/build-binaries.sh
+                name: version
+                displayName: Build release binaries
+
+              - task: onebranch.pipeline.signing@1
+                displayName: Sign release binaries
+                inputs:
+                  command: sign
+                  signing_profile: external_distribution
+                  files_to_sign: pod-nsg-controller-linux-*
+                  search_root: $(Build.ArtifactStagingDirectory)/binaries
+
+              - bash: |
+                  set -euo pipefail
+                  "$(Build.ArtifactStagingDirectory)/binaries/pod-nsg-controller-linux-amd64" --version |
+                    grep -F "$(version.releaseVersion)"
+                  sha256sum "$(Build.ArtifactStagingDirectory)"/binaries/pod-nsg-controller-linux-* \
+                    >"$(Build.ArtifactStagingDirectory)/binaries/SHA256SUMS"
+                displayName: Verify signed binary version and checksums
+
+      - stage: candidate
+        displayName: Publish validation candidate
+        dependsOn: binaries
+        condition: and(succeeded(), startsWith(variables['Build.SourceBranch'], 'refs/tags/v'))
+        variables:
+          releaseVersion: $[ stageDependencies.binaries.build.outputs['version.releaseVersion'] ]
+        jobs:
+          - job: image
+            displayName: Build signed-binary image
+            steps:
+              - task: DownloadPipelineArtifact@2
+                inputs:
+                  artifact: signed-binaries
+                  targetPath: $(Build.SourcesDirectory)/bin
+
+              - task: Docker@2
+                displayName: Sign in to validation registry
+                inputs:
+                  command: login
+                  containerRegistry: $(VALIDATION_ACR_SERVICE_CONNECTION)
+
+              - bash: |
+                  set -euo pipefail
+                  IMAGE="$(VALIDATION_ACR_LOGIN_SERVER)/$(VALIDATION_ACR_REPOSITORY):$(releaseVersion)-$(Build.BuildId)"
+                  docker buildx create --use --name release-builder
+                  docker buildx build \
+                    --platform linux/amd64,linux/arm64 \
+                    --build-arg VERSION="$(releaseVersion)" \
+                    --file Dockerfile.release \
+                    --tag "$IMAGE" \
+                    --push .
+                  DIGEST="$(docker buildx imagetools inspect "$IMAGE" --format '{{json .Manifest.Digest}}' | tr -d '"')"
+                  [[ "$DIGEST" == sha256:* ]]
+                  echo "##vso[task.setvariable variable=candidateImage;isOutput=true]${IMAGE}@${DIGEST}"
+                name: candidate
+                displayName: Build and push immutable candidate
+
+      - stage: validate
+        displayName: Multi-cluster release validation
+        dependsOn: candidate
+        condition: and(succeeded(), startsWith(variables['Build.SourceBranch'], 'refs/tags/v'))
+        variables:
+          candidateImage: $[ stageDependencies.candidate.image.outputs['candidate.candidateImage'] ]
+        jobs:
+          - deployment: multicluster
+            displayName: Validate documented multi-cluster scenarios
+            environment: pod-nsg-controller-multicluster-validation
+            strategy:
+              runOnce:
+                deploy:
+                  steps:
+                    - checkout: self
+
+                    - task: DownloadSecureFile@1
+                      name: clusterAKubeconfig
+                      inputs:
+                        secureFile: $(CLUSTER_A_KUBECONFIG_SECURE_FILE)
+
+                    - task: DownloadSecureFile@1
+                      name: clusterBKubeconfig
+                      inputs:
+                        secureFile: $(CLUSTER_B_KUBECONFIG_SECURE_FILE)
+
+                    - task: Docker@2
+                      displayName: Sign in to validation registry
+                      inputs:
+                        command: login
+                        containerRegistry: $(VALIDATION_ACR_SERVICE_CONNECTION)
+
+                    - bash: |
+                        set -euo pipefail
+                        export CANDIDATE_IMAGE="$(candidateImage)"
+                        export CLUSTER_A_KUBECONFIG="$(clusterAKubeconfig.secureFilePath)"
+                        export CLUSTER_B_KUBECONFIG="$(clusterBKubeconfig.secureFilePath)"
+                        ./scripts/release/deploy-candidate.sh
+                        make test-release-multicluster
+                      displayName: Deploy candidate and run all release tests
+                      env:
+                        CLUSTER_A_NAME: $(CLUSTER_A_NAME)
+                        CLUSTER_A_SUBSCRIPTION_ID: $(CLUSTER_A_SUBSCRIPTION_ID)
+                        CLUSTER_A_RESOURCE_GROUP: $(CLUSTER_A_RESOURCE_GROUP)
+                        CLUSTER_B_NAME: $(CLUSTER_B_NAME)
+                        CLUSTER_B_SUBSCRIPTION_ID: $(CLUSTER_B_SUBSCRIPTION_ID)
+                        CLUSTER_B_RESOURCE_GROUP: $(CLUSTER_B_RESOURCE_GROUP)
+                        RELEASE_CLUSTER_A_ASG_RESOURCE_IDS: $(RELEASE_CLUSTER_A_ASG_RESOURCE_IDS)
+                        RELEASE_CLUSTER_B_ASG_RESOURCE_IDS: $(RELEASE_CLUSTER_B_ASG_RESOURCE_IDS)
+                        REGISTRY_SERVER: $(VALIDATION_ACR_LOGIN_SERVER)
+                        REGISTRY_USERNAME: $(VALIDATION_ACR_USERNAME)
+                        REGISTRY_PASSWORD: $(VALIDATION_ACR_PASSWORD)
+
+      - stage: release
+        displayName: Release to MCR
+        dependsOn:
+          - binaries
+          - candidate
+          - validate
+        condition: and(succeeded(), startsWith(variables['Build.SourceBranch'], 'refs/tags/v'))
+        variables:
+          releaseVersion: $[ stageDependencies.binaries.build.outputs['version.releaseVersion'] ]
+          candidateImage: $[ stageDependencies.candidate.image.outputs['candidate.candidateImage'] ]
+        jobs:
+          - deployment: mcr
+            displayName: Lead-approved MCR promotion
+            # Configure this environment with Container Networking team leads as
+            # required approvers and disable self-approval.
+            environment: container-networking-lead-approval
+            strategy:
+              runOnce:
+                deploy:
+                  steps:
+                    - checkout: self
+
+                    - task: Docker@2
+                      displayName: Sign in to validation registry
+                      inputs:
+                        command: login
+                        containerRegistry: $(VALIDATION_ACR_SERVICE_CONNECTION)
+
+                    - bash: |
+                        set -euo pipefail
+                        CRANE_BIN="$(Agent.TempDirectory)/bin"
+                        mkdir -p "$CRANE_BIN"
+                        GOBIN="$CRANE_BIN" go install \
+                          "github.com/google/go-containerregistry/cmd/crane@v${CRANE_VERSION}"
+                        "$CRANE_BIN/crane" auth login mcr.microsoft.com \
+                          --username "$MCR_USERNAME" \
+                          --password-stdin <<<"$MCR_PASSWORD"
+                        export PATH="$CRANE_BIN:$PATH"
+                        SOURCE_IMAGE="$(candidateImage)" \
+                        TARGET_IMAGE="$(MCR_REPOSITORY):$(releaseVersion)" \
+                          ./scripts/release/promote-image.sh
+                      displayName: Promote validated digest to MCR
+                      env:
+                        CRANE_VERSION: 0.20.3
+                        MCR_USERNAME: $(MCR_USERNAME)
+                        MCR_PASSWORD: $(MCR_PASSWORD)
