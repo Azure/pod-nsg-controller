@@ -459,11 +459,36 @@ sequenceDiagram
 Verify every worker:
 
 ```bash
-grep -R '"mode": *"transparent-tunnel"' /etc/cni/net.d
-systemctl is-active kubelet
-ip rule show
-ip route show table all
+verify_tt_on_cluster() {
+  local subscription="$1"
+  local resource_group="$2"
+  local cluster_name="$3"
+
+  for i in 01 02 03; do
+    echo "=== ${cluster_name}-worker-${i} ==="
+    az vm run-command invoke \
+      --subscription "$subscription" \
+      --resource-group "$resource_group" \
+      --name "${cluster_name}-worker-${i}" \
+      --command-id RunShellScript \
+      --scripts '
+        set -euo pipefail
+        grep -R "\"mode\": *\"transparent-tunnel\"" /etc/cni/net.d
+        systemctl is-active kubelet
+        test -n "$(find /opt/cni -maxdepth 1 -type d -name "tt-backup-*" -print -quit)"
+        ip rule show
+        ip route show table all
+      ' \
+      --query 'value[0].message' -o tsv
+  done
+}
+
+verify_tt_on_cluster "$SUBSCRIPTION_A" "$RG_A" "$CLUSTER_A"
+verify_tt_on_cluster "$SUBSCRIPTION_B" "$RG_B" "$CLUSTER_B"
 ```
+
+Each worker must report `transparent-tunnel`, an `active` kubelet, at least one
+`tt-backup-*` directory, and the expected policy-routing rules and route tables.
 
 ## 4. Build and Push a Private Controller Image
 
