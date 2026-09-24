@@ -89,7 +89,7 @@ extends:
               - bash: |
                   set -euo pipefail
                   "$(Build.ArtifactStagingDirectory)/binaries/pod-nsg-controller-linux-amd64" --version |
-                    grep -F "$(releaseVersion)"
+                    grep -F "$(version.releaseVersion)"
                   sha256sum "$(Build.ArtifactStagingDirectory)"/binaries/pod-nsg-controller-linux-* \
                     >"$(Build.ArtifactStagingDirectory)/binaries/SHA256SUMS"
                 displayName: Verify signed binary version and checksums
