@@ -214,12 +214,14 @@ extends:
 
                     - bash: |
                         set -euo pipefail
-                        curl -fsSL \
-                          "https://github.com/google/go-containerregistry/releases/download/v${CRANE_VERSION}/go-containerregistry_Linux_x86_64.tar.gz" |
-                          tar -xz -C /usr/local/bin crane
-                        crane auth login mcr.microsoft.com \
+                        CRANE_BIN="$(Agent.TempDirectory)/bin"
+                        mkdir -p "$CRANE_BIN"
+                        GOBIN="$CRANE_BIN" go install \
+                          "github.com/google/go-containerregistry/cmd/crane@v${CRANE_VERSION}"
+                        "$CRANE_BIN/crane" auth login mcr.microsoft.com \
                           --username "$MCR_USERNAME" \
                           --password-stdin <<<"$MCR_PASSWORD"
+                        export PATH="$CRANE_BIN:$PATH"
                         SOURCE_IMAGE="$(candidateImage)" \
                         TARGET_IMAGE="$(MCR_REPOSITORY):$(releaseVersion)" \
                           ./scripts/release/promote-image.sh
