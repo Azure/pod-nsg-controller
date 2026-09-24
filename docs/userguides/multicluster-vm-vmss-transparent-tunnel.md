@@ -504,23 +504,31 @@ export ACR_LOGIN_SERVER=$(az acr show \
   --subscription "$SUBSCRIPTION_A" \
   --name "$ACR_NAME" \
   --query loginServer -o tsv)
-export CONTROLLER_IMAGE="${ACR_LOGIN_SERVER}/pod-nsg-controller:${IMAGE_TAG}"
+export CONTROLLER_IMAGE_TAGGED="${ACR_LOGIN_SERVER}/pod-nsg-controller:${IMAGE_TAG}"
 export ACR_PULL_USERNAME="<scoped-acr-token-or-service-principal-id>"
 export ACR_PULL_PASSWORD="<scoped-acr-token-or-service-principal-secret>"
 
 az acr login --subscription "$SUBSCRIPTION_A" --name "$ACR_NAME"
-make docker-build IMG="$CONTROLLER_IMAGE"
-make docker-push IMG="$CONTROLLER_IMAGE"
+make docker-build IMG="$CONTROLLER_IMAGE_TAGGED"
+make docker-push IMG="$CONTROLLER_IMAGE_TAGGED"
 ```
 
-Record the immutable digest:
+Resolve the pushed tag to an immutable deployment reference:
 
 ```bash
-az acr repository show \
+CONTROLLER_DIGEST=$(az acr repository show \
   --subscription "$SUBSCRIPTION_A" \
   --name "$ACR_NAME" \
   --image "pod-nsg-controller:${IMAGE_TAG}" \
-  --query digest -o tsv
+  --query digest -o tsv)
+
+case "$CONTROLLER_DIGEST" in
+  sha256:*) ;;
+  *) echo "ERROR: ACR did not return a sha256 digest" >&2; exit 1 ;;
+esac
+
+export CONTROLLER_IMAGE="${ACR_LOGIN_SERVER}/pod-nsg-controller@${CONTROLLER_DIGEST}"
+printf 'Deploying immutable image: %s\n' "$CONTROLLER_IMAGE"
 ```
 
 Use the same immutable image in both clusters. Do not rebuild independently per
