@@ -376,9 +376,15 @@ echo "${CNI_BINARY_SHA256}  /opt/cni/bin/azure-vnet.new" | sha256sum -c -
 chmod 0755 /opt/cni/bin/azure-vnet.new
 mv /opt/cni/bin/azure-vnet.new /opt/cni/bin/azure-vnet
 
-curl -fsSL "$CNI_CONFLIST_URL" -o /etc/cni/net.d/10-azure.conflist
+conflist_tmp=$(mktemp /etc/cni/net.d/10-azure.conflist.XXXXXX)
+trap 'rm -f "$conflist_tmp"' EXIT
+curl -fsSL "$CNI_CONFLIST_URL" -o "$conflist_tmp"
+python3 -m json.tool "$conflist_tmp" >/dev/null
 grep -Eq '"mode"[[:space:]]*:[[:space:]]*"transparent-tunnel"' \
-  /etc/cni/net.d/10-azure.conflist
+  "$conflist_tmp"
+chmod 0644 "$conflist_tmp"
+mv "$conflist_tmp" /etc/cni/net.d/10-azure.conflist
+trap - EXIT
 
 systemctl restart kubelet
 systemctl is-active --quiet kubelet
