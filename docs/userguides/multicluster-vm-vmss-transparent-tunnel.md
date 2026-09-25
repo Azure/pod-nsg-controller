@@ -286,6 +286,7 @@ az vmss create \
   --name "$VMSS_A" \
   --orchestration-mode Flexible \
   --platform-fault-domain-count 1 \
+  --single-placement-group false \
   --instance-count 0 \
   --vnet-name "${CLUSTER_A}-vnet" \
   --subnet "${CLUSTER_A}-subnet" \
@@ -301,6 +302,7 @@ for i in 01 02 03; do
     --resource-group "$RG_A" \
     --name "${CLUSTER_A}-worker-${i}" \
     --vmss "$VMSS_A" \
+    --platform-fault-domain 0 \
     --nics "${CLUSTER_A}-worker-${i}-nic" \
     --image "Canonical:0001-com-ubuntu-server-jammy:22_04-lts-gen2:latest" \
     --size "$WORKER_VM_SKU" \
@@ -309,6 +311,13 @@ for i in 01 02 03; do
     --generate-ssh-keys
 done
 ```
+
+Current Azure CLI versions support `az vm create --vmss` to assign a new VM to
+a Flexible VMSS at creation time. Verify that `az vm create --help` lists
+`--vmss` before running the commands. The documented attach operation for an
+already-created VM is `az vm update --set virtualMachineScaleSet.id=...`; there
+is no `az vmss vm attach` command. See
+[Attach or detach a virtual machine to or from a Virtual Machine Scale Set](https://learn.microsoft.com/azure/virtual-machine-scale-sets/virtual-machine-scale-sets-attach-detach-vm).
 
 Repeat for Cluster B. The worker NICs and Azure CNI secondary IP configurations
 were created in the shared prerequisite step above.
