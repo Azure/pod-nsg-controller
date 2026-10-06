@@ -16,8 +16,22 @@ set -euo pipefail
   exit 1
 }
 
+TAG_OBJECT_SHA="$(git rev-parse "${TAG_NAME}^{tag}" 2>/dev/null)" || {
+  echo "release tag must be annotated: ${TAG_NAME}" >&2
+  exit 1
+}
+[[ "$TAG_OBJECT_SHA" =~ ^[0-9a-f]{40}$ ]] || {
+  echo "invalid tag object SHA for ${TAG_NAME}: ${TAG_OBJECT_SHA}" >&2
+  exit 1
+}
+TAG_TARGET_SHA="$(git rev-parse "${TAG_NAME}^{commit}")"
+[[ "$TAG_TARGET_SHA" == "${TARGET_SHA,,}" ]] || {
+  echo "release tag ${TAG_NAME} does not target ${TARGET_SHA}" >&2
+  exit 1
+}
+
 API_URL="${GITHUB_API_URL:-https://api.github.com}"
-STATUS_CONTEXT="release-tag/${TAG_NAME}"
+STATUS_CONTEXT="release-tag/${TAG_NAME}/${TAG_OBJECT_SHA}"
 EXPECTED_RUN_PREFIX="https://github.com/${GITHUB_REPOSITORY}/actions/runs/"
 ATTEMPTS="${PROVENANCE_MAX_ATTEMPTS:-30}"
 DELAY_SECONDS="${PROVENANCE_RETRY_DELAY_SECONDS:-10}"
@@ -67,7 +81,7 @@ for ((attempt = 1; attempt <= ATTEMPTS; attempt++)); do
 done
 
 [[ -n "$RUN_ID" ]] || {
-  echo "no approved GitHub Actions provenance found for ${TAG_NAME} at ${TARGET_SHA}" >&2
+  echo "no approved GitHub Actions provenance found for ${TAG_NAME} object ${TAG_OBJECT_SHA}" >&2
   exit 1
 }
 

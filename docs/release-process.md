@@ -19,9 +19,10 @@ approved vX.Y.Z tag
 
 1. Release tags use `vMAJOR.MINOR.PATCH` and are created only through
    `.github/workflows/create-release-tag.yml`. The workflow records a
-   GitHub-authenticated commit status for the exact tag and target commit.
-   Before any release stage runs, the 1ES pipeline verifies that status points
-   to a successful run of the protected tag-creation workflow.
+   GitHub-authenticated commit status bound to the exact annotated tag object
+   and target commit. Before any release stage runs, the 1ES pipeline verifies
+   that status points to a successful run of the protected tag-creation
+   workflow.
 2. `scripts/release/build-binaries.sh` injects the release tag into the binary.
    The signed AMD64 binary must print the same tag with `--version`.
 3. `Dockerfile.release` contains only the already-built, already-signed binary.
@@ -80,12 +81,13 @@ pass. Configure GitHub environment `container-networking-tag-approval` with the
 same ownership policy for tag creation.
 
 The provenance check prevents a manually pushed `v*` tag from entering the
-binary, candidate, validation, or MCR stages. A direct tag push has no matching
-status created by `github-actions[bot]`, so the pipeline fails before running
-release work. Repository administrators should additionally configure a tag
-ruleset for `refs/tags/v*` that blocks creation, update, and deletion except for
-the GitHub Actions integration; the pipeline check remains the defense in depth
-that verifies the approved workflow actually created the release authorization.
+binary, candidate, validation, or MCR stages. The status context includes the
+annotated tag object's SHA, so deleting and recreating the same tag at the same
+commit does not reuse the prior authorization. Repository administrators must
+also configure an active tag ruleset for `refs/tags/v*` that blocks creation,
+update, and deletion except for the GitHub Actions integration. The ruleset
+prevents ref replay, while the pipeline check verifies that the approved
+workflow created the exact tag object being released.
 
 The multi-cluster validation command runs inside `AzureCLI@2` so
 `DefaultAzureCredential` can use the task's authenticated Azure CLI session for
