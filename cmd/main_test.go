@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"os"
 	"testing"
 	"time"
@@ -10,6 +11,66 @@ import (
 	"github.com/Azure/pod-nsg-controller/internal/azure"
 	"github.com/Azure/pod-nsg-controller/internal/config"
 )
+
+func TestParseOptionsVersionFlags(t *testing.T) {
+	for _, arg := range []string{"-version", "--version"} {
+		t.Run(arg, func(t *testing.T) {
+			var output bytes.Buffer
+			opts, err := parseOptions([]string{arg}, &output)
+			if err != nil {
+				t.Fatalf("parseOptions(%q): %v", arg, err)
+			}
+			if !opts.showVersion {
+				t.Fatalf("parseOptions(%q) showVersion = false, want true", arg)
+			}
+			if output.Len() != 0 {
+				t.Fatalf("parseOptions(%q) output = %q, want empty", arg, output.String())
+			}
+		})
+	}
+}
+
+func TestParseOptionsControllerFlags(t *testing.T) {
+	var output bytes.Buffer
+	opts, err := parseOptions([]string{
+		"--metrics-bind-address=:9090",
+		"-health-probe-bind-address=:9091",
+		"--leader-elect",
+	}, &output)
+	if err != nil {
+		t.Fatalf("parseOptions: %v", err)
+	}
+	if opts.metricsAddr != ":9090" {
+		t.Errorf("metricsAddr = %q, want :9090", opts.metricsAddr)
+	}
+	if opts.healthProbeAddr != ":9091" {
+		t.Errorf("healthProbeAddr = %q, want :9091", opts.healthProbeAddr)
+	}
+	if !opts.enableLeaderElection {
+		t.Error("enableLeaderElection = false, want true")
+	}
+	if opts.showVersion {
+		t.Error("showVersion = true, want false")
+	}
+}
+
+func TestWriteVersion(t *testing.T) {
+	originalVersion := version
+	version = "v1.2.3"
+	t.Cleanup(func() { version = originalVersion })
+
+	var output bytes.Buffer
+	writeVersion(&output)
+	if got, want := output.String(), "pod-nsg-controller v1.2.3\n"; got != want {
+		t.Fatalf("writeVersion() = %q, want %q", got, want)
+	}
+}
+
+func TestDefaultVersionIndicatesDevelopmentBuild(t *testing.T) {
+	if defaultVersion != "development" {
+		t.Fatalf("defaultVersion = %q, want development", defaultVersion)
+	}
+}
 
 // ---------------------------------------------------------------------------
 // Phase 6: armTuningReloader.reload() — mixed-success partial apply

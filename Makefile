@@ -1,4 +1,5 @@
 IMG ?= pod-nsg-controller:latest
+VERSION ?= development
 
 LOCALBIN ?= $(PWD)/bin
 CONTROLLER_GEN ?= $(LOCALBIN)/controller-gen
@@ -48,6 +49,10 @@ test-phase9-integration: generate manifests setup-envtest ## Run phase9 integrat
 test-phase9-e2e: ## Run phase9 E2E tests (requires AZURE_E2E=true and live cluster).
 	go test -count=1 -timeout 1200s -tags=e2e ./test/e2e/...
 
+.PHONY: test-release-multicluster
+test-release-multicluster: ## Run the externally deployed two-cluster release E2E suite.
+	go test -count=1 -timeout 1800s -tags=e2e ./test/e2e/... -run '^TestMultiClusterE2E$$'
+
 .PHONY: test-coverage
 test-coverage: test ## Run tests with coverage report.
 	go tool cover -html=cover.out -o coverage.html
@@ -56,7 +61,7 @@ test-coverage: test ## Run tests with coverage report.
 
 .PHONY: build
 build: fmt vet ## Build manager binary.
-	go build -o bin/manager ./cmd/main.go
+	go build -ldflags "-X main.version=$(VERSION)" -o bin/manager ./cmd/main.go
 
 .PHONY: run
 run: fmt vet ## Run a controller from your host.

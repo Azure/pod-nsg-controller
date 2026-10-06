@@ -1,0 +1,18 @@
+# syntax=docker/dockerfile:1
+
+ARG TARGETARCH
+
+FROM gcr.io/distroless/static:nonroot
+
+ARG TARGETARCH
+ARG VERSION
+
+LABEL org.opencontainers.image.title="pod-nsg-controller" \
+      org.opencontainers.image.version="${VERSION}" \
+      org.opencontainers.image.source="https://github.com/Azure/pod-nsg-controller"
+
+WORKDIR /
+COPY --chmod=0555 bin/pod-nsg-controller-linux-${TARGETARCH} /manager
+
+USER 65532:65532
+ENTRYPOINT ["/manager"]

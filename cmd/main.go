@@ -4,6 +4,8 @@ import (
 	"context"
 	"errors"
 	"flag"
+	"fmt"
+	"io"
 	"os"
 	"time"
 
@@ -28,6 +30,13 @@ import (
 	"github.com/Azure/pod-nsg-controller/internal/metrics"
 )
 
+const productName = "pod-nsg-controller"
+const defaultVersion = "development"
+
+// version is overridden at build time with:
+// go build -ldflags "-X main.version=<release-version>"
+var version = defaultVersion
+
 var scheme = runtime.NewScheme()
 
 func init() {
@@ -37,14 +46,14 @@ func init() {
 }
 
 func main() {
-	var metricsAddr string
-	var healthProbeAddr string
-	var enableLeaderElection bool
-
-	flag.StringVar(&metricsAddr, "metrics-bind-address", ":8080", "The address the metric endpoint binds to.")
-	flag.StringVar(&healthProbeAddr, "health-probe-bind-address", ":8081", "The address the health probe endpoint binds to.")
-	flag.BoolVar(&enableLeaderElection, "leader-elect", false, "Enable leader election for controller manager.")
-	flag.Parse()
+	opts, err := parseOptions(os.Args[1:], os.Stderr)
+	if err != nil {
+		os.Exit(2)
+	}
+	if opts.showVersion {
+		writeVersion(os.Stdout)
+		return
+	}
 
 	zapCfg := zap.NewProductionConfig()
 	zapCfg.EncoderConfig.TimeKey = "timestamp"
@@ -93,9 +102,9 @@ func main() {
 
 	mgr, err := ctrl.NewManager(ctrl.GetConfigOrDie(), ctrl.Options{
 		Scheme:                 scheme,
-		Metrics:                metricsserver.Options{BindAddress: metricsAddr},
-		HealthProbeBindAddress: healthProbeAddr,
-		LeaderElection:         enableLeaderElection,
+		Metrics:                metricsserver.Options{BindAddress: opts.metricsAddr},
+		HealthProbeBindAddress: opts.healthProbeAddr,
+		LeaderElection:         opts.enableLeaderElection,
 		LeaderElectionID:       "pod-nsg-controller.azure.com",
 	})
 	if err != nil {
@@ -222,6 +231,7 @@ func main() {
 	}
 
 	startupFields := []interface{}{
+		"version", version,
 		"clusterName", cfg.ClusterName,
 		"resyncIntervalSeconds", int(cfg.ResyncInterval.Seconds()),
 		"minReconcileIntervalMs", cfg.MinReconcileIntervalMs,
@@ -238,6 +248,31 @@ func main() {
 		setupLog.Error(err, "problem running manager")
 		os.Exit(1)
 	}
+}
+
+type commandOptions struct {
+	metricsAddr          string
+	healthProbeAddr      string
+	enableLeaderElection bool
+	showVersion          bool
+}
+
+func parseOptions(args []string, output io.Writer) (commandOptions, error) {
+	var opts commandOptions
+	flags := flag.NewFlagSet(productName, flag.ContinueOnError)
+	flags.SetOutput(output)
+	flags.StringVar(&opts.metricsAddr, "metrics-bind-address", ":8080", "The address the metric endpoint binds to.")
+	flags.StringVar(&opts.healthProbeAddr, "health-probe-bind-address", ":8081", "The address the health probe endpoint binds to.")
+	flags.BoolVar(&opts.enableLeaderElection, "leader-elect", false, "Enable leader election for controller manager.")
+	flags.BoolVar(&opts.showVersion, "version", false, "Print version information and exit.")
+	if err := flags.Parse(args); err != nil {
+		return commandOptions{}, err
+	}
+	return opts, nil
+}
+
+func writeVersion(output io.Writer) {
+	_, _ = fmt.Fprintf(output, "%s %s\n", productName, version)
 }
 
 // armTuningReloader polls the ARM tuning source and applies runtime updates

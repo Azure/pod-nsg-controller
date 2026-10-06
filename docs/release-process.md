@@ -1,0 +1,121 @@
+# Pod NSG Controller Release Process
+
+Pod NSG Controller releases use a build-once, validate-by-digest, promote-by-digest
+model. A release tag starts the official 1ES pipeline; the image reaching MCR is
+the same immutable candidate that passed the multi-cluster validation gate.
+
+```text
+approved vX.Y.Z tag
+  -> unit and envtest validation
+  -> linux/amd64 + linux/arm64 binaries
+  -> OneBranch external-distribution signing and SBOM
+  -> multi-architecture candidate image from signed binaries
+  -> two-cluster release validation
+  -> Container Networking lead approval
+  -> digest-preserving promotion to MCR
+```
+
+## Release invariants
+
+1. Release tags use `vMAJOR.MINOR.PATCH` and are created only through
+   `.github/workflows/create-release-tag.yml`. The workflow records a
+   GitHub-authenticated commit status bound to the exact annotated tag object
+   and target commit. Before any release stage runs, the 1ES pipeline verifies
+   that status points to a successful run of the protected tag-creation
+   workflow.
+2. `scripts/release/build-binaries.sh` injects the release tag into the binary.
+   The signed AMD64 binary must print the same tag with `--version`.
+3. `Dockerfile.release` contains only the already-built, already-signed binary.
+   It never recompiles source.
+4. The candidate is referenced by digest throughout validation and promotion.
+5. MCR promotion is available only for tag builds after all validation stages
+   succeed and the `container-networking-lead-approval` environment is approved.
+6. The target MCR digest must equal the validated candidate digest.
+
+## Multi-cluster release gate
+
+The release gate deploys the candidate to two externally managed self-hosted
+Kubernetes clusters matching [multi-cluster-test-setup.md](multi-cluster-test-setup.md).
+It then runs `make test-release-multicluster`, covering:
+
+| Test | Required result |
+|---|---|
+| Single-cluster scale-up | Both mappings are `Synced`; prefix sets exactly match the running pod IPs |
+| Concurrent writes | Both clusters own distinct prefix sets in the same ASGs; no controller `412` errors |
+| Scale-down and cleanup | Remaining IPs are exact and the second cluster's prefix sets are deleted |
+| Parallel scale-up | 25 + 10 pod IPs converge across four prefix sets without conflicts |
+
+The test infrastructure is intentionally environment-owned. The pipeline deploys
+the exact candidate controller on every run but does not recreate the underlying
+VM-based Kubernetes clusters. Reusing the controlled environment avoids a release
+result depending on several hours of infrastructure provisioning and allows the
+same cluster identities and cross-subscription RBAC assignments to be reviewed.
+
+## Required pipeline configuration
+
+The Azure DevOps pipeline must be onboarded to the official 1ES template and
+configured with:
+
+- `BUILD_POOL_1ESPT_AMD`
+- `VALIDATION_ACR_SERVICE_CONNECTION`
+- `AZURE_ARM_SERVICE_CONNECTION`, preferably using workload identity
+  federation; its principal needs Reader access to every validation ASG or
+  containing resource group in both subscriptions
+- `VALIDATION_ACR_LOGIN_SERVER`
+- `VALIDATION_ACR_USERNAME` and secret `VALIDATION_ACR_PASSWORD`
+- secure files named by `CLUSTER_A_KUBECONFIG_SECURE_FILE` and
+  `CLUSTER_B_KUBECONFIG_SECURE_FILE`
+- `CLUSTER_A_NAME`, `CLUSTER_A_SUBSCRIPTION_ID`, `CLUSTER_A_RESOURCE_GROUP`
+- `CLUSTER_B_NAME`, `CLUSTER_B_SUBSCRIPTION_ID`, `CLUSTER_B_RESOURCE_GROUP`
+- `RELEASE_CLUSTER_A_ASG_RESOURCE_IDS` and
+  `RELEASE_CLUSTER_B_ASG_RESOURCE_IDS`, each containing the backend and frontend
+  ASG resource IDs in the order documented by the E2E test contract
+- MCR publisher credentials `MCR_USERNAME` and secret `MCR_PASSWORD`
+- secret `GITHUB_RELEASE_PROVENANCE_TOKEN`, a fine-grained GitHub token with
+  read access to commit statuses and Actions workflow runs for this repository
+
+Configure Azure DevOps environment
+`container-networking-lead-approval` with the Container Networking release leads
+as required approvers, disable requester self-approval, add an exclusive lock,
+and require all checks to pass. The release stage uses sequential lock behavior
+so concurrent promotions cannot race the immutable-tag check. Configure GitHub
+environment `container-networking-tag-approval` with the same ownership policy
+for tag creation.
+
+The provenance check prevents a manually pushed `v*` tag from entering the
+binary, candidate, validation, or MCR stages. The status context includes the
+annotated tag object's SHA, so deleting and recreating the same tag at the same
+commit does not reuse the prior authorization. Repository administrators must
+also configure an active tag ruleset for `refs/tags/v*` that blocks creation,
+update, and deletion except for the GitHub Actions integration. The ruleset
+prevents ref replay, while the pipeline check verifies that the approved
+workflow created the exact tag object being released.
+
+The multi-cluster validation command runs inside `AzureCLI@2` so
+`DefaultAzureCredential` can use the task's authenticated Azure CLI session for
+ARM reads. Keep the deployment and test command in that task; a later standalone
+shell task must not assume the service-connection login remains available. The
+controllers running in the validation clusters retain their separate managed
+identities and require write access, normally Network Contributor, to reconcile
+address prefix sets.
+
+## Starting a release
+
+1. Choose a commit from `main` for which the normal CI pipeline is green.
+2. From the `main` branch, run **Create Release Tag** with a new semantic
+   version, the full commit SHA, and the release reason.
+3. Approve the protected tag environment.
+4. Monitor `.pipelines/pipeline.yaml`. Do not approve MCR promotion until the
+   multi-cluster stage has completed and its logs show all four test cases pass.
+5. Approve `container-networking-lead-approval`.
+6. Verify the published image:
+
+   ```bash
+   crane digest mcr.microsoft.com/containernetworking/pod-nsg-controller:vX.Y.Z
+   docker run --rm \
+     mcr.microsoft.com/containernetworking/pod-nsg-controller:vX.Y.Z \
+     --version
+   ```
+
+The digest must match the candidate digest recorded by the pipeline, and the
+binary must print the release tag.
