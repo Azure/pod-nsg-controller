@@ -6,6 +6,11 @@ CONTROLLER_NAMESPACE="${CONTROLLER_NAMESPACE:-pod-nsg-controller-system}"
 CONTROLLER_DEPLOYMENT="${CONTROLLER_DEPLOYMENT:-pod-nsg-controller}"
 CANDIDATE_IMAGE="${CANDIDATE_IMAGE:?CANDIDATE_IMAGE is required}"
 
+if [[ ! "$CANDIDATE_IMAGE" =~ ^[^[:space:]@]+@sha256:[0-9a-f]{64}$ ]]; then
+  echo "CANDIDATE_IMAGE must be pinned by a complete sha256 digest: ${CANDIDATE_IMAGE}" >&2
+  exit 1
+fi
+
 required=(
   CLUSTER_A_KUBECONFIG CLUSTER_A_NAME
   CLUSTER_B_KUBECONFIG CLUSTER_B_NAME

@@ -140,7 +140,10 @@ extends:
                     --tag "$IMAGE" \
                     --push .
                   DIGEST="$(docker buildx imagetools inspect "$IMAGE" --format '{{json .Manifest.Digest}}' | tr -d '"')"
-                  [[ "$DIGEST" == sha256:* ]]
+                  [[ "$DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]] || {
+                    echo "invalid candidate digest: ${DIGEST}" >&2
+                    exit 1
+                  }
                   echo "##vso[task.setvariable variable=candidateImage;isOutput=true]${IMAGE}@${DIGEST}"
                 name: candidate
                 displayName: Build and push immutable candidate

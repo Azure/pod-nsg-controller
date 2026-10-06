@@ -4,8 +4,8 @@ set -euo pipefail
 SOURCE_IMAGE="${SOURCE_IMAGE:?SOURCE_IMAGE must be an immutable image reference}"
 TARGET_IMAGE="${TARGET_IMAGE:?TARGET_IMAGE is required}"
 
-if [[ "$SOURCE_IMAGE" != *@sha256:* ]]; then
-  echo "SOURCE_IMAGE must be pinned by sha256 digest: ${SOURCE_IMAGE}" >&2
+if [[ ! "$SOURCE_IMAGE" =~ ^[^[:space:]@]+@sha256:[0-9a-f]{64}$ ]]; then
+  echo "SOURCE_IMAGE must be pinned by a complete sha256 digest: ${SOURCE_IMAGE}" >&2
   exit 1
 fi
 
