@@ -76,9 +76,11 @@ configured with:
 
 Configure Azure DevOps environment
 `container-networking-lead-approval` with the Container Networking release leads
-as required approvers, disable requester self-approval, and require all checks to
-pass. Configure GitHub environment `container-networking-tag-approval` with the
-same ownership policy for tag creation.
+as required approvers, disable requester self-approval, add an exclusive lock,
+and require all checks to pass. The release stage uses sequential lock behavior
+so concurrent promotions cannot race the immutable-tag check. Configure GitHub
+environment `container-networking-tag-approval` with the same ownership policy
+for tag creation.
 
 The provenance check prevents a manually pushed `v*` tag from entering the
 binary, candidate, validation, or MCR stages. The status context includes the

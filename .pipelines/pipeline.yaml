@@ -211,6 +211,7 @@ extends:
 
       - stage: release
         displayName: Release to MCR
+        lockBehavior: sequential
         dependsOn:
           - binaries
           - candidate
