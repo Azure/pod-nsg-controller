@@ -40,11 +40,24 @@ deploy_cluster() {
     --dry-run=client -o yaml | kubectl --kubeconfig "$kubeconfig" apply -f -
 
   if [[ -n "${REGISTRY_SERVER:-}" && -n "${REGISTRY_USERNAME:-}" && -n "${REGISTRY_PASSWORD:-}" ]]; then
-    kubectl --kubeconfig "$kubeconfig" -n "$CONTROLLER_NAMESPACE" create secret docker-registry release-registry \
-      --docker-server="$REGISTRY_SERVER" \
-      --docker-username="$REGISTRY_USERNAME" \
-      --docker-password="$REGISTRY_PASSWORD" \
-      --dry-run=client -o yaml | kubectl --kubeconfig "$kubeconfig" apply -f -
+    jq -cn '
+      ((env.REGISTRY_USERNAME + ":" + env.REGISTRY_PASSWORD) | @base64) as $auth
+      | {
+          auths: {
+            (env.REGISTRY_SERVER): {
+              username: env.REGISTRY_USERNAME,
+              password: env.REGISTRY_PASSWORD,
+              auth: $auth
+            }
+          }
+        }
+    ' |
+      kubectl --kubeconfig "$kubeconfig" -n "$CONTROLLER_NAMESPACE" \
+        create secret generic release-registry \
+        --type=kubernetes.io/dockerconfigjson \
+        --from-file=.dockerconfigjson=/dev/stdin \
+        --dry-run=client -o yaml |
+      kubectl --kubeconfig "$kubeconfig" apply -f -
     kubectl --kubeconfig "$kubeconfig" -n "$CONTROLLER_NAMESPACE" patch serviceaccount pod-nsg-controller \
       --type=merge -p '{"imagePullSecrets":[{"name":"release-registry"}]}'
   fi
