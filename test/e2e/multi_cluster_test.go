@@ -5,6 +5,7 @@ package e2e_test
 import (
 	"context"
 	"fmt"
+	"sort"
 	"strings"
 	"sync"
 	"testing"
@@ -52,9 +53,10 @@ type multiClusterEndpoint struct {
 }
 
 type multiClusterRuntime struct {
-	config    multiClusterEndpoint
-	client    client.Client
-	clientset kubernetes.Interface
+	config             multiClusterEndpoint
+	client             client.Client
+	clientset          kubernetes.Interface
+	controllerBaseline controllerContinuityBaseline
 }
 
 type multiClusterSuite struct {
@@ -64,6 +66,14 @@ type multiClusterSuite struct {
 	apis       map[string]azure.AddressPrefixSetAPI
 	logStarted metav1.Time
 }
+
+type controllerPodState struct {
+	name         string
+	uid          types.UID
+	restartCount int32
+}
+
+type controllerContinuityBaseline []controllerPodState
 
 func TestMultiClusterE2E(t *testing.T) {
 	cfg := requireMultiClusterConfig(t)
@@ -228,10 +238,20 @@ func (s *multiClusterSuite) setup() {
 			ControllerNamespace:  cluster.config.ControllerNamespace,
 			ControllerDeployment: cluster.config.ControllerDeployment,
 		})
-
 		ctx, cancel := context.WithTimeout(context.Background(), s.config.Timeout)
+		pods, err := listControllerPods(ctx, cluster.clientset, cluster.config)
+		cancel()
+		if err != nil {
+			s.t.Fatalf("list controller pods in %s: %v", cluster.config.Name, err)
+		}
+		cluster.controllerBaseline, err = captureControllerContinuity(pods, cluster.config.ControllerContainer)
+		if err != nil {
+			s.t.Fatalf("capture controller baseline in %s: %v", cluster.config.Name, err)
+		}
+
+		ctx, cancel = context.WithTimeout(context.Background(), s.config.Timeout)
 		namespace := &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: s.config.Namespace}}
-		err := cluster.client.Create(ctx, namespace)
+		err = cluster.client.Create(ctx, namespace)
 		cancel()
 		if err != nil {
 			s.t.Fatalf("create namespace %s in %s: %v", s.config.Namespace, cluster.config.Name, err)
@@ -579,28 +599,12 @@ func (s *multiClusterSuite) assertNo412Errors(t *testing.T) {
 	for i := range s.clusters {
 		cluster := &s.clusters[i]
 		ctx, cancel := context.WithTimeout(context.Background(), s.config.Timeout)
-		var deployment appsv1.Deployment
-		key := types.NamespacedName{
-			Namespace: cluster.config.ControllerNamespace,
-			Name:      cluster.config.ControllerDeployment,
-		}
-		if err := cluster.client.Get(ctx, key, &deployment); err != nil {
-			cancel()
-			t.Fatalf("get controller deployment in %s: %v", cluster.config.Name, err)
-		}
-		selector, err := metav1.LabelSelectorAsSelector(deployment.Spec.Selector)
+		pods, err := listAndValidateControllerContinuity(ctx, cluster)
 		if err != nil {
 			cancel()
-			t.Fatalf("controller selector in %s: %v", cluster.config.Name, err)
+			t.Fatalf("validate controller continuity before reading logs in %s: %v", cluster.config.Name, err)
 		}
-		pods, err := cluster.clientset.CoreV1().Pods(cluster.config.ControllerNamespace).List(ctx, metav1.ListOptions{
-			LabelSelector: selector.String(),
-		})
-		if err != nil {
-			cancel()
-			t.Fatalf("list controller pods in %s: %v", cluster.config.Name, err)
-		}
-		for _, pod := range pods.Items {
+		for _, pod := range pods {
 			logs, err := cluster.clientset.CoreV1().Pods(pod.Namespace).GetLogs(pod.Name, &corev1.PodLogOptions{
 				Container: cluster.config.ControllerContainer,
 				SinceTime: &s.logStarted,
@@ -620,8 +624,153 @@ func (s *multiClusterSuite) assertNo412Errors(t *testing.T) {
 				t.Fatalf("controller %s/%s logged an ARM 412 error since test start", cluster.config.Name, pod.Name)
 			}
 		}
+		if _, err := listAndValidateControllerContinuity(ctx, cluster); err != nil {
+			cancel()
+			t.Fatalf("validate controller continuity after reading logs in %s: %v", cluster.config.Name, err)
+		}
 		cancel()
 	}
+}
+
+func listControllerPods(
+	ctx context.Context,
+	clientset kubernetes.Interface,
+	config multiClusterEndpoint,
+) ([]corev1.Pod, error) {
+	deployment, err := clientset.AppsV1().Deployments(config.ControllerNamespace).Get(
+		ctx,
+		config.ControllerDeployment,
+		metav1.GetOptions{},
+	)
+	if err != nil {
+		return nil, fmt.Errorf("get deployment %s/%s: %w",
+			config.ControllerNamespace, config.ControllerDeployment, err)
+	}
+	selector, err := metav1.LabelSelectorAsSelector(deployment.Spec.Selector)
+	if err != nil {
+		return nil, fmt.Errorf("convert deployment selector: %w", err)
+	}
+	podList, err := clientset.CoreV1().Pods(config.ControllerNamespace).List(ctx, metav1.ListOptions{
+		LabelSelector: selector.String(),
+	})
+	if err != nil {
+		return nil, fmt.Errorf("list pods for deployment %s/%s: %w",
+			config.ControllerNamespace, config.ControllerDeployment, err)
+	}
+	pods := podList.Items
+	sort.Slice(pods, func(i, j int) bool {
+		if pods[i].Name == pods[j].Name {
+			return pods[i].UID < pods[j].UID
+		}
+		return pods[i].Name < pods[j].Name
+	})
+	return pods, nil
+}
+
+func captureControllerContinuity(pods []corev1.Pod, containerName string) (controllerContinuityBaseline, error) {
+	if len(pods) == 0 {
+		return nil, fmt.Errorf("no controller pods found")
+	}
+	baseline := make(controllerContinuityBaseline, 0, len(pods))
+	seenUIDs := make(map[types.UID]struct{}, len(pods))
+	for i := range pods {
+		pod := &pods[i]
+		if pod.UID == "" {
+			return nil, fmt.Errorf("controller pod %s has no UID", pod.Name)
+		}
+		if _, exists := seenUIDs[pod.UID]; exists {
+			return nil, fmt.Errorf("controller pod UID %s is duplicated", pod.UID)
+		}
+		restartCount, err := containerRestartCount(pod, containerName)
+		if err != nil {
+			return nil, err
+		}
+		seenUIDs[pod.UID] = struct{}{}
+		baseline = append(baseline, controllerPodState{
+			name:         pod.Name,
+			uid:          pod.UID,
+			restartCount: restartCount,
+		})
+	}
+	sort.Slice(baseline, func(i, j int) bool {
+		if baseline[i].name == baseline[j].name {
+			return baseline[i].uid < baseline[j].uid
+		}
+		return baseline[i].name < baseline[j].name
+	})
+	return baseline, nil
+}
+
+func validateControllerContinuity(
+	baseline controllerContinuityBaseline,
+	pods []corev1.Pod,
+	containerName string,
+) error {
+	currentByUID := make(map[types.UID]*corev1.Pod, len(pods))
+	currentByName := make(map[string]*corev1.Pod, len(pods))
+	for i := range pods {
+		pod := &pods[i]
+		currentByUID[pod.UID] = pod
+		currentByName[pod.Name] = pod
+	}
+	baselineUIDs := make(map[types.UID]struct{}, len(baseline))
+	for _, expected := range baseline {
+		baselineUIDs[expected.uid] = struct{}{}
+		pod, exists := currentByUID[expected.uid]
+		if !exists {
+			if replacement, nameExists := currentByName[expected.name]; nameExists {
+				return fmt.Errorf("controller pod %s was replaced: UID changed from %s to %s",
+					expected.name, expected.uid, replacement.UID)
+			}
+			return fmt.Errorf("controller pod %s (UID %s) is missing", expected.name, expected.uid)
+		}
+		if pod.Name != expected.name {
+			return fmt.Errorf("controller pod UID %s changed name from %s to %s",
+				expected.uid, expected.name, pod.Name)
+		}
+		restartCount, err := containerRestartCount(pod, containerName)
+		if err != nil {
+			return err
+		}
+		if restartCount != expected.restartCount {
+			return fmt.Errorf("controller pod %s container %s restart count changed from %d to %d",
+				pod.Name, containerName, expected.restartCount, restartCount)
+		}
+	}
+	for i := range pods {
+		pod := &pods[i]
+		if _, exists := baselineUIDs[pod.UID]; !exists {
+			return fmt.Errorf("unexpected controller pod %s (UID %s)", pod.Name, pod.UID)
+		}
+	}
+	return nil
+}
+
+func containerRestartCount(pod *corev1.Pod, containerName string) (int32, error) {
+	for _, status := range pod.Status.ContainerStatuses {
+		if status.Name == containerName {
+			return status.RestartCount, nil
+		}
+	}
+	return 0, fmt.Errorf("controller pod %s is missing container status for %s", pod.Name, containerName)
+}
+
+func listAndValidateControllerContinuity(
+	ctx context.Context,
+	cluster *multiClusterRuntime,
+) ([]corev1.Pod, error) {
+	pods, err := listControllerPods(ctx, cluster.clientset, cluster.config)
+	if err != nil {
+		return nil, err
+	}
+	if err := validateControllerContinuity(
+		cluster.controllerBaseline,
+		pods,
+		cluster.config.ControllerContainer,
+	); err != nil {
+		return nil, err
+	}
+	return pods, nil
 }
 
 func (s *multiClusterSuite) apiForTarget(t *testing.T, target e2eASGTarget) azure.AddressPrefixSetAPI {
