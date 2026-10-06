@@ -34,15 +34,6 @@ deploy_cluster() {
     --from-literal=nsg-name=unused \
     --dry-run=client -o yaml | kubectl --kubeconfig "$kubeconfig" apply -f -
 
-  kubectl --kubeconfig "$kubeconfig" apply -f "${REPO_ROOT}/config/manager/manager.yaml"
-  kubectl --kubeconfig "$kubeconfig" -n "$CONTROLLER_NAMESPACE" \
-    set image "deployment/${CONTROLLER_DEPLOYMENT}" "manager=${CANDIDATE_IMAGE}"
-  kubectl --kubeconfig "$kubeconfig" -n "$CONTROLLER_NAMESPACE" \
-    set env "deployment/${CONTROLLER_DEPLOYMENT}" "CLUSTER_NAME=${cluster_name}"
-  kubectl --kubeconfig "$kubeconfig" -n "$CONTROLLER_NAMESPACE" patch \
-    "deployment/${CONTROLLER_DEPLOYMENT}" --type=strategic \
-    -p '{"spec":{"template":{"spec":{"containers":[{"name":"manager","imagePullPolicy":"Always"}]}}}}'
-
   if [[ -n "${REGISTRY_SERVER:-}" && -n "${REGISTRY_USERNAME:-}" && -n "${REGISTRY_PASSWORD:-}" ]]; then
     kubectl --kubeconfig "$kubeconfig" -n "$CONTROLLER_NAMESPACE" create secret docker-registry release-registry \
       --docker-server="$REGISTRY_SERVER" \
@@ -52,6 +43,15 @@ deploy_cluster() {
     kubectl --kubeconfig "$kubeconfig" -n "$CONTROLLER_NAMESPACE" patch serviceaccount pod-nsg-controller \
       --type=merge -p '{"imagePullSecrets":[{"name":"release-registry"}]}'
   fi
+
+  kubectl --kubeconfig "$kubeconfig" apply -f "${REPO_ROOT}/config/manager/manager.yaml"
+  kubectl --kubeconfig "$kubeconfig" -n "$CONTROLLER_NAMESPACE" \
+    set image "deployment/${CONTROLLER_DEPLOYMENT}" "manager=${CANDIDATE_IMAGE}"
+  kubectl --kubeconfig "$kubeconfig" -n "$CONTROLLER_NAMESPACE" \
+    set env "deployment/${CONTROLLER_DEPLOYMENT}" "CLUSTER_NAME=${cluster_name}"
+  kubectl --kubeconfig "$kubeconfig" -n "$CONTROLLER_NAMESPACE" patch \
+    "deployment/${CONTROLLER_DEPLOYMENT}" --type=strategic \
+    -p '{"spec":{"template":{"spec":{"containers":[{"name":"manager","imagePullPolicy":"Always"}]}}}}'
 
   kubectl --kubeconfig "$kubeconfig" -n "$CONTROLLER_NAMESPACE" rollout status \
     "deployment/${CONTROLLER_DEPLOYMENT}" --timeout=5m
