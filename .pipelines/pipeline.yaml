@@ -39,6 +39,18 @@ extends:
           - job: tests
             displayName: Unit and integration tests
             steps:
+              - bash: |
+                  set -euo pipefail
+                  TAG_NAME="${BUILD_SOURCEBRANCH#refs/tags/}" \
+                  TARGET_SHA="$(git rev-parse HEAD)" \
+                  GITHUB_REPOSITORY="Azure/pod-nsg-controller" \
+                  GITHUB_TOKEN="$GITHUB_RELEASE_PROVENANCE_TOKEN" \
+                    ./scripts/release/verify-tag-provenance.sh
+                displayName: Verify approved release tag provenance
+                condition: and(succeeded(), startsWith(variables['Build.SourceBranch'], 'refs/tags/v'))
+                env:
+                  GITHUB_RELEASE_PROVENANCE_TOKEN: $(GITHUB_RELEASE_PROVENANCE_TOKEN)
+
               - script: make test
                 displayName: Run tests
 

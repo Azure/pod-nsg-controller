@@ -46,7 +46,7 @@ jobs:
             echo "::error::target_sha must be a full commit SHA"
             exit 1
           }
-git rev-parse "${TARGET_SHA}^{commit}" >/dev/null
+          git rev-parse "${TARGET_SHA}^{commit}" >/dev/null
           git merge-base --is-ancestor "$TARGET_SHA" origin/main || {
             echo "::error::target_sha must be an ancestor of main"
             exit 1
@@ -65,6 +65,7 @@ git rev-parse "${TARGET_SHA}^{commit}" >/dev/null
     permissions:
       contents: write
       deployments: write
+      statuses: write
     concurrency:
       group: release-tag-${{ needs.validate.outputs.tag_name }}
       cancel-in-progress: false
@@ -87,6 +88,14 @@ git rev-parse "${TARGET_SHA}^{commit}" >/dev/null
             echo "tag already exists: ${TAG_NAME}" >&2
             exit 1
           fi
+          STATUS_CONTEXT="release-tag/${TAG_NAME}"
+          gh api \
+            --method POST \
+            "repos/${GITHUB_REPOSITORY}/statuses/${TARGET_SHA}" \
+            -f state=pending \
+            -f context="$STATUS_CONTEXT" \
+            -f description="Approved release tag creation is in progress" \
+            -f target_url="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git tag -a "$TAG_NAME" "$TARGET_SHA" -m "$(cat <<EOF
@@ -99,3 +108,10 @@ git rev-parse "${TARGET_SHA}^{commit}" >/dev/null
           EOF
           )"
           git push "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" "refs/tags/${TAG_NAME}"
+          gh api \
+            --method POST \
+            "repos/${GITHUB_REPOSITORY}/statuses/${TARGET_SHA}" \
+            -f state=success \
+            -f context="$STATUS_CONTEXT" \
+            -f description="Approved release tag was created" \
+            -f target_url="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"

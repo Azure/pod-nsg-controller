@@ -18,7 +18,10 @@ approved vX.Y.Z tag
 ## Release invariants
 
 1. Release tags use `vMAJOR.MINOR.PATCH` and are created only through
-   `.github/workflows/create-release-tag.yml`.
+   `.github/workflows/create-release-tag.yml`. The workflow records a
+   GitHub-authenticated commit status for the exact tag and target commit.
+   Before any release stage runs, the 1ES pipeline verifies that status points
+   to a successful run of the protected tag-creation workflow.
 2. `scripts/release/build-binaries.sh` injects the release tag into the binary.
    The signed AMD64 binary must print the same tag with `--version`.
 3. `Dockerfile.release` contains only the already-built, already-signed binary.
@@ -64,6 +67,8 @@ configured with:
   `RELEASE_CLUSTER_B_ASG_RESOURCE_IDS`, each containing the backend and frontend
   ASG resource IDs in the order documented by the E2E test contract
 - MCR publisher credentials `MCR_USERNAME` and secret `MCR_PASSWORD`
+- secret `GITHUB_RELEASE_PROVENANCE_TOKEN`, a fine-grained GitHub token with
+  read access to commit statuses and Actions workflow runs for this repository
 
 Configure Azure DevOps environment
 `container-networking-lead-approval` with the Container Networking release leads
@@ -71,11 +76,19 @@ as required approvers, disable requester self-approval, and require all checks t
 pass. Configure GitHub environment `container-networking-tag-approval` with the
 same ownership policy for tag creation.
 
+The provenance check prevents a manually pushed `v*` tag from entering the
+binary, candidate, validation, or MCR stages. A direct tag push has no matching
+status created by `github-actions[bot]`, so the pipeline fails before running
+release work. Repository administrators should additionally configure a tag
+ruleset for `refs/tags/v*` that blocks creation, update, and deletion except for
+the GitHub Actions integration; the pipeline check remains the defense in depth
+that verifies the approved workflow actually created the release authorization.
+
 ## Starting a release
 
 1. Choose a commit from `main` for which the normal CI pipeline is green.
-2. Run **Create Release Tag** with a new semantic version, the full commit SHA,
-   and the release reason.
+2. From the `main` branch, run **Create Release Tag** with a new semantic
+   version, the full commit SHA, and the release reason.
 3. Approve the protected tag environment.
 4. Monitor `.pipelines/pipeline.yaml`. Do not approve MCR promotion until the
    multi-cluster stage has completed and its logs show all four test cases pass.
