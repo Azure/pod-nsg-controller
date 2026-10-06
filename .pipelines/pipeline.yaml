@@ -100,6 +100,8 @@ extends:
 
               - bash: |
                   set -euo pipefail
+                  chmod 0555 \
+                    "$(Build.ArtifactStagingDirectory)"/binaries/pod-nsg-controller-linux-*
                   "$(Build.ArtifactStagingDirectory)/binaries/pod-nsg-controller-linux-amd64" --version |
                     grep -F "$(version.releaseVersion)"
                   sha256sum "$(Build.ArtifactStagingDirectory)"/binaries/pod-nsg-controller-linux-* \

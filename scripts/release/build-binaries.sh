@@ -20,7 +20,7 @@ for arch in amd64 arm64; do
     -ldflags="-s -w -X main.version=${VERSION}" \
     -o "$output" \
     ./cmd
-  chmod 0555 "$output"
+  chmod 0755 "$output"
 done
 
 printf '%s\n' "$VERSION" >"${OUTPUT_DIR}/VERSION"
