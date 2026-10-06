@@ -175,14 +175,22 @@ extends:
                         command: login
                         containerRegistry: $(VALIDATION_ACR_SERVICE_CONNECTION)
 
-                    - bash: |
-                        set -euo pipefail
-                        export CANDIDATE_IMAGE="$(candidateImage)"
-                        export CLUSTER_A_KUBECONFIG="$(clusterAKubeconfig.secureFilePath)"
-                        export CLUSTER_B_KUBECONFIG="$(clusterBKubeconfig.secureFilePath)"
-                        ./scripts/release/deploy-candidate.sh
-                        make test-release-multicluster
+                    - task: AzureCLI@2
                       displayName: Deploy candidate and run all release tests
+                      inputs:
+                        azureSubscription: $(AZURE_ARM_SERVICE_CONNECTION)
+                        scriptType: bash
+                        scriptLocation: inlineScript
+                        inlineScript: |
+                          set -euo pipefail
+                          az account get-access-token \
+                            --resource https://management.azure.com/ \
+                            --output none
+                          export CANDIDATE_IMAGE="$(candidateImage)"
+                          export CLUSTER_A_KUBECONFIG="$(clusterAKubeconfig.secureFilePath)"
+                          export CLUSTER_B_KUBECONFIG="$(clusterBKubeconfig.secureFilePath)"
+                          ./scripts/release/deploy-candidate.sh
+                          make test-release-multicluster
                       env:
                         CLUSTER_A_NAME: $(CLUSTER_A_NAME)
                         CLUSTER_A_SUBSCRIPTION_ID: $(CLUSTER_A_SUBSCRIPTION_ID)

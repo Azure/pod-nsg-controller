@@ -57,6 +57,9 @@ configured with:
 
 - `BUILD_POOL_1ESPT_AMD`
 - `VALIDATION_ACR_SERVICE_CONNECTION`
+- `AZURE_ARM_SERVICE_CONNECTION`, preferably using workload identity
+  federation; its principal needs Reader access to every validation ASG or
+  containing resource group in both subscriptions
 - `VALIDATION_ACR_LOGIN_SERVER`
 - `VALIDATION_ACR_USERNAME` and secret `VALIDATION_ACR_PASSWORD`
 - secure files named by `CLUSTER_A_KUBECONFIG_SECURE_FILE` and
@@ -83,6 +86,14 @@ release work. Repository administrators should additionally configure a tag
 ruleset for `refs/tags/v*` that blocks creation, update, and deletion except for
 the GitHub Actions integration; the pipeline check remains the defense in depth
 that verifies the approved workflow actually created the release authorization.
+
+The multi-cluster validation command runs inside `AzureCLI@2` so
+`DefaultAzureCredential` can use the task's authenticated Azure CLI session for
+ARM reads. Keep the deployment and test command in that task; a later standalone
+shell task must not assume the service-connection login remains available. The
+controllers running in the validation clusters retain their separate managed
+identities and require write access, normally Network Contributor, to reconcile
+address prefix sets.
 
 ## Starting a release
 
